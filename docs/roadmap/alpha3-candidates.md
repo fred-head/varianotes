@@ -1,11 +1,12 @@
 # Alpha 3 roadmap
 
-This is the complete Alpha 3 milestone set. The Git-free notebook reboot is
-inserted after Milestone 30 and before Milestone 31; it changes the product
-foundation without dropping the other Alpha 3 work. Statuses below distinguish
-shipped work from work that remains, is superseded by the reboot, or is
-explicitly deferred. Historical milestone requirements remain below so their
-decisions and acceptance criteria are not lost.
+This document records the Alpha 3 milestones and their current dispositions.
+The Git-free notebook reboot is inserted after Milestone 30 and before
+Milestone 31; it changes the product foundation without dropping compatible
+Alpha 3 work. Milestone 27 has been moved to Alpha 4. Statuses below distinguish
+shipped work from work that remains, is superseded by the reboot, or is carried
+forward. Historical milestone requirements remain below so their decisions and
+acceptance criteria are not lost.
 
 This roadmap retains historical milestone decisions and acceptance criteria.
 Its current product and runtime references use the VariaNotes identity.
@@ -25,7 +26,7 @@ The original milestones and reboot have these current dispositions:
 | --- | --- |
 | M25 behavior-preserving frontend decomposition | Incomplete; continue as a focused maintainability task |
 | M26 expanded user documentation | Incomplete; complete as part of the reboot documentation phase |
-| M27 direct OIDC authentication | Deferred; retain as an Alpha 3 feature after the reboot |
+| M27 direct OIDC authentication | Moved to Alpha 4; specification retained below |
 | M28 local-only Git notebooks | Shipped before the reboot; superseded by filesystem vaults |
 | M29 managed SSH key rotation | Shipped before the reboot; removed with Git and SSH runtime support |
 | M30 visible application version | Shipped; keep |
@@ -44,11 +45,12 @@ The original milestones and reboot have these current dispositions:
 | M42 expired browser session cleanup | Shipped; keep |
 
 The reboot preserves all compatible shipped Alpha 3 features and keeps the
-uncompleted Alpha 3 work in the roadmap. Git-only milestones and sync-derived
-notifications are retained here as historical decisions, with their
-supersession stated explicitly. M31 requires a fresh threat-model review after
-the reboot; this roadmap does not authorize encryption implementation before
-that review.
+remaining Alpha 3 work in the roadmap. M27's requirements remain below as the
+planning basis for Alpha 4, not as Alpha 3 scope. Git-only milestones and
+sync-derived notifications are retained here as historical decisions, with
+their supersession stated explicitly. M31 requires a fresh threat-model review
+after the reboot; this roadmap does not authorize encryption implementation
+before that review.
 
 ## Milestone 25 - Behavior-preserving frontend decomposition
 
@@ -97,7 +99,7 @@ expanded documentation for users and self-hosting operators covering:
 - portable vault export and its distinction from a backup service,
 - PWA installation and limitations,
 - reverse proxy and troubleshooting guidance,
-- OIDC after Milestone 27 is implemented.
+- OIDC setup and behavior after Alpha 4 Milestone 27 is implemented.
 
 Prefer a version-controlled `docs/` source in the main repository so changes are
 reviewed, versioned, searchable, and shipped with the matching release. A GitHub
@@ -112,7 +114,7 @@ Completion criteria:
 - security-sensitive guidance matches the exact released behavior,
 - README links clearly to the expanded documentation.
 
-## Milestone 27 - Direct OIDC authentication
+## Milestone 27 - Direct OIDC authentication (Alpha 4)
 
 Add standards-based OIDC authentication for providers such as Authentik,
 Authelia, Keycloak, and other compatible identity providers.

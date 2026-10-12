@@ -6,10 +6,12 @@ This document replaces Git as the assumed product foundation. The repository
 remains the development host for the application.
 
 Roadmap placement: insert this reboot after Alpha 3 Milestone 30 and before
-Milestone 31. All Alpha 3 milestones remain in
-[`alpha3-candidates.md`](alpha3-candidates.md); the reboot supersedes only the
-Git-specific milestones and sync-derived behaviors listed there. M31 remains
-deferred, while shipped M32 and other compatible features stay in the product.
+Milestone 31. Alpha 3 scope and milestone dispositions are tracked in
+[`alpha3-candidates.md`](alpha3-candidates.md). M27 direct OIDC authentication
+has been moved to Alpha 4; its requirements remain there as the planning basis.
+The reboot supersedes only the Git-specific milestones and sync-derived
+behaviors listed in the Alpha 3 roadmap. M31 remains deferred, while shipped
+M32 and other compatible features stay in the product.
 
 ## Product goal
 
@@ -129,6 +131,9 @@ creating a hidden permanent history.
 
 ### Phase 4: post-reboot feature backlog
 
+- Carry M27 direct OIDC authentication into Alpha 4 using the specification in
+  [`alpha3-candidates.md`](alpha3-candidates.md); retain the single-owner and
+  fail-closed authentication constraints.
 - Revisit M31 encryption only with an explicit threat model, external recovery
   format, key lifecycle, asset/search behavior, and backup-retention policy.
 - Keep M32's already implemented document outline in the supported feature set;

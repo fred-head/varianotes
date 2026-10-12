@@ -25,25 +25,39 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Changed
 
-- Completed the VariaNotes clean-slate identity across the Go module, CLI,
-  frontend, PWA, Docker deployment, and release workflows. Only the
-  `VARIANOTES_*` environment namespace and VariaNotes application identifiers
-  are supported.
-- Prepared the source tree for the independent `fred-head/varianotes` GitHub
-  repository and `ghcr.io/fred-head/varianotes` image. Repository creation and
-  first publication remain separate operator actions.
-- Replaced Git-backed notebooks and synchronization with online-only
-  filesystem vaults. Saves write directly to the server; the operator owns
-  backup and restore.
-- Made PWA API and asset requests network-only/no-store and removed note
-  history, Git conflict, remote, and SSH administration flows.
+- Rebranded RepoQuill as VariaNotes across the Go module, CLI, frontend, PWA,
+  configuration, Docker deployment, documentation, and release workflows.
+  Only the `VARIANOTES_*` environment namespace and VariaNotes application
+  identifiers are supported; old names have no configuration fallback.
+- Prepared a clean-slate VariaNotes source and release setup for the independent
+  `fred-head/varianotes` repository and `ghcr.io/fred-head/varianotes` image.
+  RepoQuill's Git history, branches, pull requests, and release tags are not
+  carried into the new project. First publication remains a separate operator
+  action.
+- Replaced Git-backed notebooks with ordinary filesystem vaults. The server
+  filesystem is canonical, saves write directly to it with version checks, and
+  note content is online-only in the PWA. Existing folders can be adopted
+  without changing note or asset files; VariaNotes ignores and leaves any
+  legacy `.git` directory untouched. ZIP export includes ordinary vault files
+  but omits `.git` internals and application metadata. Operators own backup and
+  restore.
 - Redesigned the Markdown editor toolbar with compact SVG icon buttons and a
   grouped Insert menu, keeping common formatting actions directly accessible.
-- Replaced synchronization status with direct server-save status.
 - Moved the running VariaNotes version into the Settings header, right-aligned
   beside the heading.
 - Made the Paste as Markdown toolbar action more compact with a paste icon and
   visible MD label while retaining its full accessible name and hover tooltip.
+
+### Removed
+
+- Removed Git and OpenSSH from the application runtime and production
+  container, along with Git repository initialization, remote and branch
+  management, clone onboarding, SSH key administration, scheduled and manual
+  synchronization, Git-derived status, commits, note history, Git conflict
+  review, and Git recovery APIs. The UI now reports direct server-save status.
+- Removed offline note replicas and queued edits. PWA API and asset requests
+  are network-only and `no-store`; an unreachable server cannot make an edit
+  appear saved.
 
 ### Fixed
 
