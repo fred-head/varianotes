@@ -245,11 +245,11 @@ Completion criteria:
 
 ## Milestone 31 - Selective encryption for notes and folders
 
-M31 remains in Alpha 3. This checklist is the implementation plan. **No step
-is marked complete.** M31 is not complete until P01–P18 are complete and the
-independent security review in P17 has passed. Encryption activation must stay
-disabled in the UI, API, and any operator command until the P18 release gate
-passes.
+M31 remains in Alpha 3. This checklist is the implementation plan. **P01 is
+complete; P02–P18 remain open.** M31 is not complete until P01–P18 are complete
+and the independent security review in P17 has passed. Encryption activation
+must stay disabled in the UI, API, and any operator command until the P18
+release gate passes.
 
 The size labels are relative estimates, not measured durations: S is small, M
 is medium, and L is large or has substantial failure-recovery work. Each step
@@ -314,7 +314,7 @@ requires its listed tests; P17 adds end-to-end and adversarial coverage.
 
 ### Ordered implementation steps
 
-- [ ] **P01 — Shared file access layer** *(dependencies: none; size: M)*
+- [x] **P01 — Shared file access layer** *(dependencies: none; size: M)*
   **Goal/scope:** common content reader/writer and version-check boundary,
   initially preserving ordinary files; retain path confinement and filesystem
   coordination in this layer.
@@ -482,8 +482,8 @@ requires its listed tests; P17 adds end-to-end and adversarial coverage.
 
 ### M31 completion and activation gate
 
-- P01–P18 are mandatory, ordered, and initially unchecked. Each step's tests
-  must pass before it is completed.
+- P01–P18 are mandatory and ordered. Each step's tests must pass before it is
+  marked complete.
 - P17's independent security review and end-to-end external recovery are
   release conditions, not follow-up work.
 - P16 may be developed behind a disabled gate, but no UI, API, or operator

@@ -16,8 +16,8 @@ var (
 )
 
 func (r *Repository) Create(relative, entryType string) error {
-	r.contentMu.Lock()
-	defer r.contentMu.Unlock()
+	r.content.mu.Lock()
+	defer r.content.mu.Unlock()
 	return r.create(relative, entryType)
 }
 
@@ -69,8 +69,8 @@ func (r *Repository) create(relative, entryType string) error {
 }
 
 func (r *Repository) Delete(relative string) error {
-	r.contentMu.Lock()
-	defer r.contentMu.Unlock()
+	r.content.mu.Lock()
+	defer r.content.mu.Unlock()
 	return r.delete(relative)
 }
 
@@ -109,8 +109,8 @@ func (r *Repository) delete(relative string) error {
 func (r *Repository) Move(sourceRelative, targetRelative string) error {
 	r.moveMu.Lock()
 	defer r.moveMu.Unlock()
-	r.contentMu.Lock()
-	defer r.contentMu.Unlock()
+	r.content.mu.Lock()
+	defer r.content.mu.Unlock()
 	return r.move(sourceRelative, targetRelative)
 }
 
