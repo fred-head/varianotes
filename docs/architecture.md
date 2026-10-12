@@ -19,7 +19,12 @@ history. For behavior and deployment, see [README](../README.md).
   and writes, note operations, link rewrites, search, Trash, and ZIP export all
   route through this layer. Later M31 steps will add encrypted storage there.
 - `internal/encryption/` contains the versioned age and key-envelope primitives
-  from M31P03. They are not wired into vault operations; encryption stays
+  from M31P03 and the authenticated, durable catalog from M31P04. Catalogs
+  authenticate vault/object identities, logical and physical paths,
+  ciphertext-only digests, explicit protection state, and recursive folder
+  rules. The store keeps catalogs in server application metadata outside the
+  vault and rejects missing, corrupt, or unauthenticated state. Neither the
+  primitives nor catalog are wired into vault operations; encryption stays
   inactive until the M31 release gate passes.
 - Multiple named vaults on one server are registered in application metadata.
   The registry stores IDs, display names, and filesystem paths. It is not a
