@@ -13,6 +13,11 @@ history. For behavior and deployment, see [README](../README.md).
   and asset responses are not cached. Saves use content versions and atomic
   filesystem writes; a stale version returns a conflict while preserving the
   browser draft and current server file for an explicit decision.
+- `internal/files/content.go` is the shared boundary for ordinary file reads
+  and version-checked atomic replacements. It enforces root confinement, size
+  limits, and coordination with repository mutations. Markdown reads and saves
+  use it; later M31 steps will route the remaining content operations through
+  this layer.
 - Multiple named vaults on one server are registered in application metadata.
   The registry stores IDs, display names, and filesystem paths. It is not a
   copy of note or asset content.

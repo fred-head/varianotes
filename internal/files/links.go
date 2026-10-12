@@ -97,8 +97,8 @@ func (r *Repository) PreviewMoveLinks(source, target string) (MoveLinkPreview, e
 func (r *Repository) MoveWithLinkUpdates(source, target, expectedToken string) (MoveLinkPreview, error) {
 	r.moveMu.Lock()
 	defer r.moveMu.Unlock()
-	r.contentMu.Lock()
-	defer r.contentMu.Unlock()
+	r.content.mu.Lock()
+	defer r.content.mu.Unlock()
 
 	preview, files, err := r.planMoveLinks(source, target)
 	if err != nil {

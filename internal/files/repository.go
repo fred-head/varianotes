@@ -17,12 +17,12 @@ import (
 const maxMarkdownSize = 10 << 20
 
 var (
-	ErrNotConfigured = errors.New("repository is not configured")
-	ErrInvalidPath   = errors.New("invalid repository path")
-	ErrNotMarkdown   = errors.New("file is not Markdown")
-	ErrFileTooLarge  = errors.New("Markdown file is too large")
-	ErrConflict      = errors.New("Markdown file changed since it was loaded")
-	ErrExportTooLarge = errors.New("vault archive exceeds the export size limit")
+	ErrNotConfigured        = errors.New("repository is not configured")
+	ErrInvalidPath          = errors.New("invalid repository path")
+	ErrNotMarkdown          = errors.New("file is not Markdown")
+	ErrFileTooLarge         = errors.New("Markdown file is too large")
+	ErrConflict             = errors.New("Markdown file changed since it was loaded")
+	ErrExportTooLarge       = errors.New("vault archive exceeds the export size limit")
 	ErrExportTooManyEntries = errors.New("vault archive exceeds the entry limit")
 )
 
@@ -34,10 +34,10 @@ type Node struct {
 }
 
 type Repository struct {
-	root      string
-	trashMu   sync.Mutex
-	moveMu    sync.Mutex
-	contentMu sync.Mutex
+	root    string
+	trashMu sync.Mutex
+	moveMu  sync.Mutex
+	content *contentStore
 }
 
 type Markdown struct {
@@ -47,7 +47,7 @@ type Markdown struct {
 
 func NewRepository(root string) (*Repository, error) {
 	if strings.TrimSpace(root) == "" {
-		return &Repository{}, nil
+		return &Repository{content: &contentStore{}}, nil
 	}
 
 	absolute, err := filepath.Abs(root)
@@ -66,7 +66,8 @@ func NewRepository(root string) (*Repository, error) {
 		return nil, errors.New("repository root is not a directory")
 	}
 
-	return &Repository{root: filepath.Clean(resolved)}, nil
+	cleanRoot := filepath.Clean(resolved)
+	return &Repository{root: cleanRoot, content: &contentStore{root: cleanRoot}}, nil
 }
 
 func (r *Repository) Configured() bool {
@@ -122,76 +123,25 @@ func readDirectory(root, relative string) ([]Node, error) {
 }
 
 func (r *Repository) ReadMarkdown(relative string) (Markdown, error) {
-	resolved, _, err := r.resolveMarkdown(relative)
+	if err := r.validateRelative(relative, true); err != nil {
+		return Markdown{}, err
+	}
+	content, err := r.content.Read(relative, maxMarkdownSize)
 	if err != nil {
 		return Markdown{}, err
 	}
-	// #nosec G304 -- resolveMarkdown rejects traversal, symlinks, non-regular files, and paths outside the repository root.
-	content, err := os.ReadFile(resolved)
-	if err != nil {
-		return Markdown{}, err
-	}
-	return Markdown{Content: string(content), Version: contentVersion(content)}, nil
+	return Markdown{Content: string(content.Bytes), Version: content.Version}, nil
 }
 
 func (r *Repository) WriteMarkdown(relative, content, expectedVersion string) (Markdown, error) {
-	r.contentMu.Lock()
-	defer r.contentMu.Unlock()
-	return r.writeMarkdown(relative, content, expectedVersion)
-}
-
-func (r *Repository) writeMarkdown(relative, content, expectedVersion string) (Markdown, error) {
-	resolved, info, err := r.resolveMarkdown(relative)
+	if err := r.validateRelative(relative, true); err != nil {
+		return Markdown{}, err
+	}
+	written, err := r.content.Write(relative, []byte(content), expectedVersion, maxMarkdownSize)
 	if err != nil {
 		return Markdown{}, err
 	}
-	if len(content) > maxMarkdownSize {
-		return Markdown{}, ErrFileTooLarge
-	}
-	// #nosec G304 -- resolveMarkdown rejects traversal, symlinks, non-regular files, and paths outside the repository root.
-	current, err := os.ReadFile(resolved)
-	if err != nil {
-		return Markdown{}, err
-	}
-	if expectedVersion == "" || contentVersion(current) != expectedVersion {
-		return Markdown{}, ErrConflict
-	}
-
-	temporary, err := os.CreateTemp(filepath.Dir(resolved), "."+filepath.Base(resolved)+".*.tmp")
-	if err != nil {
-		return Markdown{}, err
-	}
-	temporaryName := temporary.Name()
-	cleanup := func() {
-		_ = temporary.Close()
-		_ = os.Remove(temporaryName)
-	}
-	if err := temporary.Chmod(info.Mode().Perm()); err != nil {
-		cleanup()
-		return Markdown{}, err
-	}
-	if _, err := temporary.WriteString(content); err != nil {
-		cleanup()
-		return Markdown{}, err
-	}
-	if err := temporary.Sync(); err != nil {
-		cleanup()
-		return Markdown{}, err
-	}
-	if err := temporary.Close(); err != nil {
-		cleanup()
-		return Markdown{}, err
-	}
-	if err := os.Rename(temporaryName, resolved); err != nil {
-		cleanup()
-		return Markdown{}, err
-	}
-	if directory, err := os.Open(filepath.Dir(resolved)); err == nil {
-		_ = directory.Sync()
-		_ = directory.Close()
-	}
-
-	return Markdown{Content: content, Version: contentVersion([]byte(content))}, nil
+	return Markdown{Content: string(written.Bytes), Version: written.Version}, nil
 }
 
 func (r *Repository) resolveMarkdown(relative string) (string, os.FileInfo, error) {
