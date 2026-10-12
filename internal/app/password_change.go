@@ -395,14 +395,20 @@ func regularFileExists(filename string) (bool, error) {
 }
 
 func readRegularFile(filename string, maximum int64) ([]byte, error) {
-	info, err := os.Lstat(filename)
+	root, err := os.OpenRoot(filepath.Dir(filename))
+	if err != nil {
+		return nil, err
+	}
+	defer root.Close()
+	name := filepath.Base(filename)
+	info, err := root.Lstat(name)
 	if err != nil {
 		return nil, err
 	}
 	if !info.Mode().IsRegular() || info.Size() < 0 || info.Size() > maximum {
 		return nil, errors.New("encryption metadata file is unsafe or too large")
 	}
-	file, err := os.Open(filename)
+	file, err := root.Open(name)
 	if err != nil {
 		return nil, err
 	}
@@ -416,7 +422,7 @@ func readRegularFile(filename string, maximum int64) ([]byte, error) {
 	if err := errors.Join(readErr, closeErr); err != nil {
 		return nil, err
 	}
-	currentInfo, statErr := os.Lstat(filename)
+	currentInfo, statErr := root.Lstat(name)
 	if statErr != nil || !currentInfo.Mode().IsRegular() || !os.SameFile(info, currentInfo) || int64(len(content)) > maximum {
 		return nil, errors.New("encryption metadata changed while reading")
 	}
