@@ -163,7 +163,7 @@ func (s *Service) BeginMFAEnrollment(ctx context.Context, currentPassword, curre
 	}
 	s.credentialMu.Lock()
 	defer s.credentialMu.Unlock()
-	if err := s.VerifyPassword(ctx, currentPassword); err != nil {
+	if err := s.verifyPassword(ctx, currentPassword); err != nil {
 		return MFAEnrollment{}, ErrMFAInvalid
 	}
 	enabled, err := s.MFAEnabled(ctx)

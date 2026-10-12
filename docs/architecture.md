@@ -20,7 +20,8 @@ history. For behavior and deployment, see [README](../README.md).
   route through this layer. Later M31 steps will add encrypted storage there.
 - `internal/encryption/` contains the versioned age and key-envelope primitives
   from M31P03, the authenticated durable catalog from M31P04, the volatile
-  per-vault key manager from M31P05, and the transaction journal from M31P06.
+  per-vault key manager from M31P05, the transaction journal from M31P06, and
+  the password-envelope store used by M31P07.
   Catalogs authenticate vault/object identities, logical and physical paths,
   ciphertext-only digests, explicit protection state, and recursive folder
   rules. The transaction journal stages verified ciphertext beside vault files,
@@ -28,11 +29,19 @@ history. For behavior and deployment, see [README](../README.md).
   and recovers committed changes forward after restart. Recovery needs the
   unlocked vault key and must run before affected content is served. The store
   keeps catalogs in server application metadata outside the vault and rejects
-  missing, corrupt, or unauthenticated state. The key manager's lock, activity,
-  and lock-event routes do not unlock vaults or serve protected content. Key
-  envelopes, catalog, key manager, and transaction journal are not wired into
-  vault operations; encryption stays inactive until the M31 release gate
-  passes.
+  missing, corrupt, or unauthenticated state. M31P07 coordinates auth password
+  changes with the password-wrapped vault keys through a durable auth database
+  journal; it never rewrites note or asset bytes. Key envelopes and catalogs
+  live beside the notebook registry under `encryption/` application metadata.
+  Startup rolls back a prepared password change or completes a committed one
+  before serving requests. Password recovery without the previous password
+  leaves envelopes untouched and marks the encryption password separate from
+  later login changes. Disabling authentication checks all registered vaults and
+  remains blocked while encryption metadata or ciphertext exists, including in
+  Trash. The key manager's lock, activity, and lock-event routes do not
+  unlock vaults or serve protected content. Key envelopes, catalog, key manager,
+  and transaction journal are not wired into vault content operations;
+  encryption stays inactive until the M31 release gate passes.
 - Multiple named vaults on one server are registered in application metadata.
   The registry stores IDs, display names, and filesystem paths. It is not a
   copy of note or asset content.

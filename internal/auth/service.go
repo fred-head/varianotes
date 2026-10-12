@@ -14,14 +14,15 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const currentSchemaVersion = 6
+const currentSchemaVersion = 8
 
 type State struct {
-	Mode           Mode
-	ModeExplicit   bool
-	OwnerPrincipal string
-	SetupCompleted bool
-	SchemaVersion  int
+	Mode                       Mode
+	ModeExplicit               bool
+	OwnerPrincipal             string
+	SetupCompleted             bool
+	EncryptionPasswordSeparate bool
+	SchemaVersion              int
 }
 
 type Service struct {
@@ -138,6 +139,23 @@ var migrations = []migration{
 			`ALTER TABLE auth_mfa_configuration ADD COLUMN pending_session_hash BLOB`,
 		},
 	},
+	{
+		version: 7,
+		statements: []string{
+			`CREATE TABLE auth_password_change_journal (
+				id INTEGER PRIMARY KEY CHECK (id = 1),
+				phase TEXT NOT NULL CHECK (phase IN ('prepared', 'committed')),
+				plan BLOB NOT NULL,
+				created_at TEXT NOT NULL
+			) STRICT`,
+		},
+	},
+	{
+		version: 8,
+		statements: []string{
+			`ALTER TABLE auth_configuration ADD COLUMN encryption_password_separate INTEGER NOT NULL DEFAULT 0 CHECK (encryption_password_separate IN (0, 1))`,
+		},
+	},
 }
 
 func Open(ctx context.Context, config Config, logger *slog.Logger) (*Service, error) {
@@ -199,21 +217,32 @@ func (s *Service) Config() Config { return s.config }
 func (s *Service) State(ctx context.Context) (State, error) {
 	var state State
 	var mode string
-	var setupCompleted int
+	var setupCompleted, encryptionPasswordSeparate int
 	err := s.db.QueryRowContext(ctx, `
-		SELECT mode, owner_principal, setup_completed
+		SELECT mode, owner_principal, setup_completed, encryption_password_separate
 		FROM auth_configuration WHERE id = 1
-	`).Scan(&mode, &state.OwnerPrincipal, &setupCompleted)
+	`).Scan(&mode, &state.OwnerPrincipal, &setupCompleted, &encryptionPasswordSeparate)
 	if err != nil {
 		return State{}, fmt.Errorf("read authentication state: %w", err)
 	}
 	state.Mode = Mode(mode)
 	state.ModeExplicit = s.config.ModeExplicit
 	state.SetupCompleted = setupCompleted == 1
+	state.EncryptionPasswordSeparate = encryptionPasswordSeparate == 1
 	if err := s.db.QueryRowContext(ctx, `SELECT COALESCE(MAX(version), 0) FROM auth_schema_migrations`).Scan(&state.SchemaVersion); err != nil {
 		return State{}, fmt.Errorf("read authentication schema version: %w", err)
 	}
 	return state, nil
+}
+
+// EncryptionPasswordSeparate reports whether a password reset has separated
+// the vault unlock password from the local login password.
+func (s *Service) EncryptionPasswordSeparate(ctx context.Context) (bool, error) {
+	state, err := s.State(ctx)
+	if err != nil {
+		return false, err
+	}
+	return state.EncryptionPasswordSeparate, nil
 }
 
 func (s *Service) initialize(ctx context.Context) error {
@@ -265,6 +294,9 @@ func (s *Service) initialize(ctx context.Context) error {
 	if schemaVersion != currentSchemaVersion {
 		return fmt.Errorf("unsupported authentication schema version %d", schemaVersion)
 	}
+	if err := s.recoverPasswordChange(ctx); err != nil {
+		return err
+	}
 	if err := s.reconcileConfiguration(ctx); err != nil {
 		return err
 	}
@@ -295,6 +327,15 @@ func (s *Service) applyMigration(ctx context.Context, next migration) error {
 }
 
 func (s *Service) reconcileConfiguration(ctx context.Context) error {
+	if s.config.Mode == ModeDisabled && s.config.PasswordCoordinator != nil {
+		protected, err := s.config.PasswordCoordinator.HasProtectedContent(ctx)
+		if err != nil {
+			return fmt.Errorf("check protected vault state before disabling authentication: %w", err)
+		}
+		if protected {
+			return ErrAuthenticationDisableBlocked
+		}
+	}
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -323,12 +364,13 @@ func (s *Service) reconcileConfiguration(ctx context.Context) error {
 			`DELETE FROM auth_throttle_state`,
 			`DELETE FROM auth_password_credentials`,
 			`DELETE FROM auth_mfa_configuration`,
+			`DELETE FROM auth_password_change_journal`,
 		} {
 			if _, err := tx.ExecContext(ctx, statement); err != nil {
 				return fmt.Errorf("invalidate authentication state: %w", err)
 			}
 		}
-		if _, err := tx.ExecContext(ctx, `UPDATE auth_configuration SET mode = ?, setup_completed = 0, updated_at = ? WHERE id = 1`, s.config.Mode, now); err != nil {
+		if _, err := tx.ExecContext(ctx, `UPDATE auth_configuration SET mode = ?, setup_completed = 0, encryption_password_separate = 0, updated_at = ? WHERE id = 1`, s.config.Mode, now); err != nil {
 			return fmt.Errorf("change authentication mode: %w", err)
 		}
 		if _, err := tx.ExecContext(ctx, `INSERT INTO auth_security_events(event_type, occurred_at, outcome, details) VALUES ('mode_changed', ?, 'success', '')`, now); err != nil {

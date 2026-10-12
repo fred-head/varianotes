@@ -224,6 +224,19 @@ func (s *Service) CompleteSetup(ctx context.Context, bootstrapToken, password st
 }
 
 func (s *Service) VerifyPassword(ctx context.Context, password string) error {
+	s.credentialMu.Lock()
+	defer s.credentialMu.Unlock()
+	return s.verifyPassword(ctx, password)
+}
+
+func (s *Service) verifyPassword(ctx context.Context, password string) error {
+	phase, _, journalErr := s.pendingPasswordChange(ctx)
+	if journalErr != nil {
+		return journalErr
+	}
+	if phase != "" {
+		return ErrPasswordChangePending
+	}
 	if len(password) > maximumPasswordBytes || !utf8.ValidString(password) {
 		return ErrAuthentication
 	}

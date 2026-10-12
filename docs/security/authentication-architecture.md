@@ -91,6 +91,8 @@ The database is limited to:
 - hashed one-time setup/recovery artifacts,
 - hashed throttle keys and counters,
 - security events that contain neither credentials nor note content,
+- an interrupted password-change journal containing only encrypted old/new
+  vault-key envelopes and a transaction phase,
 - versioned migration records.
 
 It must never contain Markdown, asset bytes, vault trees, external credentials,
@@ -106,11 +108,26 @@ exclusive backup before its transaction begins. A failed migration rolls back
 and prevents startup. A database created by a newer VariaNotes version is never
 downgraded implicitly.
 
+M31P07 prepares password rewraps for every registered vault before updating the
+login credential. The auth database records the envelope plan and a `prepared`
+phase; the credential update and `committed` phase share one SQLite transaction.
+Startup rolls back a prepared plan or completes a committed plan before serving
+requests. If recovery cannot reach a registered vault, startup fails closed.
+Password recovery without the previous password changes the login credential
+only and leaves vault envelopes untouched. The envelope rewrap primitive takes
+an explicit encryption password, so a later separate encryption password does
+not depend on local login. Password recovery without the prior password records
+that separation, so future login-password changes leave the existing envelopes
+alone. OIDC identity tokens are never encryption keys.
+Explicitly disabling authentication is rejected while any registered vault has
+encryption metadata or `.age` ciphertext, including content in Trash, and also
+fails when a registered vault cannot be inspected.
+
 Changing `local`/`disabled` invalidates sessions, one-time artifacts, and
-throttling state atomically and resets setup completion. Operator-only password
-and MFA recovery commands require filesystem/container administration. Recovery
-changes authentication metadata only; it never moves, encrypts, deletes, or
-rewrites notebook repositories.
+throttling state atomically and resets setup completion after the encryption
+guard passes. Operator-only password and MFA recovery commands require
+filesystem/container administration. Password recovery changes authentication
+metadata only; it never moves, encrypts, deletes, or rewrites notebook files.
 
 ## Authentication implementation history
 
