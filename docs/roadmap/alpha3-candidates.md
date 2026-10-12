@@ -31,7 +31,7 @@ The original milestones and reboot have these current dispositions:
 | M29 managed SSH key rotation | Shipped before the reboot; removed with Git and SSH runtime support |
 | M30 visible application version | Shipped; keep |
 | Git-free notebook reboot | Inserted here, after M30 and before M31 |
-| M31 selective encryption | Deferred until the new storage, export, and recovery model is established |
+| M31 selective encryption | Planned for Alpha 3; activation remains gated by all M31 steps and security review |
 | M32 document outline | Shipped; keep |
 | M33 code block language and copy UX | Shipped; keep |
 | M34 collapsible notebook sidebar | Shipped; keep |
@@ -48,9 +48,9 @@ The reboot preserves all compatible shipped Alpha 3 features and keeps the
 remaining Alpha 3 work in the roadmap. M27's requirements remain below as the
 planning basis for Alpha 4, not as Alpha 3 scope. Git-only milestones and
 sync-derived notifications are retained here as historical decisions, with
-their supersession stated explicitly. M31 requires a fresh threat-model review
-after the reboot; this roadmap does not authorize encryption implementation
-before that review.
+their supersession stated explicitly. M31 remains part of Alpha 3. Its
+implementation and activation are governed by the checklist and release gate
+below; a UI or API must not enable encryption before the complete gate passes.
 
 ## Milestone 25 - Behavior-preserving frontend decomposition
 
@@ -243,65 +243,256 @@ Completion criteria:
   release,
 - version rendering and the `dev` fallback have focused tests.
 
-## Milestone 31 - Optional encrypted notes and folders
+## Milestone 31 - Selective encryption for notes and folders
 
-This milestone remains deferred until the Git-free storage, export, and
-operator-recovery model is established. It requires an explicit design and
-threat-model review before code is implemented because opaque ciphertext
-changes VariaNotes's ordinary-Markdown portability guarantee. The goal is
-deliberate extra protection for selected notes or folders, independent of
-authentication and MFA.
+M31 remains in Alpha 3. This checklist is the implementation plan. **No step
+is marked complete.** M31 is not complete until P01–P18 are complete and the
+independent security review in P17 has passed. Encryption activation must stay
+disabled in the UI, API, and any operator command until the P18 release gate
+passes.
 
-Design gates:
+The size labels are relative estimates, not measured durations: S is small, M
+is medium, and L is large or has substantial failure-recovery work. Each step
+requires its listed tests; P17 adds end-to-end and adversarial coverage.
 
-- define whether encryption protects copied vault files and operator backups,
-  the server's disk, or also a compromised running VariaNotes server; server-side
-  decryption cannot protect plaintext from a compromised running server,
-- select a documented, interoperable encrypted file format that can be decrypted
-  with maintained tools outside VariaNotes; recovery must never require the
-  VariaNotes application itself,
-- document which metadata remains visible, including filenames, folder layout,
-  file sizes, modification patterns, and asset relationships,
-- define password/key creation, unlocking, rotation, backup, export, and loss
-  recovery separately from the login password and MFA configuration,
-- decide whether protection is selected only at note/folder creation or can be
-  applied to existing files; conversion cannot retract plaintext copies already
-  retained in operator backups,
-- decide how encrypted images/assets, search, Trash, save conflicts, PWA
-  behavior, autosave, and ZIP export work without leaking plaintext,
-- obtain an explicit product decision for the portability exception: encrypted
-  content remains ordinary vault files but is not directly readable as plain
-  Markdown until decrypted with compatible external tooling.
+### Product decisions and security boundaries
 
-Security requirements:
+- **Protection goal:** protect fully converted vault files and later server
+  backups from reading without the password or key. The server decrypts content
+  while unlocked. An attacker controlling the running, unlocked server can read
+  plaintext and keys and may capture a password entered later. This is not
+  end-to-end encryption.
+- **Visible information:** filenames, folder layout, titles derived from
+  filenames, file sizes, modification patterns, and some asset relationships
+  remain visible. Earlier plaintext backups, snapshots, copies, and retained
+  storage blocks are not retroactively protected or securely erased.
+- **Keys and authentication:** a random vault key protects content keys; the
+  password protects the vault key. The proposed age format creates a random key
+  for each file. A regular password change rewraps the vault key without
+  rewriting content. Local login initially supplies the unlock password. Later
+  OIDC must use a separate encryption password; OIDC tokens are never keys.
+  Encryption cannot be newly enabled without login. Login cannot be disabled
+  while encrypted data remains unless it is decrypted first or a separate
+  encryption password is established.
+- **Recovery:** provide one high-entropy recovery code, shown once during setup
+  or replacement and stored separately by the user. Recovery preserves
+  ciphertext and permits password replacement. Old backups retain their old
+  password/recovery envelopes; rewrapping current keys does not revoke old
+  copies.
+- **Files and policy:** encrypt note contents, images, and attachments; keep
+  filenames and folder names visible. A protected folder recursively protects
+  all current and future descendants, with no unprotected exceptions. A single
+  note may be protected in an unprotected folder. A shared attachment is one
+  encrypted object for every reference; never create a plaintext duplicate.
+  While locked, an unprotected note referencing it shows “Geschützter Anhang”.
+- **Moves and conversion:** moving unprotected content into a protected folder
+  encrypts it. Moving protected content out requires an explicit choice to keep
+  protection or decrypt it; for a protected folder the choice applies to the
+  whole subtree. Keeping protection persists after the move. Protecting existing
+  content also converts existing attachments. On failure, preserve originals
+  and report a recoverable incomplete state; never present partial conversion
+  as complete.
+- **Lock and search:** keep the data key in server memory only while unlocked;
+  lock after 15 minutes without user activity, logout, restart, or manual lock.
+  Enforce state across tabs and sessions and reject late responses. Protected
+  content is searchable only while unlocked. Do not persist a plaintext index;
+  discard in-memory search data on lock.
+- **Export:** every ZIP containing protected content asks again for the current
+  unlock password and produces an unencrypted plaintext ZIP. An export without
+  protected content does not ask. Warn that the ZIP is unencrypted and earlier
+  backups remain plaintext.
+- **Format and failures:** use a maintained authenticated encryption format
+  that an external tool can decrypt without VariaNotes; age is the proposed
+  baseline, subject to P03 validation. Authenticate catalog paths and object
+  identities because file encryption alone does not prevent swaps or full
+  rollback. Fail closed on corruption, unknown versions, missing keys, and
+  invalid metadata; never fall back to plaintext.
+- **Operational limits:** do not claim physical memory erasure or secure removal
+  of prior SSD/filesystem copies. Account for swap, core dumps, proxy buffering,
+  temporary files, browser memory, and external programs writing into protected
+  folders. Unsafe or ambiguous filesystem entries block conversion.
 
-- use a focused, maintained cryptographic library and established authenticated
-  encryption; never design custom cryptography or silently downgrade encryption,
-- never save plaintext copies, keys, passwords, recovery material, editor
-  caches, previews, search indexes, temporary files, or logs into the vault,
-- keep encrypted and unencrypted content clearly distinguishable and require
-  deliberate confirmation when changing protection state,
-- fail closed on corrupt data, missing keys, authentication failure, interrupted
-  writes, and unsupported format versions while preserving the original bytes,
-- use atomic writes and retain a documented external recovery/decryption path,
-- prevent sensitive plaintext from entering browser-persistent storage or the
-  service-worker cache,
-- cover key handling, path confinement, tampering, rollback, mixed encrypted and
-  plain folders, operator backups, conflicts, and recovery with adversarial
-  tests and an independent security review.
+### Ordered implementation steps
 
-Completion criteria:
+- [ ] **P01 — Shared file access layer** *(dependencies: none; size: M)*
+  **Goal/scope:** common content reader/writer and version-check boundary,
+  initially preserving ordinary files; retain path confinement and filesystem
+  coordination in this layer.
+  **Acceptance/tests:** byte-identical ordinary reads/writes; stale versions
+  conflict; traversal, symlink escape, non-regular files, and unsafe sizes are
+  rejected; concurrent writes have deterministic outcomes.
 
-- selected notes and complete folder trees can be encrypted, unlocked, edited,
-  backed up, restored, and deliberately decrypted without data loss,
-- an external documented tool can recover the Markdown and assets without
-  VariaNotes,
-- losing the encryption secret is clearly explained as unrecoverable and cannot
-  silently damage unencrypted notebooks,
-- encrypted content never appears in plaintext in application metadata, logs,
-  caches, recovery artifacts, or unencrypted assets,
-- the feature does not ship until its threat model, format, recovery procedure,
-  migration behavior, and security review are complete.
+- [ ] **P02 — Route every content path through the shared layer**
+  *(dependencies: P01; size: L)*
+  **Goal/scope:** remove direct content access from note operations, link preview
+  and rewrite, assets, search, conflicts, and ZIP export, including export's
+  separately created repository.
+  **Acceptance/tests:** inventory and exercise every content path; current
+  plaintext behavior and conflict handling remain; no route bypasses the layer.
+
+- [ ] **P03 — Encryption format and key envelopes**
+  *(dependencies: P01; size: M)*
+  **Goal/scope:** integrate the selected maintained format, random vault key,
+  per-file random content keys, password-protected vault-key envelope, format
+  version, and bounded password derivation.
+  **Acceptance/tests:** round-trip text, binary, empty, and large files; official
+  age CLI decrypts test files; wrong password, tampering, truncation, and
+  unsupported versions fail without returning plaintext.
+
+- [ ] **P04 — Authenticated catalog and durable rules**
+  *(dependencies: P01, P03; size: M)*
+  **Goal/scope:** versioned catalog of vault/object IDs, logical/physical paths,
+  ciphertext digests, explicit note protection, and recursive folder rules;
+  authenticate metadata and bind entries to objects.
+  **Acceptance/tests:** empty protected folders retain rules after restart;
+  tampered, swapped, missing, or unsupported entries fail closed; `.age`
+  collisions are detected; no note text, preview, or plaintext fingerprint is
+  stored in the catalog.
+
+- [ ] **P05 — In-memory key manager and server lock state**
+  *(dependencies: P03, P04; size: M)*
+  **Goal/scope:** central key lifetime, per-session grants, 15-minute inactivity
+  lock, logout/manual/restart lock, tab notifications, and stale-response
+  invalidation.
+  **Acceptance/tests:** no protected API returns plaintext while locked; other
+  sessions must unlock; background requests do not extend timeout; restart
+  starts locked; logout/manual lock revoke grants; late responses stay hidden.
+
+- [ ] **P06 — Transaction journal and restart recovery**
+  *(dependencies: P01, P03, P04; size: L)*
+  **Goal/scope:** reusable prepare, ciphertext staging, verification, commit
+  point, and forward recovery for changes spanning content and catalog files.
+  **Acceptance/tests:** inject failures at writes, syncs, renames, and commit
+  boundaries; before commit the old state survives, after commit restart
+  completes forward; full disk and permission errors preserve originals and
+  block affected content; no plaintext staging files remain.
+
+- [ ] **P07 — Password changes and authentication-mode rules**
+  *(dependencies: P03–P06; size: L)*
+  **Goal/scope:** coordinate login credential and vault-envelope changes;
+  support later separate encryption password; guard login disablement in runtime
+  and startup configuration.
+  **Acceptance/tests:** password change rewrites envelopes but not content;
+  interruption across vaults/auth database resumes safely; unavailable
+  registered vault blocks partial change; password reset without old password
+  preserves ciphertext/envelopes; disable rules include encrypted Trash; OIDC
+  credentials are never keys.
+
+- [ ] **P08 — One-time recovery code**
+  *(dependencies: P03–P07; size: L)*
+  **Goal/scope:** code creation, one-time display, user confirmation, password
+  loss recovery, replacement, and multi-vault envelope update.
+  **Acceptance/tests:** private code is not persisted on server; setup activates
+  only after envelopes verify; wrong code changes nothing; interrupted recovery
+  does not consume old code early; success changes password and code, revokes
+  sessions, and locks vaults; documented external recovery works.
+
+- [ ] **P09 — Encrypted note reads, saves, and conflicts**
+  *(dependencies: P01–P06; size: M)*
+  **Goal/scope:** route protected note reads, creates, saves, and conflict
+  resolution through policy-aware encrypted storage.
+  **Acceptance/tests:** protected saves and temporary files contain only
+  ciphertext; creation in protected folders is encrypted from the first write;
+  stale saves preserve draft and server version; corrupt data never opens as
+  Markdown or gets overwritten.
+
+- [ ] **P10 — Shared images and attachments**
+  *(dependencies: P01–P06, P09; size: L)*
+  **Goal/scope:** stable attachment identity and safe reference resolution;
+  encrypted upload/read and global protection when any protected rule applies.
+  **Acceptance/tests:** shared bytes exist once and are encrypted; locked
+  references show “Geschützter Anhang”; removing one reference does not decrypt
+  or delete a still-used object; encoded/traversal paths and bounded large-file
+  streams are covered; multipart upload leaves no plaintext spill files.
+
+- [ ] **P11 — Convert existing notes, folders, and attachments**
+  *(dependencies: P04, P06, P09, P10; size: L)*
+  **Goal/scope:** preflight, inventory, stage, verify, and convert selected
+  existing content, including recursive files and associated Trash.
+  **Acceptance/tests:** detect collisions, symlinks, hardlinks, and unsupported
+  entries before conversion; inject cancellation, disk errors, and restart at
+  every phase; preserve originals before commit; resume after commit; never show
+  partial conversion as complete.
+
+- [ ] **P12 — Rename, move, and link updates**
+  *(dependencies: P06, P09–P11; size: L)*
+  **Goal/scope:** enforce keep-protected/decrypt choices on moves; preserve
+  recursive folder policy and update links through encrypted writes.
+  **Acceptance/tests:** unprotected-to-protected converts automatically;
+  protected-to-unprotected requires a choice; protection survives “keep”;
+  decrypting under a protected parent is rejected; stale previews and interrupted
+  multi-note link updates do not corrupt files.
+
+- [ ] **P13 — Trash and restore**
+  *(dependencies: P06, P10–P12; size: M)*
+  **Goal/scope:** retain encryption/policy across Trash, restore, and permanent
+  delete; respect shared references.
+  **Acceptance/tests:** protected Trash remains ciphertext; restore into a
+  protected destination encrypts; restore out requires the same keep/decrypt
+  decision as a move; collisions preserve both copies; abort/restart is
+  recoverable; unknown references cause retention or blocked deletion, not data
+  loss.
+
+- [ ] **P14 — Search, caches, and plaintext leak checks**
+  *(dependencies: P05, P09, P10; size: M)*
+  **Goal/scope:** search protected content only while unlocked; review derived
+  previews, API responses, logs, temporary files, browser storage, and service
+  worker caching.
+  **Acceptance/tests:** no persistent plaintext index; lock discards results;
+  late responses stay hidden; sentinel content/passwords are absent from logs,
+  metadata, temp files, persistent browser storage, and API caches.
+
+- [ ] **P15 — Reauthenticated plaintext ZIP export**
+  *(dependencies: P05, P06, P09–P14; size: L)*
+  **Goal/scope:** snapshot export contents, re-prompt for current password if any
+  protected note or shared attachment is included, then stream logical plaintext
+  paths into an unencrypted ZIP.
+  **Acceptance/tests:** protected export always prompts and unprotected export
+  never does; concurrent mutations cannot bypass reauthentication; corrupt files
+  fail before streaming; no server-side plaintext ZIP staging; keyfiles/journals
+  are excluded; lock/logout invalidates the one-use grant.
+
+- [ ] **P16 — Protection, lock, recovery, and export UI**
+  *(dependencies: P05, P07–P15; size: M)*
+  **Goal/scope:** expose status, protect/unprotect choices, unlock/lock, recovery,
+  shared-attachment placeholder, and backup/export warnings.
+  **Acceptance/tests:** wording and choices match product decisions; unsaved
+  drafts remain browser-memory-only and hidden on lock; tabs follow server state;
+  activation stays gated even if UI code merges earlier.
+
+- [ ] **P17 — End-to-end fault matrix and independent security review**
+  *(dependencies: P01–P16; size: L)*
+  **Goal/scope:** exercise complete flows and obtain independent review of crypto
+  integration, transaction recovery, auth coordination, and data leaks.
+  **Acceptance/tests:** cover conversion/save/move/Trash/export aborts; restarts at
+  journal boundaries; corrupt files/envelopes; password change and recovery
+  interruption; multi-session lock races; shared assets; and byte-for-byte
+  external recovery without VariaNotes. Resolve all blocking findings before
+  release; document any remaining finding and confirm it does not weaken the
+  agreed security boundary. Obtain reviewer sign-off.
+
+- [ ] **P18 — Operations documentation and release gate**
+  *(dependencies: P01–P17; size: S)*
+  **Goal/scope:** document setup, recovery, external decryption, backups, visible
+  metadata, memory limits, earlier plaintext copies, and plaintext ZIPs; enable
+  the feature only after all mandatory steps and review pass.
+  **Acceptance/tests:** follow external recovery from a complete test backup;
+  verify no activation path works before the gate; pass new/adopted-vault flows;
+  record P01–P18 and security review complete before marking M31 complete.
+
+### M31 completion and activation gate
+
+- P01–P18 are mandatory, ordered, and initially unchecked. Each step's tests
+  must pass before it is completed.
+- P17's independent security review and end-to-end external recovery are
+  release conditions, not follow-up work.
+- P16 may be developed behind a disabled gate, but no UI, API, or operator
+  command may activate encryption before P18.
+- If a data path bypasses the shared layer, a failure can expose or lose content,
+  or external recovery cannot decrypt the full vault without VariaNotes, the
+  activation gate remains closed.
+- M31 is complete only after every checklist step and the security review pass.
+  Earlier plaintext backups and physical remnants remain outside this claim.
 
 ## Milestone 32 - Document outline / table of contents
 
