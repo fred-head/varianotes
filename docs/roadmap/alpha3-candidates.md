@@ -330,14 +330,20 @@ requires its listed tests; P17 adds end-to-end and adversarial coverage.
   **Acceptance/tests:** inventory and exercise every content path; current
   plaintext behavior and conflict handling remain; no route bypasses the layer.
 
-- [ ] **P03 — Encryption format and key envelopes**
+- [x] **P03 — Encryption format and key envelopes**
   *(dependencies: P01; size: M)*
   **Goal/scope:** integrate the selected maintained format, random vault key,
   per-file random content keys, password-protected vault-key envelope, format
   version, and bounded password derivation.
   **Acceptance/tests:** round-trip text, binary, empty, and large files; official
   age CLI decrypts test files; wrong password, tampering, truncation, and
-  unsupported versions fail without returning plaintext.
+  unsupported versions fail without returning plaintext. Implemented in
+  `internal/encryption` with age v1.3.2, age scrypt at a fixed and capped work
+  factor, per-file X25519 identities, and XChaCha20-Poly1305 content-key
+  envelopes bound to object IDs. CI builds the pinned official age CLI for the
+  interoperability test. These primitives are not connected to vault
+  reads, writes, APIs, or operator commands; the M31 activation gate remains
+  closed.
 
 - [ ] **P04 — Authenticated catalog and durable rules**
   *(dependencies: P01, P03; size: M)*

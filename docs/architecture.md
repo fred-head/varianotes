@@ -18,6 +18,9 @@ history. For behavior and deployment, see [README](../README.md).
   limits, and coordination with repository mutations. Markdown and asset reads
   and writes, note operations, link rewrites, search, Trash, and ZIP export all
   route through this layer. Later M31 steps will add encrypted storage there.
+- `internal/encryption/` contains the versioned age and key-envelope primitives
+  from M31P03. They are not wired into vault operations; encryption stays
+  inactive until the M31 release gate passes.
 - Multiple named vaults on one server are registered in application metadata.
   The registry stores IDs, display names, and filesystem paths. It is not a
   copy of note or asset content.
