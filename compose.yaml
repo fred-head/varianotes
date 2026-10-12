@@ -1,0 +1,38 @@
+name: varianotes
+
+services:
+  varianotes:
+    build: .
+    image: ghcr.io/fred-head/varianotes:local
+    init: true
+    restart: unless-stopped
+    ports:
+      - "${VARIANOTES_PUBLISH_ADDR:-127.0.0.1}:8080:8080"
+    volumes:
+      - varianotes-data:/data
+    environment:
+      VARIANOTES_NOTEBOOKS_DIR: "${VARIANOTES_NOTEBOOKS_DIR:-/data/notebooks}"
+      VARIANOTES_NOTEBOOK_METADATA: "${VARIANOTES_NOTEBOOK_METADATA:-/data/app/notebooks.json}"
+      VARIANOTES_AUTH_MODE: "${VARIANOTES_AUTH_MODE:-local}"
+      VARIANOTES_AUTH_METADATA: "${VARIANOTES_AUTH_METADATA:-/data/app/auth.db}"
+      VARIANOTES_AUTH_ENCRYPTION_KEY_FILE: "${VARIANOTES_AUTH_ENCRYPTION_KEY_FILE:-/data/app/auth.key}"
+      VARIANOTES_SESSION_COOKIE_SECURE: "${VARIANOTES_SESSION_COOKIE_SECURE:-true}"
+      VARIANOTES_TRUSTED_PROXIES: "${VARIANOTES_TRUSTED_PROXIES:-}"
+      VARIANOTES_TRUSTED_ORIGINS: "${VARIANOTES_TRUSTED_ORIGINS:-}"
+      VARIANOTES_ADDR: "${VARIANOTES_ADDR:-:8080}"
+    read_only: true
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,noexec,size=64m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--spider", "http://127.0.0.1:8080/api/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+
+volumes:
+  varianotes-data:

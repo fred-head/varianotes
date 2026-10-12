@@ -1,0 +1,21 @@
+.git
+.github
+.agents
+.codex
+.varianotes-data
+# Keep pre-existing workstation data out of future build contexts.
+.repoquill-data
+data
+testada
+testdata
+.env
+.env.*
+*.pem
+*.key
+id_rsa
+id_ed25519
+frontend/node_modules
+frontend/dist
+*.md
+!README.md
+!THIRD-PARTY-NOTICES.md

@@ -1,0 +1,403 @@
+name: Publish alpha container
+
+on:
+  push:
+    tags:
+      - "v*.*.*-alpha.*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  GO_VERSION: 1.26.9
+  NODE_VERSION: "24"
+  IMAGE_NAME: ghcr.io/fred-head/varianotes
+
+jobs:
+  verify:
+    name: Verify tagged source
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.release.outputs.version }}
+      channel: ${{ steps.release.outputs.channel }}
+      sha_tag: ${{ steps.release.outputs.sha_tag }}
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Validate release metadata
+        id: release
+        shell: bash
+        run: |
+          ./scripts/check-release-version.sh "${GITHUB_REF_NAME}"
+          version="${GITHUB_REF_NAME#v}"
+          channel="${version%%-alpha.*}-alpha"
+          echo "version=${version}" >> "${GITHUB_OUTPUT}"
+          echo "channel=${channel}" >> "${GITHUB_OUTPUT}"
+          echo "sha_tag=sha-${GITHUB_SHA}" >> "${GITHUB_OUTPUT}"
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: false
+
+      - name: Backend tests and analysis
+        run: |
+          go test ./...
+          go vet ./...
+          go test -race ./...
+
+      - name: Install and run gosec
+        run: |
+          go install github.com/securego/gosec/v2/cmd/gosec@v2.29.0
+          gosec -quiet ./...
+
+      - name: Install and run govulncheck
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@v1.7.0
+          govulncheck ./...
+
+      - name: Frontend tests, build, and audit
+        working-directory: frontend
+        run: |
+          npm ci
+          npm run lint
+          npm test
+          npm run build
+          npm audit
+
+  secrets:
+    name: Scan tagged Git history
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out complete history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Scan secrets
+        uses: gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e # v3.0.0
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+
+  build-candidate:
+    name: Build immutable release candidate
+    runs-on: ubuntu-latest
+    needs: [verify, secrets]
+    outputs:
+      digest: ${{ steps.candidate.outputs.digest || steps.push.outputs.digest }}
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@1f40c72289eff860ee54a304f1438e3cff362e0a # v4.3.0
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Resolve or reserve immutable candidate
+        id: candidate
+        shell: bash
+        run: |
+          ensure_absent() {
+            local reference output
+            reference="$1"
+            if output="$(docker buildx imagetools inspect "${reference}" 2>&1)"; then
+              echo "Immutable image reference already exists: ${reference}" >&2
+              exit 1
+            fi
+            if ! grep --ignore-case --extended-regexp 'not found|manifest unknown|no such manifest' <<<"${output}" >/dev/null; then
+              echo "Could not safely determine whether ${reference} exists:" >&2
+              echo "${output}" >&2
+              exit 1
+            fi
+          }
+
+          ensure_absent "${IMAGE_NAME}:${{ needs.verify.outputs.version }}"
+
+          candidate="${IMAGE_NAME}:${{ needs.verify.outputs.sha_tag }}"
+          if output="$(docker buildx imagetools inspect "${candidate}" 2>&1)"; then
+            digest="$(awk '$1 == "Digest:" { print $2; exit }' <<<"${output}")"
+            if [[ ! "${digest}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+              echo "Could not resolve the existing candidate digest." >&2
+              exit 1
+            fi
+            echo "Reusing immutable candidate ${candidate}@${digest}"
+            echo "digest=${digest}" >> "${GITHUB_OUTPUT}"
+            echo "exists=true" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+          if ! grep --ignore-case --extended-regexp 'not found|manifest unknown|no such manifest' <<<"${output}" >/dev/null; then
+            echo "Could not safely determine whether ${candidate} exists:" >&2
+            echo "${output}" >&2
+            exit 1
+          fi
+          echo "exists=false" >> "${GITHUB_OUTPUT}"
+
+      - name: Build and push immutable multi-architecture candidate
+        id: push
+        if: steps.candidate.outputs.exists != 'true'
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ env.IMAGE_NAME }}:${{ needs.verify.outputs.sha_tag }}
+          build-args: |
+            VERSION=${{ needs.verify.outputs.version }}
+            VCS_REF=${{ github.sha }}
+          provenance: mode=max
+          sbom: true
+
+  validate-image:
+    name: Validate exact candidate on ${{ matrix.platform }}
+    runs-on: ubuntu-latest
+    needs: [verify, build-candidate]
+    permissions:
+      contents: read
+      packages: read
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - platform: linux/amd64
+            slug: amd64
+          - platform: linux/arm64
+            slug: arm64
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@1f40c72289eff860ee54a304f1438e3cff362e0a # v4.3.0
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Pull exact architecture from candidate digest
+        run: |
+          candidate="${IMAGE_NAME}@${{ needs.build-candidate.outputs.digest }}"
+          docker pull --platform "${{ matrix.platform }}" "${candidate}"
+          docker tag "${candidate}" "varianotes:validate-${{ matrix.slug }}"
+
+      - name: Scan architecture image
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: varianotes:validate-${{ matrix.slug }}
+          format: table
+          scanners: vuln,secret
+          severity: HIGH,CRITICAL
+          exit-code: "1"
+
+      - name: Smoke-test architecture image
+        run: >-
+          ./scripts/ci-container-check.sh
+          varianotes:validate-${{ matrix.slug }}
+          "${{ needs.verify.outputs.version }}"
+
+  publish:
+    name: Promote verified candidate
+    runs-on: ubuntu-latest
+    needs: [verify, build-candidate, validate-image]
+    outputs:
+      digest: ${{ needs.build-candidate.outputs.digest }}
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Verify candidate digest and reserve immutable version
+        shell: bash
+        run: |
+          candidate="${IMAGE_NAME}:${{ needs.verify.outputs.sha_tag }}"
+          output="$(docker buildx imagetools inspect "${candidate}")"
+          resolved="$(awk '$1 == "Digest:" { print $2; exit }' <<<"${output}")"
+          expected="${{ needs.build-candidate.outputs.digest }}"
+          if [[ "${resolved}" != "${expected}" ]]; then
+            echo "Candidate digest changed: expected ${expected}, found ${resolved}" >&2
+            exit 1
+          fi
+
+          version="${IMAGE_NAME}:${{ needs.verify.outputs.version }}"
+          if output="$(docker buildx imagetools inspect "${version}" 2>&1)"; then
+            echo "Immutable image reference already exists: ${version}" >&2
+            exit 1
+          fi
+          if ! grep --ignore-case --extended-regexp 'not found|manifest unknown|no such manifest' <<<"${output}" >/dev/null; then
+            echo "Could not safely determine whether ${version} exists:" >&2
+            echo "${output}" >&2
+            exit 1
+          fi
+
+      - name: Attach immutable version to verified digest
+        run: >-
+          docker buildx imagetools create
+          --tag "${IMAGE_NAME}:${{ needs.verify.outputs.version }}"
+          "${IMAGE_NAME}@${{ needs.build-candidate.outputs.digest }}"
+
+      - name: Verify immutable aliases and architectures
+        shell: bash
+        run: |
+          version_manifest="${RUNNER_TEMP}/varianotes-version-manifest.json"
+          sha_manifest="${RUNNER_TEMP}/varianotes-sha-manifest.json"
+          docker buildx imagetools inspect --raw \
+            "${IMAGE_NAME}:${{ needs.verify.outputs.version }}" > "${version_manifest}"
+          docker buildx imagetools inspect --raw \
+            "${IMAGE_NAME}:${{ needs.verify.outputs.sha_tag }}" > "${sha_manifest}"
+          cmp "${version_manifest}" "${sha_manifest}"
+          node - "${version_manifest}" <<'NODE'
+          const fs = require('node:fs')
+          const manifest = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'))
+          const platforms = new Set(
+            (manifest.manifests ?? [])
+              .map((entry) => `${entry.platform?.os}/${entry.platform?.architecture}`)
+          )
+          for (const expected of ['linux/amd64', 'linux/arm64']) {
+            if (!platforms.has(expected)) {
+              console.error(`Published manifest is missing ${expected}`)
+              process.exit(1)
+            }
+          }
+          NODE
+
+      - name: Create signed GitHub attestation
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-name: ${{ env.IMAGE_NAME }}
+          subject-digest: ${{ needs.build-candidate.outputs.digest }}
+          subject-version: ${{ needs.verify.outputs.version }}
+          push-to-registry: true
+
+      - name: Move Alpha channel to verified immutable image
+        shell: bash
+        run: |
+          version_manifest="${RUNNER_TEMP}/varianotes-version-manifest.json"
+          channel_manifest="${RUNNER_TEMP}/varianotes-channel-manifest.json"
+          docker buildx imagetools create \
+            --tag "${IMAGE_NAME}:${{ needs.verify.outputs.channel }}" \
+            "${IMAGE_NAME}:${{ needs.verify.outputs.version }}"
+          docker buildx imagetools inspect --raw \
+            "${IMAGE_NAME}:${{ needs.verify.outputs.channel }}" > "${channel_manifest}"
+          cmp "${version_manifest}" "${channel_manifest}"
+
+      - name: Summarize published image
+        shell: bash
+        run: |
+          {
+            echo "## Published VariaNotes alpha"
+            echo
+            echo "- Image: \`${IMAGE_NAME}\`"
+            echo "- Version: \`${{ needs.verify.outputs.version }}\`"
+            echo "- Channel: \`${{ needs.verify.outputs.channel }}\`"
+            echo "- Git tag: \`${GITHUB_REF_NAME}\`"
+            echo "- Architectures: \`linux/amd64\`, \`linux/arm64\`"
+            echo "- Digest: \`${{ needs.build-candidate.outputs.digest }}\`"
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+  release-record:
+    name: Publish immutable Alpha release record
+    runs-on: ubuntu-latest
+    needs: [verify, publish]
+    permissions:
+      contents: write
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Create prerelease with security and recovery evidence
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.verify.outputs.version }}
+          CHANNEL: ${{ needs.verify.outputs.channel }}
+          DIGEST: ${{ needs.publish.outputs.digest }}
+        shell: bash
+        run: |
+          notes="${RUNNER_TEMP}/varianotes-release-notes.md"
+          {
+            echo "## VariaNotes ${VERSION}"
+            echo
+            echo "VariaNotes is Alpha software. Back up the complete persistent \`/data\` directory and review the linked limitations before upgrading important notebooks."
+            echo
+            echo "### Container"
+            echo
+            echo "- Immutable image: \`${IMAGE_NAME}:${VERSION}\`"
+            echo "- Moving Alpha channel: \`${IMAGE_NAME}:${CHANNEL}\`"
+            echo "- Architectures: \`linux/amd64\`, \`linux/arm64\`"
+            echo "- Manifest digest: \`${DIGEST}\`"
+            echo
+            echo "The published OCI artifact includes a generated SBOM and signed GitHub provenance attestation. Verify it with GitHub's artifact-attestation tooling before deployment."
+            echo
+            echo "### Upgrade and migration"
+            echo
+            echo "1. Back up the complete \`/data\` volume, including vault files and application metadata."
+            echo "2. Read the [Alpha release guide](https://github.com/${GITHUB_REPOSITORY}/blob/${GITHUB_REF_NAME}/ALPHA-RELEASE.md) and [known limitations](https://github.com/${GITHUB_REPOSITORY}/blob/${GITHUB_REF_NAME}/KNOWN-LIMITATIONS.md)."
+            echo "3. Pull and deploy the immutable version tag, then complete the documented operator smoke test before relying on it."
+            echo
+            echo "Canonical notes and assets remain ordinary Markdown and files in the vault. Any application-metadata migration or special limitation must be documented in the release guide before this tag is created."
+            echo
+            echo "### Rollback"
+            echo
+            echo "Stop VariaNotes, preserve the failed-state volume for diagnosis, restore the pre-upgrade \`/data\` backup when metadata compatibility requires it, and deploy the previous immutable image tag. Never move or overwrite this release tag to perform a rollback."
+            echo
+            echo "Security issues must be reported through [private vulnerability reporting](https://github.com/${GITHUB_REPOSITORY}/security/advisories/new), not a public issue."
+          } > "${notes}"
+          gh release create "${GITHUB_REF_NAME}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --title "VariaNotes ${VERSION}" \
+            --notes-file "${notes}" \
+            --prerelease \
+            --latest=false \
+            --verify-tag

@@ -1,0 +1,196 @@
+name: Scheduled security surveillance
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: read
+
+concurrency:
+  group: scheduled-security
+  cancel-in-progress: false
+
+env:
+  GO_VERSION: 1.26.9
+  NODE_VERSION: "24"
+  IMAGE_NAME: ghcr.io/fred-head/varianotes
+  LATEST_ALPHA_VERSION: ${{ vars.VARIANOTES_LATEST_ALPHA_VERSION }}
+
+jobs:
+  go-security:
+    name: Scheduled Go security
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: false
+
+      - name: Static analysis
+        run: go vet ./...
+
+      - name: Install gosec
+        run: go install github.com/securego/gosec/v2/cmd/gosec@v2.29.0
+
+      - name: Go security static analysis
+        run: gosec -quiet ./...
+
+      - name: Install govulncheck
+        run: go install golang.org/x/vuln/cmd/govulncheck@v1.7.0
+
+      - name: Scan Go call graph for known vulnerabilities
+        run: govulncheck ./...
+
+  frontend-security:
+    name: Scheduled frontend security
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Reproducible dependency install
+        run: npm ci
+
+      - name: Static analysis
+        run: npm run lint
+
+      - name: Scan npm dependency graph
+        run: npm audit
+
+  secret-history:
+    name: Scheduled repository secret scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out complete history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Scan Git history and working tree
+        uses: gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e # v3.0.0
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+
+  fresh-image:
+    name: Scan fresh production image
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Build with current base images
+        run: >-
+          docker build
+          --pull
+          --build-arg VERSION=scheduled-${GITHUB_SHA}
+          --build-arg VCS_REF=${GITHUB_SHA}
+          --tag varianotes:scheduled
+          .
+
+      - name: Produce Trivy report
+        id: trivy
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: varianotes:scheduled
+          format: json
+          output: trivy-fresh.json
+          scanners: vuln,secret
+          severity: HIGH,CRITICAL
+          exit-code: "0"
+
+      - name: Retain fresh-image report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: trivy-fresh-${{ github.run_id }}
+          path: trivy-fresh.json
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Enforce fresh-image policy
+        if: always()
+        run: ./scripts/evaluate-trivy-report.sh trivy-fresh.json varianotes:scheduled
+
+  published-images:
+    name: Scan published ${{ matrix.kind }} image
+    if: ${{ vars.VARIANOTES_LATEST_ALPHA_VERSION != '' }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - kind: immutable
+            tag: ${{ vars.VARIANOTES_LATEST_ALPHA_VERSION }}
+          - kind: channel
+            tag: 0.1.0-alpha
+    steps:
+      - name: Check out policy script
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Resolve published digest
+        id: image
+        run: |
+          reference="${IMAGE_NAME}:${{ matrix.tag }}"
+          docker pull "${reference}"
+          digest="$(docker image inspect --format '{{index .RepoDigests 0}}' "${reference}")"
+          echo "reference=${reference}" >> "${GITHUB_OUTPUT}"
+          echo "digest=${digest}" >> "${GITHUB_OUTPUT}"
+          {
+            echo "## Published image under test"
+            echo
+            echo "- Kind: \`${{ matrix.kind }}\`"
+            echo "- Tag: \`${reference}\`"
+            echo "- Resolved digest: \`${digest}\`"
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Produce Trivy report
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ${{ steps.image.outputs.reference }}
+          format: json
+          output: trivy-published-${{ matrix.kind }}.json
+          scanners: vuln,secret
+          severity: HIGH,CRITICAL
+          exit-code: "0"
+
+      - name: Retain published-image report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: trivy-published-${{ matrix.kind }}-${{ github.run_id }}
+          path: trivy-published-${{ matrix.kind }}.json
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Enforce published-image policy
+        if: always()
+        run: >-
+          ./scripts/evaluate-trivy-report.sh
+          trivy-published-${{ matrix.kind }}.json
+          "${{ steps.image.outputs.digest || steps.image.outputs.reference }}"
