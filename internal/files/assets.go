@@ -8,7 +8,6 @@ import (
 	"net/http"
 	"os"
 	"path"
-	"path/filepath"
 	"strings"
 )
 
@@ -33,10 +32,23 @@ var imageExtensions = map[string]string{
 }
 
 func (r *Repository) SaveAsset(noteRelative string, source io.Reader) (Asset, error) {
-	notePath, _, err := r.resolveMarkdown(noteRelative)
+	r.content.mu.Lock()
+	defer r.content.mu.Unlock()
+
+	if err := r.validateRelative(noteRelative, true); err != nil {
+		return Asset{}, err
+	}
+	noteInfo, err := r.content.lstat(noteRelative)
 	if err != nil {
 		return Asset{}, err
 	}
+	if !noteInfo.Mode().IsRegular() {
+		return Asset{}, ErrInvalidPath
+	}
+	if noteInfo.Size() > maxMarkdownSize {
+		return Asset{}, ErrFileTooLarge
+	}
+	notePath := noteRelative
 	content, err := io.ReadAll(io.LimitReader(source, maxAssetSize+1))
 	if err != nil {
 		return Asset{}, err
@@ -50,17 +62,17 @@ func (r *Repository) SaveAsset(noteRelative string, source io.Reader) (Asset, er
 		return Asset{}, ErrUnsupportedMedia
 	}
 
-	assetsDirectory := noteAssetsPath(notePath)
-	exists, err := validateOwnedAssets(r.root, assetsDirectory)
+	assetsDirectory := path.Join(path.Dir(notePath), noteBase(notePath)+".assets")
+	exists, err := validateOwnedAssets(r.content, assetsDirectory)
 	if err != nil {
 		return Asset{}, err
 	}
 	if !exists {
 		// #nosec G301 -- assets are ordinary portable notebook files; access control is provided by the repository/container boundary.
-		if err := os.Mkdir(assetsDirectory, 0o755); err != nil && !errors.Is(err, os.ErrExist) {
+		if err := r.content.mkdir(assetsDirectory, 0o755); err != nil && !errors.Is(err, os.ErrExist) {
 			return Asset{}, err
 		}
-		if _, err := validateOwnedAssets(r.root, assetsDirectory); err != nil {
+		if _, err := validateOwnedAssets(r.content, assetsDirectory); err != nil {
 			return Asset{}, err
 		}
 	}
@@ -70,31 +82,15 @@ func (r *Repository) SaveAsset(noteRelative string, source io.Reader) (Asset, er
 		return Asset{}, err
 	}
 	filename := hex.EncodeToString(identifier) + extension
-	target := filepath.Join(assetsDirectory, filename)
-	// #nosec G302,G304 -- target uses a random filename in a validated note-owned directory; assets intentionally remain portable.
-	file, err := os.OpenFile(target, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
-	if err != nil {
+	target := path.Join(assetsDirectory, filename)
+	if err := r.content.writeNew(target, content, 0o644); err != nil {
 		return Asset{}, err
 	}
-	if _, err := file.Write(content); err != nil {
-		_ = file.Close()
-		_ = os.Remove(target)
-		return Asset{}, err
-	}
-	if err := file.Sync(); err != nil {
-		_ = file.Close()
-		_ = os.Remove(target)
-		return Asset{}, err
-	}
-	if err := file.Close(); err != nil {
-		_ = os.Remove(target)
-		return Asset{}, err
-	}
-	if err := syncDirectory(assetsDirectory); err != nil {
+	if err := r.content.syncDir(assetsDirectory); err != nil {
 		return Asset{}, err
 	}
 
-	relative := noteBase(notePath) + ".assets/" + filename
+	relative := path.Join(noteBase(notePath)+".assets", filename)
 	return Asset{RelativePath: relative, ContentType: contentType, Content: content}, nil
 }
 
@@ -112,30 +108,25 @@ func (r *Repository) ReadAsset(noteRelative, assetRelative string) (Asset, error
 		return Asset{}, ErrInvalidPath
 	}
 
-	assetsDirectory := noteAssetsPath(notePath)
-	exists, err := validateOwnedAssets(r.root, assetsDirectory)
+	assetsDirectory := path.Join(path.Dir(notePath), expectedDirectoryName)
+	exists, err := validateOwnedAssets(r.content, assetsDirectory)
 	if err != nil {
 		return Asset{}, err
 	}
 	if !exists {
 		return Asset{}, os.ErrNotExist
 	}
-	target := filepath.Join(assetsDirectory, parts[1])
-	info, err := os.Lstat(target)
-	if err != nil {
-		return Asset{}, err
-	}
-	if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || info.Size() > maxAssetSize {
+	target := path.Join(assetsDirectory, parts[1])
+	content, err := r.content.Read(target, maxAssetSize)
+	if errors.Is(err, ErrFileTooLarge) {
 		return Asset{}, ErrInvalidPath
 	}
-	// #nosec G304 -- target was confined to the validated note-owned asset directory and lstat-checked as a non-symlink regular file.
-	content, err := os.ReadFile(target)
 	if err != nil {
 		return Asset{}, err
 	}
-	contentType := http.DetectContentType(content)
+	contentType := http.DetectContentType(content.Bytes)
 	if _, supported := imageExtensions[contentType]; !supported {
 		return Asset{}, ErrUnsupportedMedia
 	}
-	return Asset{RelativePath: assetRelative, ContentType: contentType, Content: content}, nil
+	return Asset{RelativePath: assetRelative, ContentType: contentType, Content: content.Bytes}, nil
 }

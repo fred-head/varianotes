@@ -2,12 +2,9 @@ package files
 
 import (
 	"bufio"
-	"io"
-	"io/fs"
 	"net/url"
 	"os"
 	"path"
-	"path/filepath"
 	"regexp"
 	"sort"
 	"strings"
@@ -37,6 +34,12 @@ func (r *Repository) UnreferencedAssets() ([]UnreferencedAsset, error) {
 	if !r.Configured() {
 		return nil, ErrNotConfigured
 	}
+	r.content.mu.RLock()
+	defer r.content.mu.RUnlock()
+	return r.unreferencedAssets()
+}
+
+func (r *Repository) unreferencedAssets() ([]UnreferencedAsset, error) {
 	candidates, err := r.cleanupCandidates()
 	if err != nil {
 		return nil, err
@@ -59,6 +62,8 @@ func (r *Repository) UnreferencedAssets() ([]UnreferencedAsset, error) {
 
 func (r *Repository) DeleteUnreferencedAssets(paths []string) (AssetCleanupResult, error) {
 	result := AssetCleanupResult{Deleted: []string{}, Failures: []AssetCleanupFailure{}}
+	r.content.mu.Lock()
+	defer r.content.mu.Unlock()
 	seen := make(map[string]bool, len(paths))
 	for _, relative := range paths {
 		if !validCleanupPath(relative) {
@@ -69,7 +74,7 @@ func (r *Repository) DeleteUnreferencedAssets(paths []string) (AssetCleanupResul
 		}
 		seen[relative] = true
 
-		current, err := r.UnreferencedAssets()
+		current, err := r.unreferencedAssets()
 		if err != nil {
 			return result, err
 		}
@@ -85,24 +90,23 @@ func (r *Repository) DeleteUnreferencedAssets(paths []string) (AssetCleanupResul
 			continue
 		}
 
-		target := filepath.Join(r.root, filepath.FromSlash(relative))
-		info, err := os.Lstat(target)
-		if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || !isWithinRoot(r.root, target) {
+		info, err := r.content.lstat(relative)
+		if err != nil || !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
 			result.Failures = append(result.Failures, AssetCleanupFailure{Path: relative, Error: "asset is no longer a safe regular file"})
 			continue
 		}
-		if err := os.Remove(target); err != nil {
+		if err := r.content.remove(relative); err != nil {
 			result.Failures = append(result.Failures, AssetCleanupFailure{Path: relative, Error: err.Error()})
 			continue
 		}
 		result.Deleted = append(result.Deleted, relative)
-		directory := filepath.Dir(target)
-		entries, readErr := os.ReadDir(directory)
+		directory := path.Dir(relative)
+		entries, readErr := r.content.readDir(directory)
 		if readErr == nil && len(entries) == 0 {
-			_ = os.Remove(directory)
-			_ = syncDirectory(filepath.Dir(directory))
+			_ = r.content.removeAll(directory)
+			_ = r.content.syncDir(path.Dir(directory))
 		} else {
-			_ = syncDirectory(directory)
+			_ = r.content.syncDir(directory)
 		}
 	}
 	return result, nil
@@ -110,117 +114,81 @@ func (r *Repository) DeleteUnreferencedAssets(paths []string) (AssetCleanupResul
 
 func (r *Repository) cleanupCandidates() ([]UnreferencedAsset, error) {
 	result := []UnreferencedAsset{}
-	err := filepath.WalkDir(r.root, func(current string, entry fs.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return walkErr
+	entries, err := r.content.walkEntries(func(entry contentEntry) bool {
+		if !entry.Info.IsDir() {
+			return false
 		}
-		if entry.Type()&os.ModeSymlink != 0 {
-			if entry.IsDir() {
-				return filepath.SkipDir
-			}
-			return nil
+		return ignoredCleanupPath(entry.Path) || strings.HasSuffix(strings.ToLower(entry.Name), ".assets")
+	})
+	if err != nil {
+		return nil, err
+	}
+	for _, entry := range entries {
+		if entry.Info.Mode()&os.ModeSymlink != 0 || !entry.Info.IsDir() || ignoredCleanupPath(entry.Path) {
+			continue
 		}
-		if !entry.IsDir() {
-			return nil
+		if !strings.HasSuffix(strings.ToLower(entry.Name), ".assets") {
+			continue
 		}
-		name := strings.ToLower(entry.Name())
-		if current != r.root && (name == ".git" || name == ".trash" || name == "node_modules") {
-			return filepath.SkipDir
-		}
-		if !strings.HasSuffix(name, ".assets") {
-			return nil
-		}
-
-		note := strings.TrimSuffix(current, filepath.Ext(current)) + ".md"
-		noteInfo, err := os.Lstat(note)
+		note := strings.TrimSuffix(entry.Path, path.Ext(entry.Path)) + ".md"
+		noteInfo, err := r.content.lstat(note)
 		if err != nil || !noteInfo.Mode().IsRegular() || noteInfo.Mode()&os.ModeSymlink != 0 {
-			return filepath.SkipDir
+			continue
 		}
-		children, err := os.ReadDir(current)
+		children, err := r.content.readDir(entry.Path)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		for _, child := range children {
-			if child.IsDir() || child.Type()&os.ModeSymlink != 0 || !supportedCleanupExtension(child.Name()) {
+			if child.Info.IsDir() || child.Info.Mode()&os.ModeSymlink != 0 || !supportedCleanupExtension(child.Name) {
 				continue
 			}
-			info, err := child.Info()
-			if err != nil || !info.Mode().IsRegular() {
+			if !child.Info.Mode().IsRegular() || !validCleanupPath(child.Path) {
 				continue
 			}
-			relative, err := filepath.Rel(r.root, filepath.Join(current, child.Name()))
-			if err != nil || !validCleanupPath(filepath.ToSlash(relative)) {
-				continue
-			}
-			result = append(result, UnreferencedAsset{Path: filepath.ToSlash(relative), Size: info.Size()})
+			result = append(result, UnreferencedAsset{Path: child.Path, Size: child.Info.Size()})
 		}
-		return filepath.SkipDir
-	})
-	return result, err
+	}
+	return result, nil
 }
 
 func (r *Repository) assetReferences() (map[string]bool, map[string]bool, error) {
 	referenced := map[string]bool{}
 	conservativeNames := map[string]bool{}
-	confinedRoot, err := os.OpenRoot(r.root)
+	entries, err := r.content.walkEntries(func(entry contentEntry) bool {
+		return entry.Info.IsDir() && (ignoredCleanupPath(entry.Path) || strings.HasSuffix(strings.ToLower(entry.Name), ".assets"))
+	})
 	if err != nil {
 		return nil, nil, err
 	}
-	defer confinedRoot.Close()
-	err = filepath.WalkDir(r.root, func(current string, entry fs.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return walkErr
+	for _, entry := range entries {
+		if entry.Info.Mode()&os.ModeSymlink != 0 || entry.Info.IsDir() || !entry.Info.Mode().IsRegular() || ignoredCleanupPath(entry.Path) || strings.HasSuffix(strings.ToLower(entry.Name), ".assets") || !strings.EqualFold(path.Ext(entry.Name), ".md") {
+			continue
 		}
-		if entry.Type()&os.ModeSymlink != 0 {
-			if entry.IsDir() {
-				return filepath.SkipDir
-			}
-			return nil
-		}
-		if entry.IsDir() {
-			name := strings.ToLower(entry.Name())
-			if current != r.root && (name == ".git" || name == ".trash" || name == "node_modules" || strings.HasSuffix(name, ".assets")) {
-				return filepath.SkipDir
-			}
-			return nil
-		}
-		if !strings.EqualFold(filepath.Ext(entry.Name()), ".md") {
-			return nil
-		}
-		noteRelative, err := filepath.Rel(r.root, current)
+		content, err := r.content.read(entry.Path, maxMarkdownSize)
 		if err != nil {
-			return err
+			return nil, nil, err
 		}
-		expected, err := entry.Info()
-		if err != nil {
-			return err
-		}
-		file, _, err := openConfinedRegularFile(confinedRoot, noteRelative, expected, maxMarkdownSize)
-		if err != nil {
-			return err
-		}
-		content, err := io.ReadAll(io.LimitReader(file, maxMarkdownSize+1))
-		closeErr := file.Close()
-		if err != nil {
-			return err
-		}
-		if len(content) > maxMarkdownSize {
-			return ErrFileTooLarge
-		}
-		if closeErr != nil {
-			return closeErr
-		}
-		for _, destination := range markdownDestinations(string(content)) {
-			resolved, name, ok := resolveAssetReference(filepath.ToSlash(noteRelative), destination)
+		for _, destination := range markdownDestinations(string(content.Bytes)) {
+			resolved, name, ok := resolveAssetReference(entry.Path, destination)
 			if !ok {
 				continue
 			}
 			referenced[resolved] = true
 			conservativeNames[name] = true
 		}
-		return nil
-	})
+	}
 	return referenced, conservativeNames, err
+}
+
+func ignoredCleanupPath(relative string) bool {
+	for _, part := range strings.Split(relative, "/") {
+		switch strings.ToLower(part) {
+		case ".git", ".trash", "node_modules":
+			return true
+		}
+	}
+	return false
 }
 
 func markdownDestinations(content string) []string {

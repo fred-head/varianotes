@@ -2,7 +2,6 @@ package files
 
 import (
 	"bufio"
-	"io/fs"
 	"os"
 	"path/filepath"
 	"sort"
@@ -28,82 +27,56 @@ func (r *Repository) Search(query string) ([]SearchResult, error) {
 	}
 	lowerQuery := strings.ToLower(query)
 	results := make([]SearchResult, 0)
-	confinedRoot, err := os.OpenRoot(r.root)
+	entries, err := r.content.WalkEntries(func(entry contentEntry) bool {
+		return entry.Info.IsDir() && ignoredSearchPath(entry.Path)
+	})
 	if err != nil {
 		return nil, err
 	}
-	defer confinedRoot.Close()
-
-	err = filepath.WalkDir(r.root, func(current string, entry fs.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return walkErr
+	for _, entry := range entries {
+		name := strings.ToLower(entry.Name)
+		if entry.Info.Mode()&os.ModeSymlink != 0 || ignoredSearchPath(entry.Path) {
+			continue
 		}
-		if current == r.root {
-			return nil
-		}
-		name := strings.ToLower(entry.Name())
-		if entry.Type()&fs.ModeSymlink != 0 {
-			if entry.IsDir() {
-				return filepath.SkipDir
-			}
-			return nil
-		}
-		if entry.IsDir() && (name == ".git" || name == ".trash" || name == "node_modules" || strings.HasSuffix(name, ".assets")) {
-			return filepath.SkipDir
-		}
-		relative, err := filepath.Rel(r.root, current)
-		if err != nil {
-			return err
-		}
-		relative = filepath.ToSlash(relative)
-		if entry.IsDir() {
+		if entry.Info.IsDir() {
 			if strings.Contains(name, lowerQuery) {
-				results = append(results, SearchResult{Path: relative, Type: "directory"})
+				results = append(results, SearchResult{Path: entry.Path, Type: "directory"})
 				if len(results) >= maxSearchResults {
-					return filepath.SkipAll
+					break
 				}
 			}
-			return nil
+			continue
 		}
-		if !strings.EqualFold(filepath.Ext(entry.Name()), ".md") {
-			return nil
+		if !entry.Info.Mode().IsRegular() || !strings.EqualFold(filepath.Ext(entry.Name), ".md") {
+			continue
 		}
 		if strings.Contains(name, lowerQuery) {
-			results = append(results, SearchResult{Path: relative, Type: "file"})
+			results = append(results, SearchResult{Path: entry.Path, Type: "file"})
 		}
 		if len(results) >= maxSearchResults {
-			return filepath.SkipAll
+			break
 		}
-		expected, err := entry.Info()
+		content, err := r.content.Read(entry.Path, maxMarkdownSize)
 		if err != nil {
-			return err
+			return nil, err
 		}
-		file, _, err := openConfinedRegularFile(confinedRoot, filepath.FromSlash(relative), expected, maxMarkdownSize)
-		if err != nil {
-			return err
-		}
-		scanner := bufio.NewScanner(file)
+		scanner := bufio.NewScanner(strings.NewReader(string(content.Bytes)))
 		scanner.Buffer(make([]byte, 64*1024), maxMarkdownSize)
 		line := 0
 		for scanner.Scan() && len(results) < maxSearchResults {
 			line++
 			text := scanner.Text()
 			if strings.Contains(strings.ToLower(text), lowerQuery) {
-				results = append(results, SearchResult{Path: relative, Type: "content", Line: line, Excerpt: searchExcerpt(text)})
+				results = append(results, SearchResult{Path: entry.Path, Type: "content", Line: line, Excerpt: searchExcerpt(text)})
 			}
 		}
 		scanErr := scanner.Err()
-		closeErr := file.Close()
 		if scanErr != nil {
-			return scanErr
+			return nil, scanErr
 		}
 		if len(results) >= maxSearchResults {
-			return filepath.SkipAll
+			break
 		}
-		return closeErr
-	})
-	if err != nil {
-		return nil, err
 	}
 
 	sort.SliceStable(results, func(i, j int) bool {
@@ -119,6 +92,16 @@ func (r *Repository) Search(query string) ([]SearchResult, error) {
 		results = results[:maxSearchResults]
 	}
 	return results, nil
+}
+
+func ignoredSearchPath(relative string) bool {
+	for _, part := range strings.Split(relative, "/") {
+		lower := strings.ToLower(part)
+		if lower == ".git" || lower == ".trash" || lower == "node_modules" || strings.HasSuffix(lower, ".assets") {
+			return true
+		}
+	}
+	return false
 }
 
 func searchExcerpt(line string) string {

@@ -79,37 +79,37 @@ func (r *Repository) Tree() ([]Node, error) {
 		return nil, ErrNotConfigured
 	}
 
-	nodes, err := readDirectory(r.root, "")
+	nodes, err := r.readDirectory("")
 	if err != nil {
 		return nil, fmt.Errorf("read repository tree: %w", err)
 	}
 	return nodes, nil
 }
 
-func readDirectory(root, relative string) ([]Node, error) {
-	entries, err := os.ReadDir(filepath.Join(root, filepath.FromSlash(relative)))
+func (r *Repository) readDirectory(relative string) ([]Node, error) {
+	entries, err := r.content.ReadDir(relative)
 	if err != nil {
 		return nil, err
 	}
 
 	nodes := make([]Node, 0, len(entries))
 	for _, entry := range entries {
-		lowerName := strings.ToLower(entry.Name())
-		if lowerName == ".git" || lowerName == ".trash" || lowerName == "node_modules" || strings.HasSuffix(lowerName, ".assets") || entry.Type()&fs.ModeSymlink != 0 {
+		lowerName := strings.ToLower(entry.Name)
+		if lowerName == ".git" || lowerName == ".trash" || lowerName == "node_modules" || strings.HasSuffix(lowerName, ".assets") || entry.Info.Mode()&fs.ModeSymlink != 0 {
 			continue
 		}
 
-		childPath := filepath.ToSlash(filepath.Join(relative, entry.Name()))
-		if entry.IsDir() {
-			children, err := readDirectory(root, childPath)
+		childPath := entry.Path
+		if entry.Info.IsDir() {
+			children, err := r.readDirectory(childPath)
 			if err != nil {
 				return nil, err
 			}
-			nodes = append(nodes, Node{Name: entry.Name(), Path: childPath, Type: "directory", Children: children})
+			nodes = append(nodes, Node{Name: entry.Name, Path: childPath, Type: "directory", Children: children})
 			continue
 		}
-		if strings.EqualFold(filepath.Ext(entry.Name()), ".md") {
-			nodes = append(nodes, Node{Name: entry.Name(), Path: childPath, Type: "file"})
+		if strings.EqualFold(filepath.Ext(entry.Name), ".md") {
+			nodes = append(nodes, Node{Name: entry.Name, Path: childPath, Type: "file"})
 		}
 	}
 
@@ -148,16 +148,7 @@ func (r *Repository) resolveMarkdown(relative string) (string, os.FileInfo, erro
 	if err := r.validateRelative(relative, true); err != nil {
 		return "", nil, err
 	}
-
-	candidate := filepath.Join(r.root, filepath.FromSlash(relative))
-	resolved, err := filepath.EvalSymlinks(candidate)
-	if err != nil {
-		return "", nil, err
-	}
-	if resolved != filepath.Clean(candidate) || !isWithinRoot(r.root, resolved) {
-		return "", nil, ErrInvalidPath
-	}
-	info, err := os.Stat(resolved)
+	info, err := r.content.Lstat(relative)
 	if err != nil {
 		return "", nil, err
 	}
@@ -167,7 +158,7 @@ func (r *Repository) resolveMarkdown(relative string) (string, os.FileInfo, erro
 	if info.Size() > maxMarkdownSize {
 		return "", nil, ErrFileTooLarge
 	}
-	return resolved, info, nil
+	return relative, info, nil
 }
 
 func hasControlCharacter(value string) bool {

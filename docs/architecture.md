@@ -15,9 +15,9 @@ history. For behavior and deployment, see [README](../README.md).
   browser draft and current server file for an explicit decision.
 - `internal/files/content.go` is the shared boundary for ordinary file reads
   and version-checked atomic replacements. It enforces root confinement, size
-  limits, and coordination with repository mutations. Markdown reads and saves
-  use it; later M31 steps will route the remaining content operations through
-  this layer.
+  limits, and coordination with repository mutations. Markdown and asset reads
+  and writes, note operations, link rewrites, search, Trash, and ZIP export all
+  route through this layer. Later M31 steps will add encrypted storage there.
 - Multiple named vaults on one server are registered in application metadata.
   The registry stores IDs, display names, and filesystem paths. It is not a
   copy of note or asset content.
