@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 )
@@ -96,6 +97,40 @@ func TestContentStoreRejectsUnsafePathsAndSizes(t *testing.T) {
 	}
 	if string(actual) != "oversized" {
 		t.Fatalf("rejected write changed stored bytes: %q", actual)
+	}
+}
+
+func TestContentStoreHidesTransactionStagingFiles(t *testing.T) {
+	root := t.TempDir()
+	if err := os.Mkdir(filepath.Join(root, "private"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "private", "note.md.age"), []byte("ciphertext"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	stagePath := filepath.Join(root, "private", ".vnotes-txn-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-000000.stage")
+	if err := os.WriteFile(stagePath, []byte("staged ciphertext"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store := &contentStore{root: root}
+	entries, err := store.ReadDir("private")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].Name != "note.md.age" {
+		t.Fatalf("directory entries exposed transaction staging: %#v", entries)
+	}
+	walked, err := store.Entries()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range walked {
+		if strings.HasPrefix(entry.Name, internalTransactionStagePrefix) {
+			t.Fatalf("walk exposed transaction staging entry: %#v", entry)
+		}
+	}
+	if _, err := store.Read("private/"+filepath.Base(stagePath), 128); !errors.Is(err, ErrInvalidPath) {
+		t.Fatalf("direct staging read error = %v, want invalid path", err)
 	}
 }
 

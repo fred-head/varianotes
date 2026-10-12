@@ -227,6 +227,29 @@ func DecryptContent(vaultKey []byte, objectID string, ciphertext []byte, envelop
 	return plaintext, nil
 }
 
+// VerifyEncryptedContent authenticates an age ciphertext and its object-bound
+// key envelope without retaining the plaintext. It is useful before durable
+// staging, where the caller needs to prove the bytes are encrypted content.
+func VerifyEncryptedContent(vaultKey []byte, objectID string, ciphertext []byte, envelope ContentKeyEnvelope) error {
+	privateKey, err := UnwrapContentKey(vaultKey, objectID, envelope)
+	if err != nil {
+		return err
+	}
+	defer clear(privateKey)
+	identity, err := age.ParseX25519Identity(string(privateKey))
+	if err != nil {
+		return ErrInvalidEnvelope
+	}
+	reader, err := age.Decrypt(bytes.NewReader(ciphertext), identity)
+	if err != nil {
+		return fmt.Errorf("%w: %v", ErrAuthentication, err)
+	}
+	if _, err := io.Copy(io.Discard, reader); err != nil {
+		return fmt.Errorf("%w: %v", ErrAuthentication, err)
+	}
+	return nil
+}
+
 func wrapContentKey(vaultKey []byte, objectID string, privateKey []byte) (ContentKeyEnvelope, error) {
 	aead, err := chacha20poly1305.NewX(vaultKey)
 	if err != nil {

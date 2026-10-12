@@ -8,6 +8,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- Added the M31 transaction journal for authenticated ciphertext and catalog
+  updates, with a durable forward commit point, restart recovery, and hidden
+  ciphertext staging. Encryption remains inactive pending the M31 release gate.
 - Added the volatile M31 key manager with per-session unlock grants, a
   15-minute inactivity lock, explicit activity tracking, generation-checked
   response leases, manual/logout locking, and session-scoped lock events.

@@ -1,0 +1,1114 @@
+package encryption
+
+import (
+	"bytes"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"io/fs"
+	"os"
+	"path"
+	"path/filepath"
+	"sort"
+	"strings"
+	"sync"
+)
+
+const (
+	transactionFormatVersion   uint8 = 1
+	transactionMACDomain             = "varianotes/transaction-journal/v1\x00"
+	maxTransactionJournalBytes       = 16 << 20
+	maxTransactionChanges            = 100_000
+	maxTransactionFileBytes          = 64 << 20
+	maxTransactionTotalBytes   int64 = 2 << 30
+)
+
+var (
+	ErrInvalidTransaction        = errors.New("invalid encryption transaction")
+	ErrTransactionJournalCorrupt = errors.New("encryption transaction journal is corrupt")
+	ErrTransactionPending        = errors.New("encryption transaction is already pending")
+	ErrTransactionNeedsRecovery  = errors.New("encryption transaction requires recovery")
+	ErrTransactionConflict       = errors.New("encryption transaction target changed before commit")
+)
+
+// CiphertextChange describes one encrypted vault file to replace or remove.
+// Callers must provide complete, authenticated age ciphertext in Ciphertext;
+// plaintext is never accepted as transaction staging data. Delete leaves the
+// current file untouched until the durable commit point.
+type CiphertextChange struct {
+	Path               string
+	ObjectID           string
+	Ciphertext         []byte
+	ContentKeyEnvelope ContentKeyEnvelope
+	Delete             bool
+}
+
+// TransactionJournal coordinates ciphertext replacements and an authenticated
+// catalog replacement. Staging files for vault content sit beside their final
+// paths so rename remains atomic on the vault filesystem. The journal and the
+// staged catalog live beside the catalog in server-owned application metadata.
+// Only one backend writer per vault is supported.
+type TransactionJournal struct {
+	vaultRoot string
+	catalog   *CatalogStore
+	name      string
+	mu        sync.Mutex
+	fault     func(string) error
+}
+
+type transactionRecord struct {
+	Version       uint8               `json:"version"`
+	ID            string              `json:"id"`
+	VaultID       string              `json:"vault_id"`
+	State         string              `json:"state"`
+	Changes       []transactionChange `json:"changes"`
+	CatalogStage  string              `json:"catalog_stage"`
+	CatalogSHA256 string              `json:"catalog_sha256"`
+	MAC           string              `json:"authentication"`
+}
+
+type transactionChange struct {
+	Path     string `json:"path"`
+	ObjectID string `json:"object_id,omitempty"`
+	Stage    string `json:"stage,omitempty"`
+	SHA256   string `json:"sha256,omitempty"`
+	Delete   bool   `json:"delete,omitempty"`
+}
+
+type transactionPayload struct {
+	Version       uint8               `json:"version"`
+	ID            string              `json:"id"`
+	VaultID       string              `json:"vault_id"`
+	State         string              `json:"state"`
+	Changes       []transactionChange `json:"changes"`
+	CatalogStage  string              `json:"catalog_stage"`
+	CatalogSHA256 string              `json:"catalog_sha256"`
+}
+
+// PreparedTransaction is a durable prepare record plus ciphertext staging.
+// The original target fingerprints are held only in memory; a restart before
+// Commit discards the prepared transaction and leaves originals untouched.
+type PreparedTransaction struct {
+	journal      *TransactionJournal
+	record       transactionRecord
+	key          []byte
+	prior        map[string]string
+	priorCatalog string
+	used         bool
+}
+
+// NewTransactionJournal binds a journal to one vault root and its catalog.
+func NewTransactionJournal(vaultDirectory string, catalog *CatalogStore) (*TransactionJournal, error) {
+	if catalog == nil || vaultDirectory == "" {
+		return nil, ErrInvalidTransaction
+	}
+	absolute, err := filepath.Abs(vaultDirectory)
+	if err != nil {
+		return nil, fmt.Errorf("resolve transaction vault root: %w", err)
+	}
+	info, err := os.Lstat(absolute)
+	if err != nil {
+		return nil, fmt.Errorf("inspect transaction vault root: %w", err)
+	}
+	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		return nil, ErrInvalidTransaction
+	}
+	relativeMetadata, err := filepath.Rel(filepath.Clean(absolute), catalog.directory)
+	if err != nil {
+		return nil, ErrInvalidTransaction
+	}
+	if relativeMetadata == "." || (relativeMetadata != ".." && !strings.HasPrefix(relativeMetadata, ".."+string(filepath.Separator))) {
+		return nil, ErrInvalidTransaction
+	}
+	return &TransactionJournal{
+		vaultRoot: filepath.Clean(absolute),
+		catalog:   catalog,
+		name:      "." + catalog.name + ".transaction.json",
+	}, nil
+}
+
+// Prepare validates and fingerprints current targets, writes a durable
+// prepared journal, stages ciphertext and the next authenticated catalog, and
+// verifies every staged byte. No live content or catalog path is changed.
+func (j *TransactionJournal) Prepare(changes []CiphertextChange, catalog Catalog, vaultKey []byte) (*PreparedTransaction, error) {
+	if j == nil || len(vaultKey) != VaultKeySize || len(changes) == 0 || len(changes) > maxTransactionChanges {
+		return nil, ErrInvalidTransaction
+	}
+	encodedCatalog, err := MarshalCatalog(catalog, vaultKey)
+	if err != nil {
+		return nil, err
+	}
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	priorCatalog, err := j.currentCatalogDigest()
+	if err != nil {
+		return nil, err
+	}
+	previousCatalog, err := j.catalog.Load(vaultKey, catalog.VaultID)
+	if errors.Is(err, ErrCatalogMissing) {
+		previousCatalog = Catalog{}
+	} else if err != nil {
+		return nil, err
+	}
+	if err := validateTransactionBindings(changes, catalog); err != nil {
+		return nil, err
+	}
+
+	root, err := os.OpenRoot(j.vaultRoot)
+	if err != nil {
+		return nil, fmt.Errorf("open transaction vault root: %w", err)
+	}
+	defer root.Close()
+	prior := make(map[string]string, len(changes))
+	previousObjects := make(map[string]CatalogObject, len(previousCatalog.Objects))
+	for _, object := range previousCatalog.Objects {
+		previousObjects[object.PhysicalPath] = object
+	}
+	seen := make(map[string]struct{}, len(changes))
+	var totalBytes int64
+	for _, change := range changes {
+		if !isTransactionContentPath(change.Path) {
+			return nil, ErrInvalidTransaction
+		}
+		if _, exists := seen[change.Path]; exists {
+			return nil, ErrInvalidTransaction
+		}
+		seen[change.Path] = struct{}{}
+		if change.Delete {
+			if len(change.Ciphertext) != 0 || change.ObjectID != "" || change.ContentKeyEnvelope.Version != 0 || len(change.ContentKeyEnvelope.Ciphertext) != 0 {
+				return nil, ErrInvalidTransaction
+			}
+		} else {
+			if len(change.Ciphertext) == 0 || len(change.Ciphertext) > maxTransactionFileBytes || !isCatalogID(change.ObjectID) {
+				return nil, ErrInvalidTransaction
+			}
+			totalBytes += int64(len(change.Ciphertext))
+			if totalBytes > maxTransactionTotalBytes {
+				return nil, ErrInvalidTransaction
+			}
+			if err := VerifyEncryptedContent(vaultKey, change.ObjectID, change.Ciphertext, change.ContentKeyEnvelope); err != nil {
+				return nil, errors.Join(ErrInvalidTransaction, err)
+			}
+		}
+		if err := validateTransactionTarget(root, change.Path); err != nil {
+			return nil, err
+		}
+		prior[change.Path], err = transactionTargetDigest(root, change.Path)
+		if err != nil {
+			return nil, err
+		}
+		if previous, exists := previousObjects[change.Path]; exists && previous.Protected && prior[change.Path] != previous.CiphertextHash {
+			return nil, ErrCatalogCiphertextCheck
+		}
+	}
+	if err := j.ensureNoPendingJournal(); err != nil {
+		return nil, err
+	}
+
+	id, err := newCatalogID()
+	if err != nil {
+		return nil, err
+	}
+	record := transactionRecord{
+		Version: transactionFormatVersion, ID: id, VaultID: catalog.VaultID, State: "prepared",
+		CatalogStage: transactionCatalogStageName(id), CatalogSHA256: transactionDigest(encodedCatalog),
+		Changes: make([]transactionChange, 0, len(changes)),
+	}
+	ordered := append([]CiphertextChange(nil), changes...)
+	sort.Slice(ordered, func(a, b int) bool { return ordered[a].Path < ordered[b].Path })
+	for index, change := range ordered {
+		entry := transactionChange{Path: change.Path, ObjectID: change.ObjectID, Delete: change.Delete}
+		if !change.Delete {
+			entry.Stage = transactionContentStageName(id, index)
+			entry.SHA256 = transactionDigest(change.Ciphertext)
+		}
+		record.Changes = append(record.Changes, entry)
+	}
+	if err := validateTransactionRecord(record); err != nil {
+		return nil, err
+	}
+	if err := j.saveRecord(record, vaultKey); err != nil {
+		return nil, fmt.Errorf("persist prepared encryption transaction: %w", err)
+	}
+	tx := &PreparedTransaction{
+		journal: j, record: record, key: append([]byte(nil), vaultKey...), prior: prior, priorCatalog: priorCatalog,
+	}
+	for index, change := range ordered {
+		entry := record.Changes[index]
+		if change.Delete {
+			continue
+		}
+		if err := j.writeVaultStage(root, entry.Path, entry.Stage, change.Ciphertext); err != nil {
+			return nil, j.abortPrepared(tx, err)
+		}
+	}
+	metadataRoot, err := os.OpenRoot(j.catalog.directory)
+	if err != nil {
+		return nil, j.abortPrepared(tx, fmt.Errorf("open catalog metadata for staging: %w", err))
+	}
+	stageErr := j.writeMetadataStage(metadataRoot, record.CatalogStage, encodedCatalog)
+	closeErr := metadataRoot.Close()
+	if err := errors.Join(stageErr, closeErr); err != nil {
+		return nil, j.abortPrepared(tx, err)
+	}
+	if err := j.verifyPreparedStages(root, record, encodedCatalog); err != nil {
+		return nil, j.abortPrepared(tx, err)
+	}
+	return tx, nil
+}
+
+// Commit checks that original targets still match their pre-prepare state,
+// durably records the forward-only decision, and applies it. Any error after
+// that decision leaves the journal in place and returns ErrTransactionNeedsRecovery.
+func (tx *PreparedTransaction) Commit() error {
+	if tx == nil || tx.journal == nil || tx.used {
+		return ErrInvalidTransaction
+	}
+	tx.used = true
+	defer clear(tx.key)
+	j := tx.journal
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	root, err := os.OpenRoot(j.vaultRoot)
+	if err != nil {
+		return fmt.Errorf("open transaction vault root: %w", err)
+	}
+	defer root.Close()
+	record, err := j.loadRecord(tx.key)
+	if err != nil {
+		return err
+	}
+	if record.ID != tx.record.ID || record.State != "prepared" {
+		return ErrTransactionJournalCorrupt
+	}
+	for _, entry := range record.Changes {
+		current, digestErr := transactionTargetDigest(root, entry.Path)
+		if digestErr != nil {
+			return digestErr
+		}
+		if current != tx.prior[entry.Path] {
+			return j.abortPrepared(tx, ErrTransactionConflict)
+		}
+	}
+	currentCatalog, err := j.currentCatalogDigest()
+	if err != nil {
+		return err
+	}
+	if currentCatalog != tx.priorCatalog {
+		return j.abortPrepared(tx, ErrTransactionConflict)
+	}
+	if err := j.fail("transaction.commit.before"); err != nil {
+		return j.abortPrepared(tx, err)
+	}
+	record.State = "committed"
+	if err := j.saveRecord(record, tx.key); err != nil {
+		persisted, loadErr := j.loadRecord(tx.key)
+		if loadErr == nil && persisted.ID == record.ID && persisted.State == "prepared" {
+			return j.abortPrepared(tx, err)
+		}
+		return errors.Join(ErrTransactionNeedsRecovery, err, loadErr)
+	}
+	tx.record = record
+	if err := j.fail("transaction.commit.after"); err != nil {
+		return errors.Join(ErrTransactionNeedsRecovery, err)
+	}
+	if err := j.applyCommitted(root, record, tx.key); err != nil {
+		return errors.Join(ErrTransactionNeedsRecovery, err)
+	}
+	return nil
+}
+
+// Recover discards a prepared transaction because its live targets are still
+// the old state. A committed transaction is verified and completed forward.
+// Callers must run it before serving affected content after a restart.
+func (j *TransactionJournal) Recover(vaultKey []byte) error {
+	if j == nil || len(vaultKey) != VaultKeySize {
+		return ErrInvalidTransaction
+	}
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	record, err := j.loadRecord(vaultKey)
+	if errors.Is(err, fs.ErrNotExist) {
+		return j.cleanupOrphanJournalStages()
+	}
+	if err != nil {
+		return err
+	}
+	if record.State == "prepared" {
+		if err := j.cleanupRecord(record); err != nil {
+			return errors.Join(ErrTransactionNeedsRecovery, err)
+		}
+		return nil
+	}
+	root, err := os.OpenRoot(j.vaultRoot)
+	if err != nil {
+		return errors.Join(ErrTransactionNeedsRecovery, fmt.Errorf("open transaction vault root: %w", err))
+	}
+	defer root.Close()
+	if err := j.applyCommitted(root, record, vaultKey); err != nil {
+		return errors.Join(ErrTransactionNeedsRecovery, err)
+	}
+	return nil
+}
+
+func (j *TransactionJournal) ensureNoPendingJournal() error {
+	root, err := os.OpenRoot(j.catalog.directory)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil
+		}
+		return fmt.Errorf("open transaction metadata directory: %w", err)
+	}
+	defer root.Close()
+	_, err = root.Lstat(j.name)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("inspect pending transaction journal: %w", err)
+	}
+	return ErrTransactionPending
+}
+
+func (j *TransactionJournal) currentCatalogDigest() (string, error) {
+	root, err := os.OpenRoot(j.catalog.directory)
+	if errors.Is(err, fs.ErrNotExist) {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("open transaction catalog directory: %w", err)
+	}
+	defer root.Close()
+	if err := validateCatalogStoreTarget(root, j.catalog.name); err != nil {
+		return "", err
+	}
+	digest, err := transactionFileDigest(root, j.catalog.name)
+	if errors.Is(err, fs.ErrNotExist) {
+		return "", nil
+	}
+	return digest, err
+}
+
+func (j *TransactionJournal) abortPrepared(tx *PreparedTransaction, cause error) error {
+	if err := j.cleanupRecord(tx.record); err != nil {
+		return errors.Join(ErrTransactionNeedsRecovery, cause, err)
+	}
+	return cause
+}
+
+func (j *TransactionJournal) writeVaultStage(root *os.Root, target, stage string, content []byte) error {
+	if err := validateTransactionTarget(root, target); err != nil {
+		return err
+	}
+	stagePath := path.Join(path.Dir(target), stage)
+	if err := j.fail("transaction.content_stage.write"); err != nil {
+		return err
+	}
+	file, err := root.OpenFile(filepath.FromSlash(stagePath), os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		return fmt.Errorf("create ciphertext transaction stage: %w", err)
+	}
+	written, writeErr := file.Write(content)
+	if writeErr == nil && written != len(content) {
+		writeErr = io.ErrShortWrite
+	}
+	if writeErr == nil {
+		writeErr = j.fail("transaction.content_stage.file_sync")
+	}
+	if writeErr == nil {
+		writeErr = file.Sync()
+	}
+	closeErr := file.Close()
+	if err := errors.Join(writeErr, closeErr); err != nil {
+		return fmt.Errorf("write ciphertext transaction stage: %w", err)
+	}
+	if err := j.syncVaultDirectory(root, path.Dir(target), "transaction.content_stage.directory_sync"); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (j *TransactionJournal) writeMetadataStage(root *os.Root, name string, content []byte) error {
+	if err := j.fail("transaction.catalog_stage.write"); err != nil {
+		return err
+	}
+	file, err := root.OpenFile(name, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		return fmt.Errorf("create catalog transaction stage: %w", err)
+	}
+	written, writeErr := file.Write(content)
+	if writeErr == nil && written != len(content) {
+		writeErr = io.ErrShortWrite
+	}
+	if writeErr == nil {
+		writeErr = j.fail("transaction.catalog_stage.file_sync")
+	}
+	if writeErr == nil {
+		writeErr = file.Sync()
+	}
+	closeErr := file.Close()
+	if err := errors.Join(writeErr, closeErr); err != nil {
+		return fmt.Errorf("write catalog transaction stage: %w", err)
+	}
+	return syncTransactionDirectory(root, ".", j.fail, "transaction.catalog_stage.directory_sync")
+}
+
+func (j *TransactionJournal) verifyPreparedStages(root *os.Root, record transactionRecord, catalogBytes []byte) error {
+	for _, entry := range record.Changes {
+		if entry.Delete {
+			continue
+		}
+		stagePath := path.Join(path.Dir(entry.Path), entry.Stage)
+		actual, err := transactionFileDigest(root, stagePath)
+		if err != nil {
+			return fmt.Errorf("verify ciphertext stage for %q: %w", entry.Path, err)
+		}
+		if actual != entry.SHA256 {
+			return ErrTransactionJournalCorrupt
+		}
+	}
+	if transactionDigest(catalogBytes) != record.CatalogSHA256 {
+		return ErrTransactionJournalCorrupt
+	}
+	metadataRoot, err := os.OpenRoot(j.catalog.directory)
+	if err != nil {
+		return fmt.Errorf("open catalog metadata for verification: %w", err)
+	}
+	defer metadataRoot.Close()
+	actual, err := transactionFileDigest(metadataRoot, record.CatalogStage)
+	if err != nil {
+		return fmt.Errorf("verify catalog transaction stage: %w", err)
+	}
+	if actual != record.CatalogSHA256 {
+		return ErrTransactionJournalCorrupt
+	}
+	return nil
+}
+
+func (j *TransactionJournal) applyCommitted(root *os.Root, record transactionRecord, vaultKey []byte) error {
+	// Verify every remaining stage and the catalog before applying more files.
+	// A missing stage is valid only when its final target already has the new
+	// digest, which makes recovery idempotent after a partial prior attempt.
+	for _, entry := range record.Changes {
+		if err := validateTransactionTarget(root, entry.Path); err != nil {
+			return err
+		}
+		if entry.Delete {
+			continue
+		}
+		current, err := transactionTargetDigest(root, entry.Path)
+		if err != nil {
+			return err
+		}
+		if current == entry.SHA256 {
+			continue
+		}
+		stagePath := path.Join(path.Dir(entry.Path), entry.Stage)
+		stageDigest, err := transactionFileDigest(root, stagePath)
+		if err != nil || stageDigest != entry.SHA256 {
+			return errors.Join(ErrTransactionJournalCorrupt, err)
+		}
+	}
+	metadataRoot, err := os.OpenRoot(j.catalog.directory)
+	if err != nil {
+		return fmt.Errorf("open catalog metadata for recovery: %w", err)
+	}
+	defer metadataRoot.Close()
+	if err := validateCatalogStoreTarget(metadataRoot, j.catalog.name); err != nil {
+		return err
+	}
+	catalogDigest, err := transactionFileDigest(metadataRoot, j.catalog.name)
+	if err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return err
+	}
+	var catalogBytes []byte
+	if catalogDigest == record.CatalogSHA256 {
+		catalogBytes, err = readTransactionFile(metadataRoot, j.catalog.name, maxCatalogBytes)
+	} else {
+		stageDigest, stageErr := transactionFileDigest(metadataRoot, record.CatalogStage)
+		if stageErr != nil || stageDigest != record.CatalogSHA256 {
+			return errors.Join(ErrTransactionJournalCorrupt, stageErr)
+		}
+		catalogBytes, err = readTransactionFile(metadataRoot, record.CatalogStage, maxCatalogBytes)
+	}
+	if err != nil {
+		return err
+	}
+	nextCatalog, err := ParseCatalog(catalogBytes, vaultKey, record.VaultID)
+	if err != nil {
+		return errors.Join(ErrTransactionJournalCorrupt, err)
+	}
+	if err := validateTransactionRecordBindings(record, nextCatalog); err != nil {
+		return errors.Join(ErrTransactionJournalCorrupt, err)
+	}
+
+	for _, entry := range record.Changes {
+		if entry.Delete {
+			if err := validateTransactionTarget(root, entry.Path); err != nil {
+				return err
+			}
+			if _, err := root.Lstat(filepath.FromSlash(entry.Path)); err == nil {
+				if err := j.fail("transaction.content.delete"); err != nil {
+					return err
+				}
+				if err := root.Remove(filepath.FromSlash(entry.Path)); err != nil {
+					return fmt.Errorf("remove transaction target %q: %w", entry.Path, err)
+				}
+			} else if !errors.Is(err, fs.ErrNotExist) {
+				return err
+			}
+			if err := j.syncVaultDirectory(root, path.Dir(entry.Path), "transaction.content.directory_sync"); err != nil {
+				return err
+			}
+			continue
+		}
+		current, err := transactionTargetDigest(root, entry.Path)
+		if err != nil {
+			return err
+		}
+		if current == entry.SHA256 {
+			continue
+		}
+		stagePath := path.Join(path.Dir(entry.Path), entry.Stage)
+		if err := j.fail("transaction.content.rename"); err != nil {
+			return err
+		}
+		if err := root.Rename(filepath.FromSlash(stagePath), filepath.FromSlash(entry.Path)); err != nil {
+			return fmt.Errorf("install transaction content %q: %w", entry.Path, err)
+		}
+		if err := j.syncVaultDirectory(root, path.Dir(entry.Path), "transaction.content.directory_sync"); err != nil {
+			return err
+		}
+	}
+
+	catalogDigest, err = transactionFileDigest(metadataRoot, j.catalog.name)
+	if err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return err
+	}
+	if catalogDigest != record.CatalogSHA256 {
+		if err := j.fail("transaction.catalog.rename"); err != nil {
+			return err
+		}
+		if err := metadataRoot.Rename(record.CatalogStage, j.catalog.name); err != nil {
+			return fmt.Errorf("install transaction catalog: %w", err)
+		}
+		if err := syncTransactionDirectory(metadataRoot, ".", j.fail, "transaction.catalog.directory_sync"); err != nil {
+			return err
+		}
+	}
+	return j.cleanupRecord(record)
+}
+
+func (j *TransactionJournal) saveRecord(record transactionRecord, vaultKey []byte) error {
+	encoded, err := marshalTransactionRecord(record, vaultKey)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(j.catalog.directory, 0o700); err != nil {
+		return fmt.Errorf("create transaction metadata directory: %w", err)
+	}
+	root, err := os.OpenRoot(j.catalog.directory)
+	if err != nil {
+		return fmt.Errorf("open transaction metadata directory: %w", err)
+	}
+	defer root.Close()
+	if err := validateTransactionJournalTarget(root, j.name); err != nil {
+		return err
+	}
+	var temporary string
+	for range 8 {
+		id, idErr := newCatalogID()
+		if idErr != nil {
+			return idErr
+		}
+		temporary = ".vnotes-journal-" + id + ".tmp"
+		file, openErr := root.OpenFile(temporary, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+		if errors.Is(openErr, fs.ErrExist) {
+			continue
+		}
+		if openErr != nil {
+			return fmt.Errorf("create transaction journal stage: %w", openErr)
+		}
+		phase := "transaction.journal." + record.State
+		writeErr := j.fail(phase + ".write")
+		if writeErr == nil {
+			written, fileWriteErr := file.Write(encoded)
+			if fileWriteErr == nil && written != len(encoded) {
+				fileWriteErr = io.ErrShortWrite
+			}
+			writeErr = fileWriteErr
+		}
+		if writeErr == nil {
+			writeErr = j.fail(phase + ".file_sync")
+		}
+		if writeErr == nil {
+			writeErr = file.Sync()
+		}
+		closeErr := file.Close()
+		if err := errors.Join(writeErr, closeErr); err != nil {
+			_ = root.Remove(temporary)
+			return fmt.Errorf("write transaction journal: %w", err)
+		}
+		if err := j.fail(phase + ".rename"); err != nil {
+			_ = root.Remove(temporary)
+			return err
+		}
+		if err := root.Rename(temporary, j.name); err != nil {
+			_ = root.Remove(temporary)
+			return fmt.Errorf("replace transaction journal: %w", err)
+		}
+		if err := syncTransactionDirectory(root, ".", j.fail, phase+".directory_sync"); err != nil {
+			return err
+		}
+		return nil
+	}
+	return errors.New("could not allocate a transaction journal stage")
+}
+
+func (j *TransactionJournal) loadRecord(vaultKey []byte) (transactionRecord, error) {
+	root, err := os.OpenRoot(j.catalog.directory)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return transactionRecord{}, fs.ErrNotExist
+		}
+		return transactionRecord{}, fmt.Errorf("open transaction metadata directory: %w", err)
+	}
+	defer root.Close()
+	info, err := root.Lstat(j.name)
+	if err != nil {
+		return transactionRecord{}, err
+	}
+	if !info.Mode().IsRegular() || info.Size() < 0 || info.Size() > maxTransactionJournalBytes {
+		return transactionRecord{}, ErrTransactionJournalCorrupt
+	}
+	data, err := readTransactionFile(root, j.name, maxTransactionJournalBytes)
+	if err != nil {
+		return transactionRecord{}, errors.Join(ErrTransactionJournalCorrupt, err)
+	}
+	record, err := parseTransactionRecord(data, vaultKey)
+	if err != nil {
+		return transactionRecord{}, err
+	}
+	return record, nil
+}
+
+func (j *TransactionJournal) cleanupRecord(record transactionRecord) error {
+	var result error
+	root, err := os.OpenRoot(j.vaultRoot)
+	if err != nil {
+		return fmt.Errorf("open vault to clean transaction stages: %w", err)
+	}
+	for _, entry := range record.Changes {
+		if entry.Delete {
+			continue
+		}
+		stagePath := path.Join(path.Dir(entry.Path), entry.Stage)
+		if removeErr := removeTransactionFile(root, stagePath); removeErr != nil {
+			result = errors.Join(result, removeErr)
+		} else if syncErr := j.syncVaultDirectory(root, path.Dir(entry.Path), "transaction.cleanup.content_sync"); syncErr != nil {
+			result = errors.Join(result, syncErr)
+		}
+	}
+	result = errors.Join(result, root.Close())
+	metadataRoot, err := os.OpenRoot(j.catalog.directory)
+	if err != nil {
+		return errors.Join(result, fmt.Errorf("open metadata to clean transaction stages: %w", err))
+	}
+	if removeErr := removeTransactionFile(metadataRoot, record.CatalogStage); removeErr != nil {
+		result = errors.Join(result, removeErr)
+	}
+	if result == nil {
+		if syncErr := syncTransactionDirectory(metadataRoot, ".", j.fail, "transaction.cleanup.catalog_sync"); syncErr != nil {
+			result = errors.Join(result, syncErr)
+		}
+	}
+	if result == nil {
+		if removeErr := removeTransactionFile(metadataRoot, j.name); removeErr != nil {
+			result = errors.Join(result, removeErr)
+		}
+	}
+	if result == nil {
+		result = errors.Join(result, syncTransactionDirectory(metadataRoot, ".", j.fail, "transaction.cleanup.journal_sync"))
+	}
+	if result == nil {
+		result = errors.Join(result, cleanupOrphanJournalStages(metadataRoot))
+	}
+	result = errors.Join(result, metadataRoot.Close())
+	return result
+}
+
+func (j *TransactionJournal) cleanupOrphanJournalStages() error {
+	root, err := os.OpenRoot(j.catalog.directory)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("open metadata to clean transaction journal stages: %w", err)
+	}
+	defer root.Close()
+	return cleanupOrphanJournalStages(root)
+}
+
+func cleanupOrphanJournalStages(root *os.Root) error {
+	directory, err := root.Open(".")
+	if err != nil {
+		return err
+	}
+	entries, readErr := directory.ReadDir(-1)
+	closeErr := directory.Close()
+	if err := errors.Join(readErr, closeErr); err != nil {
+		return err
+	}
+	changed := false
+	for _, entry := range entries {
+		name := entry.Name()
+		if !strings.HasPrefix(name, ".vnotes-journal-") || !strings.HasSuffix(name, ".tmp") {
+			continue
+		}
+		identifier := strings.TrimSuffix(strings.TrimPrefix(name, ".vnotes-journal-"), ".tmp")
+		if !isCatalogID(identifier) {
+			continue
+		}
+		info, statErr := root.Lstat(name)
+		if statErr != nil {
+			return statErr
+		}
+		if !info.Mode().IsRegular() {
+			return ErrTransactionJournalCorrupt
+		}
+		if err := root.Remove(name); err != nil {
+			return err
+		}
+		changed = true
+	}
+	if changed {
+		return syncTransactionDirectory(root, ".", nil, "")
+	}
+	return nil
+}
+
+func (j *TransactionJournal) syncVaultDirectory(root *os.Root, relative string, phase string) error {
+	return syncTransactionDirectory(root, relative, j.fail, phase)
+}
+
+func (j *TransactionJournal) fail(phase string) error {
+	if j.fault != nil {
+		return j.fault(phase)
+	}
+	return nil
+}
+
+func validateTransactionTarget(root *os.Root, relative string) error {
+	if !isTransactionContentPath(relative) {
+		return ErrInvalidTransaction
+	}
+	components := strings.Split(relative, "/")
+	for index := range components {
+		current := strings.Join(components[:index+1], "/")
+		info, err := root.Lstat(filepath.FromSlash(current))
+		if errors.Is(err, fs.ErrNotExist) {
+			if index != len(components)-1 {
+				return fmt.Errorf("transaction parent %q does not exist: %w", current, fs.ErrNotExist)
+			}
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("inspect transaction path %q: %w", current, err)
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return ErrInvalidTransaction
+		}
+		if index == len(components)-1 {
+			if !info.Mode().IsRegular() {
+				return ErrInvalidTransaction
+			}
+		} else if !info.IsDir() {
+			return ErrInvalidTransaction
+		}
+	}
+	return nil
+}
+
+func transactionTargetDigest(root *os.Root, relative string) (string, error) {
+	if err := validateTransactionTarget(root, relative); err != nil {
+		return "", err
+	}
+	_, err := root.Lstat(filepath.FromSlash(relative))
+	if errors.Is(err, fs.ErrNotExist) {
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	return transactionFileDigest(root, relative)
+}
+
+func transactionFileDigest(root *os.Root, relative string) (string, error) {
+	info, err := root.Lstat(filepath.FromSlash(relative))
+	if err != nil {
+		return "", err
+	}
+	if !info.Mode().IsRegular() || info.Size() < 0 || info.Size() > maxTransactionFileBytes {
+		return "", ErrInvalidTransaction
+	}
+	file, err := root.Open(filepath.FromSlash(relative))
+	if err != nil {
+		return "", err
+	}
+	openedInfo, statErr := file.Stat()
+	if statErr != nil || !openedInfo.Mode().IsRegular() || !os.SameFile(info, openedInfo) {
+		_ = file.Close()
+		return "", errors.Join(ErrInvalidTransaction, statErr)
+	}
+	hasher := sha256.New()
+	readBytes, readErr := io.Copy(hasher, io.LimitReader(file, maxTransactionFileBytes+1))
+	closeErr := file.Close()
+	if err := errors.Join(readErr, closeErr); err != nil {
+		return "", err
+	}
+	if openedInfo.Size() > maxTransactionFileBytes || readBytes > maxTransactionFileBytes {
+		return "", ErrInvalidTransaction
+	}
+	return hex.EncodeToString(hasher.Sum(nil)), nil
+}
+
+func readTransactionFile(root *os.Root, relative string, maximum int64) ([]byte, error) {
+	info, err := root.Lstat(filepath.FromSlash(relative))
+	if err != nil {
+		return nil, err
+	}
+	if !info.Mode().IsRegular() || info.Size() < 0 || info.Size() > maximum {
+		return nil, ErrTransactionJournalCorrupt
+	}
+	file, err := root.Open(filepath.FromSlash(relative))
+	if err != nil {
+		return nil, err
+	}
+	openedInfo, statErr := file.Stat()
+	if statErr != nil || !openedInfo.Mode().IsRegular() || !os.SameFile(info, openedInfo) {
+		_ = file.Close()
+		return nil, errors.Join(ErrTransactionJournalCorrupt, statErr)
+	}
+	data, readErr := io.ReadAll(io.LimitReader(file, maximum+1))
+	closeErr := file.Close()
+	if err := errors.Join(readErr, closeErr); err != nil {
+		return nil, err
+	}
+	if int64(len(data)) > maximum {
+		return nil, ErrTransactionJournalCorrupt
+	}
+	return data, nil
+}
+
+func removeTransactionFile(root *os.Root, relative string) error {
+	info, err := root.Lstat(filepath.FromSlash(relative))
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if !info.Mode().IsRegular() {
+		return ErrTransactionJournalCorrupt
+	}
+	return root.Remove(filepath.FromSlash(relative))
+}
+
+func syncTransactionDirectory(root *os.Root, relative string, fail func(string) error, phase string) error {
+	if fail != nil {
+		if err := fail(phase); err != nil {
+			return err
+		}
+	}
+	if relative == "" {
+		relative = "."
+	}
+	directory, err := root.Open(filepath.FromSlash(relative))
+	if err != nil {
+		return fmt.Errorf("open transaction directory %q for sync: %w", relative, err)
+	}
+	syncErr := directory.Sync()
+	closeErr := directory.Close()
+	return errors.Join(syncErr, closeErr)
+}
+
+func validateTransactionJournalTarget(root *os.Root, name string) error {
+	info, err := root.Lstat(name)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if !info.Mode().IsRegular() {
+		return ErrTransactionJournalCorrupt
+	}
+	return nil
+}
+
+func marshalTransactionRecord(record transactionRecord, vaultKey []byte) ([]byte, error) {
+	if len(vaultKey) != VaultKeySize || validateTransactionRecord(record) != nil {
+		return nil, ErrInvalidTransaction
+	}
+	payload := transactionPayloadFromRecord(record)
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		return nil, err
+	}
+	keyDeriver := hmac.New(sha256.New, vaultKey)
+	_, _ = keyDeriver.Write([]byte(transactionMACDomain))
+	authKey := keyDeriver.Sum(nil)
+	authenticator := hmac.New(sha256.New, authKey)
+	_, _ = authenticator.Write(encoded)
+	record.MAC = hex.EncodeToString(authenticator.Sum(nil))
+	encoded, err = json.Marshal(record)
+	if err != nil {
+		return nil, err
+	}
+	if len(encoded) > maxTransactionJournalBytes {
+		return nil, ErrInvalidTransaction
+	}
+	return encoded, nil
+}
+
+func parseTransactionRecord(data, vaultKey []byte) (transactionRecord, error) {
+	if len(data) == 0 || len(data) > maxTransactionJournalBytes || len(vaultKey) != VaultKeySize {
+		return transactionRecord{}, ErrTransactionJournalCorrupt
+	}
+	if err := rejectDuplicateJSONFieldsRecursive(data); err != nil {
+		return transactionRecord{}, ErrTransactionJournalCorrupt
+	}
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	var record transactionRecord
+	if err := decoder.Decode(&record); err != nil {
+		return transactionRecord{}, errors.Join(ErrTransactionJournalCorrupt, err)
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		return transactionRecord{}, ErrTransactionJournalCorrupt
+	}
+	providedMAC, err := hex.DecodeString(record.MAC)
+	if err != nil || len(providedMAC) != sha256.Size {
+		return transactionRecord{}, ErrTransactionJournalCorrupt
+	}
+	payload, err := json.Marshal(transactionPayloadFromRecord(record))
+	if err != nil {
+		return transactionRecord{}, err
+	}
+	keyDeriver := hmac.New(sha256.New, vaultKey)
+	_, _ = keyDeriver.Write([]byte(transactionMACDomain))
+	authKey := keyDeriver.Sum(nil)
+	authenticator := hmac.New(sha256.New, authKey)
+	_, _ = authenticator.Write(payload)
+	if !hmac.Equal(providedMAC, authenticator.Sum(nil)) || validateTransactionRecord(record) != nil {
+		return transactionRecord{}, ErrTransactionJournalCorrupt
+	}
+	return record, nil
+}
+
+func transactionPayloadFromRecord(record transactionRecord) transactionPayload {
+	return transactionPayload{
+		Version: record.Version, ID: record.ID, VaultID: record.VaultID, State: record.State,
+		Changes: record.Changes, CatalogStage: record.CatalogStage, CatalogSHA256: record.CatalogSHA256,
+	}
+}
+
+func validateTransactionRecord(record transactionRecord) error {
+	if record.Version != transactionFormatVersion || !isCatalogID(record.ID) || !isCatalogID(record.VaultID) ||
+		(record.State != "prepared" && record.State != "committed") || len(record.Changes) == 0 ||
+		len(record.Changes) > maxTransactionChanges || record.CatalogStage != transactionCatalogStageName(record.ID) ||
+		!isSHA256Hex(record.CatalogSHA256) {
+		return ErrInvalidTransaction
+	}
+	seen := make(map[string]struct{}, len(record.Changes))
+	for index, entry := range record.Changes {
+		if !isTransactionContentPath(entry.Path) {
+			return ErrInvalidTransaction
+		}
+		if _, exists := seen[entry.Path]; exists {
+			return ErrInvalidTransaction
+		}
+		seen[entry.Path] = struct{}{}
+		if entry.Delete {
+			if entry.ObjectID != "" || entry.Stage != "" || entry.SHA256 != "" {
+				return ErrInvalidTransaction
+			}
+		} else if !isCatalogID(entry.ObjectID) || entry.Stage != transactionContentStageName(record.ID, index) || !isSHA256Hex(entry.SHA256) {
+			return ErrInvalidTransaction
+		}
+		if index > 0 && record.Changes[index-1].Path >= entry.Path {
+			return ErrInvalidTransaction
+		}
+	}
+	return nil
+}
+
+func validateTransactionBindings(changes []CiphertextChange, catalog Catalog) error {
+	objects := make(map[string]CatalogObject, len(catalog.Objects))
+	for _, object := range catalog.Objects {
+		objects[object.PhysicalPath] = object
+	}
+	for _, change := range changes {
+		object, exists := objects[change.Path]
+		if change.Delete {
+			if exists {
+				return ErrInvalidTransaction
+			}
+			continue
+		}
+		if !exists || !object.Protected || object.ObjectID != change.ObjectID || object.CiphertextHash != transactionDigest(change.Ciphertext) {
+			return ErrInvalidTransaction
+		}
+	}
+	return nil
+}
+
+func isTransactionContentPath(value string) bool {
+	if !isCatalogPath(value) {
+		return false
+	}
+	for _, component := range strings.Split(value, "/") {
+		if strings.HasPrefix(component, ".vnotes-txn-") {
+			return false
+		}
+	}
+	return true
+}
+
+func validateTransactionRecordBindings(record transactionRecord, catalog Catalog) error {
+	objects := make(map[string]CatalogObject, len(catalog.Objects))
+	for _, object := range catalog.Objects {
+		objects[object.PhysicalPath] = object
+	}
+	for _, change := range record.Changes {
+		object, exists := objects[change.Path]
+		if change.Delete {
+			if exists {
+				return ErrInvalidTransaction
+			}
+			continue
+		}
+		if !exists || !object.Protected || object.ObjectID != change.ObjectID || object.CiphertextHash != change.SHA256 {
+			return ErrInvalidTransaction
+		}
+	}
+	return nil
+}
+
+func transactionContentStageName(id string, index int) string {
+	return fmt.Sprintf(".vnotes-txn-%s-%06d.stage", id, index)
+}
+
+func transactionCatalogStageName(id string) string {
+	return ".vnotes-txn-" + id + "-catalog.stage"
+}
+
+func transactionDigest(data []byte) string {
+	digest := sha256.Sum256(data)
+	return hex.EncodeToString(digest[:])
+}
