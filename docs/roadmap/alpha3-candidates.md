@@ -245,8 +245,8 @@ Completion criteria:
 
 ## Milestone 31 - Selective encryption for notes and folders
 
-M31 remains in Alpha 3. This checklist is the implementation plan. **P01–P04
-are complete; P05–P18 remain open.** M31 is not complete until P01–P18 are
+M31 remains in Alpha 3. This checklist is the implementation plan. **P01–P05
+are complete; P06–P18 remain open.** M31 is not complete until P01–P18 are
 complete and the independent security review in P17 has passed. Encryption
 activation must stay disabled in the UI, API, and any operator command until
 the P18 release gate passes.
@@ -362,7 +362,7 @@ requires its listed tests; P17 adds end-to-end and adversarial coverage.
   remain disconnected from vault operations until later M31 steps and the P18
   activation gate.
 
-- [ ] **P05 — In-memory key manager and server lock state**
+- [x] **P05 — In-memory key manager and server lock state**
   *(dependencies: P03, P04; size: M)*
   **Goal/scope:** central key lifetime, per-session grants, 15-minute inactivity
   lock, logout/manual/restart lock, tab notifications, and stale-response
@@ -370,6 +370,13 @@ requires its listed tests; P17 adds end-to-end and adversarial coverage.
   **Acceptance/tests:** no protected API returns plaintext while locked; other
   sessions must unlock; background requests do not extend timeout; restart
   starts locked; logout/manual lock revoke grants; late responses stay hidden.
+  Implemented in `internal/encryption` as a volatile per-vault key manager with
+  grants bound to authenticated session hashes, a 15-minute idle timer, explicit
+  foreground activity, generation-checked key leases, and session-scoped lock
+  events. The lock, activity, and event routes do not provide an unlock path or
+  protected content; startup remains locked and the M31 activation gate stays
+  closed. Logout, session renewal/revocation, password change, and MFA disable
+  lock all in-memory vault keys.
 
 - [ ] **P06 — Transaction journal and restart recovery**
   *(dependencies: P01, P03, P04; size: L)*

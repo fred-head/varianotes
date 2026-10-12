@@ -2,6 +2,7 @@ package app
 
 import (
 	"database/sql"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -22,6 +23,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/fred-head/varianotes/internal/auth"
+	"github.com/fred-head/varianotes/internal/encryption"
 	"github.com/fred-head/varianotes/internal/files"
 	frontend "github.com/fred-head/varianotes/web"
 )
@@ -46,6 +48,13 @@ func newHandler(logger *slog.Logger, repositoryRoot string, authService *auth.Se
 }
 
 func newHandlerWithSessions(logger *slog.Logger, repositoryRoot string, authService *auth.Service, sessions *auth.Sessions, versions ...string) (http.Handler, error) {
+	return newHandlerWithKeyManager(logger, repositoryRoot, authService, sessions, encryption.NewKeyManager(), versions...)
+}
+
+func newHandlerWithKeyManager(logger *slog.Logger, repositoryRoot string, authService *auth.Service, sessions *auth.Sessions, keyManager *encryption.KeyManager, versions ...string) (http.Handler, error) {
+	if keyManager == nil {
+		return nil, errors.New("encryption key manager is required")
+	}
 	version := "dev"
 	if len(versions) > 0 && strings.TrimSpace(versions[0]) != "" {
 		version = strings.TrimSpace(versions[0])
@@ -194,6 +203,7 @@ func newHandlerWithSessions(logger *slog.Logger, repositoryRoot string, authServ
 			defer release()
 			err = sessions.Login(r.Context(), input.Password, input.RememberDevice, r.UserAgent())
 			if errors.Is(err, auth.ErrMFARequired) {
+				_ = keyManager.LockAll(encryption.LockReasonSession)
 				_ = authService.RecordSecurityEvent(r.Context(), "login_password", "success", "client="+auth.ClientReference(clientIP))
 				writeJSON(w, http.StatusAccepted, map[string]any{"authenticated": false, "mfaRequired": true})
 				return
@@ -212,6 +222,7 @@ func newHandlerWithSessions(logger *slog.Logger, repositoryRoot string, authServ
 				writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "authentication is unavailable"})
 				return
 			}
+			_ = keyManager.LockAll(encryption.LockReasonSession)
 			if err := loginThrottle.SuccessOperation(r.Context(), auth.ThrottleOperationLogin, clientIP); err != nil {
 				logger.Warn("clear login throttle failed", "error", err)
 			}
@@ -242,11 +253,13 @@ func newHandlerWithSessions(logger *slog.Logger, repositoryRoot string, authServ
 				writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "authentication failed", "code": "invalid_credentials"})
 				return
 			}
+			_ = keyManager.LockAll(encryption.LockReasonSession)
 			_ = loginThrottle.SuccessOperation(r.Context(), auth.ThrottleOperationLogin, clientIP)
 			_ = authService.RecordSecurityEvent(r.Context(), "login_mfa", "success", "client="+auth.ClientReference(clientIP))
 			writeJSON(w, http.StatusOK, map[string]any{"authenticated": true, "csrfToken": sessions.ExistingCSRFToken(r.Context())})
 		})
 		mux.HandleFunc("POST /api/auth/logout", func(w http.ResponseWriter, r *http.Request) {
+			_ = keyManager.LockAll(encryption.LockReasonLogout)
 			if err := sessions.Logout(r.Context()); err != nil {
 				writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "logout failed"})
 				return
@@ -255,6 +268,7 @@ func newHandlerWithSessions(logger *slog.Logger, repositoryRoot string, authServ
 			writeJSON(w, http.StatusOK, map[string]bool{"authenticated": false})
 		})
 		mux.HandleFunc("DELETE /api/auth/session", func(w http.ResponseWriter, r *http.Request) {
+			_ = keyManager.LockAll(encryption.LockReasonLogout)
 			if err := sessions.RevokeCurrent(r.Context()); err != nil {
 				writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "session revocation failed"})
 				return
@@ -263,6 +277,7 @@ func newHandlerWithSessions(logger *slog.Logger, repositoryRoot string, authServ
 			writeJSON(w, http.StatusOK, map[string]bool{"revoked": true})
 		})
 		mux.HandleFunc("DELETE /api/auth/sessions", func(w http.ResponseWriter, r *http.Request) {
+			_ = keyManager.LockAll(encryption.LockReasonLogout)
 			if err := sessions.RevokeAll(r.Context()); err != nil {
 				writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "session revocation failed"})
 				return
@@ -283,6 +298,7 @@ func newHandlerWithSessions(logger *slog.Logger, repositoryRoot string, authServ
 				writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "session revocation failed"})
 				return
 			}
+			_ = keyManager.RevokeSessionsExcept(sessions.CurrentHash(r.Context()))
 			_ = authService.RecordSecurityEvent(r.Context(), "session_revoke_others", "success", "client="+auth.ClientReference(requestIdentity.ClientIP(r)))
 			writeJSON(w, http.StatusOK, map[string]bool{"revoked": true})
 		})
@@ -290,6 +306,9 @@ func newHandlerWithSessions(logger *slog.Logger, repositoryRoot string, authServ
 			err := authService.RevokeSession(r.Context(), r.PathValue("id"), sessions.CurrentHash(r.Context()))
 			switch {
 			case err == nil:
+				if sessionHash, decodeErr := base64.RawURLEncoding.DecodeString(r.PathValue("id")); decodeErr == nil {
+					_ = keyManager.RevokeSessionEverywhere(sessionHash)
+				}
 				writeJSON(w, http.StatusOK, map[string]bool{"revoked": true})
 			case errors.Is(err, sql.ErrNoRows):
 				writeJSON(w, http.StatusNotFound, map[string]string{"error": "session not found"})
@@ -399,6 +418,7 @@ func newHandlerWithSessions(logger *slog.Logger, repositoryRoot string, authServ
 			err := sessions.ChangePassword(r.Context(), input.CurrentPassword, input.NewPassword)
 			switch {
 			case err == nil:
+				_ = keyManager.LockAll(encryption.LockReasonSession)
 				if clearErr := loginThrottle.SuccessOperation(r.Context(), auth.ThrottleOperationSensitive, clientIP); clearErr != nil {
 					logger.Warn("clear sensitive credential throttle failed", "error", clearErr)
 				}
@@ -465,6 +485,7 @@ func newHandlerWithSessions(logger *slog.Logger, repositoryRoot string, authServ
 				writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "session rotation failed"})
 				return
 			}
+			_ = keyManager.LockAll(encryption.LockReasonSession)
 			_ = authService.RecordSecurityEvent(r.Context(), "mfa_enabled", "success", "client="+auth.ClientReference(requestIdentity.ClientIP(r)))
 			writeJSON(w, http.StatusOK, map[string]any{"mfaEnabled": true, "csrfToken": sessions.ExistingCSRFToken(r.Context())})
 		})
@@ -495,6 +516,7 @@ func newHandlerWithSessions(logger *slog.Logger, repositoryRoot string, authServ
 				writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "authentication failed", "code": "invalid_credentials"})
 				return
 			}
+			_ = keyManager.LockAll(encryption.LockReasonLogout)
 			if err := sessions.Logout(r.Context()); err != nil {
 				writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "logout failed"})
 				return
@@ -556,6 +578,71 @@ func newHandlerWithSessions(logger *slog.Logger, repositoryRoot string, authServ
 			default:
 				logger.Error("owner setup failed", "error", err)
 				writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "owner setup could not be completed"})
+			}
+		})
+		mux.HandleFunc("POST /api/encryption/lock", func(w http.ResponseWriter, _ *http.Request) {
+			if err := keyManager.LockVault(currentNotebookID(), encryption.LockReasonManual); err != nil {
+				writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "encryption lock is unavailable"})
+				return
+			}
+			writeJSON(w, http.StatusOK, map[string]bool{"locked": true})
+		})
+		mux.HandleFunc("POST /api/encryption/activity", func(w http.ResponseWriter, r *http.Request) {
+			err := keyManager.Touch(r.URL.Query().Get("vaultId"), sessions.CurrentHash(r.Context()))
+			switch {
+			case err == nil:
+				writeJSON(w, http.StatusOK, map[string]bool{"recorded": true})
+			case errors.Is(err, encryption.ErrVaultLocked):
+				writeJSON(w, http.StatusLocked, map[string]string{"error": "vault is locked"})
+			case errors.Is(err, encryption.ErrSessionRequired):
+				writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "authenticated session is required"})
+			case errors.Is(err, encryption.ErrInvalidVaultID):
+				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid vault ID"})
+			default:
+				writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "encryption activity state is unavailable"})
+			}
+		})
+		mux.HandleFunc("GET /api/encryption/lock-events", func(w http.ResponseWriter, r *http.Request) {
+			events, cancel, err := keyManager.Subscribe(r.URL.Query().Get("vaultId"), sessions.CurrentHash(r.Context()))
+			if err != nil {
+				if errors.Is(err, encryption.ErrSessionRequired) {
+					writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "authenticated session is required"})
+				} else if errors.Is(err, encryption.ErrKeyManagerClosed) {
+					writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "encryption lock events are unavailable"})
+				} else {
+					writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid encryption lock subscription"})
+				}
+				return
+			}
+			defer cancel()
+			flusher, ok := w.(http.Flusher)
+			if !ok {
+				writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "lock events are unavailable"})
+				return
+			}
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.Header().Set("Cache-Control", "no-store")
+			w.Header().Set("X-Accel-Buffering", "no")
+			for {
+				select {
+				case event, open := <-events:
+					if !open {
+						return
+					}
+					encoded, marshalErr := json.Marshal(event)
+					if marshalErr != nil {
+						return
+					}
+					if _, writeErr := fmt.Fprintf(w, "event: encryption-lock\ndata: %s\n\n", encoded); writeErr != nil {
+						return
+					}
+					flusher.Flush()
+					if event.Reason == encryption.LockReasonLogout || event.Reason == encryption.LockReasonSession || event.Reason == encryption.LockReasonRevoked || event.Reason == encryption.LockReasonRestart {
+						return
+					}
+				case <-r.Context().Done():
+					return
+				}
 			}
 		})
 	}

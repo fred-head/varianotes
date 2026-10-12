@@ -1,6 +1,7 @@
-// Package encryption implements the versioned cryptographic primitives used
-// by the later selective-encryption layers. It is deliberately not connected
-// to an API, command, or vault operation until the M31 activation gate passes.
+// Package encryption implements M31's versioned cryptographic primitives,
+// authenticated catalog, and volatile lock state. Key material and catalogs
+// remain disconnected from vault content APIs until the M31 activation gate
+// passes; only lock, activity, and lock-event operations are exposed meanwhile.
 package encryption
 
 import (

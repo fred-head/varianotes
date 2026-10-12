@@ -8,6 +8,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- Added the volatile M31 key manager with per-session unlock grants, a
+  15-minute inactivity lock, explicit activity tracking, generation-checked
+  response leases, manual/logout locking, and session-scoped lock events.
+  No unlock or protected-content API is enabled; M31 remains gated.
 - Added versioned, authenticated encryption catalogs with durable recursive
   folder rules, object-bound ciphertext digests, and fail-closed metadata
   loading. Encryption remains inactive pending the M31 release gate.
