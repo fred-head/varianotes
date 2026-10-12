@@ -4,7 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
-	"io/fs"
+	"fmt"
 	"net/url"
 	"os"
 	"path"
@@ -53,10 +53,11 @@ type linkOccurrence struct {
 }
 
 type plannedLinkFile struct {
-	oldPath string
-	newPath string
-	content string
-	updated string
+	oldPath   string
+	newPath   string
+	content   string
+	afterMove string
+	updated   string
 }
 
 func (r *Repository) NoteLinks(notePath string) ([]NoteLink, error) {
@@ -105,7 +106,7 @@ func (r *Repository) MoveWithLinkUpdates(source, target, expectedToken string) (
 		return MoveLinkPreview{}, err
 	}
 	if expectedToken == "" || expectedToken != preview.Token {
-		return MoveLinkPreview{}, ErrConflict
+		return MoveLinkPreview{}, fmt.Errorf("link rewrite preview is stale: %w", ErrConflict)
 	}
 	if err := r.move(source, target); err != nil {
 		return MoveLinkPreview{}, err
@@ -116,19 +117,20 @@ func (r *Repository) MoveWithLinkUpdates(source, target, expectedToken string) (
 		if planned.updated == planned.content {
 			continue
 		}
-		destination, info, resolveErr := r.resolveEntry(planned.newPath)
-		if resolveErr != nil || !info.Mode().IsRegular() {
-			err = errors.Join(ErrInvalidPath, resolveErr)
-			break
-		}
-		// #nosec G304 -- destination was re-resolved beneath the repository and checked as a regular file immediately above.
-		current, readErr := os.ReadFile(destination)
+		current, readErr := r.content.read(planned.newPath, maxMarkdownSize)
 		if readErr != nil {
 			err = readErr
 			break
 		}
-		planned.content = string(current)
-		if writeErr := writeMarkdownAtomically(destination, planned.updated); writeErr != nil {
+		currentContent := string(current.Bytes)
+		if currentContent == planned.updated {
+			continue
+		}
+		if currentContent != planned.afterMove {
+			err = fmt.Errorf("note %q changed during link rewrite: %w", planned.newPath, ErrConflict)
+			break
+		}
+		if _, writeErr := r.content.write(planned.newPath, []byte(planned.updated), current.Version, maxMarkdownSize); writeErr != nil {
 			err = writeErr
 			break
 		}
@@ -138,8 +140,9 @@ func (r *Repository) MoveWithLinkUpdates(source, target, expectedToken string) (
 		return preview, nil
 	}
 	for index := len(written) - 1; index >= 0; index-- {
-		if destination, info, resolveErr := r.resolveEntry(written[index].newPath); resolveErr == nil && info.Mode().IsRegular() {
-			_ = writeMarkdownAtomically(destination, written[index].content)
+		current, readErr := r.content.read(written[index].newPath, maxMarkdownSize)
+		if readErr == nil && string(current.Bytes) == written[index].updated {
+			_, _ = r.content.write(written[index].newPath, []byte(written[index].afterMove), current.Version, maxMarkdownSize)
 		}
 	}
 	_ = r.move(target, source)
@@ -169,11 +172,11 @@ func (r *Repository) planMoveLinks(source, target string) (MoveLinkPreview, []pl
 	_, _ = hash.Write([]byte(source + "\x00" + target + "\x00"))
 	for _, oldNotePath := range notePaths {
 		newNotePath := remapMovedPath(oldNotePath, source, target)
-		content, readErr := os.ReadFile(filepath.Join(r.root, filepath.FromSlash(oldNotePath)))
+		content, readErr := r.content.read(oldNotePath, maxMarkdownSize)
 		if readErr != nil {
 			return MoveLinkPreview{}, nil, readErr
 		}
-		occurrences := parseMarkdownLinks(oldNotePath, string(content))
+		occurrences := parseMarkdownLinks(oldNotePath, string(content.Bytes))
 		replacements := make([]linkReplacement, 0)
 		for _, occurrence := range occurrences {
 			if !occurrence.internal || !noteSet[occurrence.targetPath] {
@@ -193,17 +196,19 @@ func (r *Repository) planMoveLinks(source, target string) (MoveLinkPreview, []pl
 			replacements = append(replacements, linkReplacement{start: occurrence.hrefStart, end: occurrence.hrefEnd, value: nextHref})
 			preview.Rewrites = append(preview.Rewrites, LinkRewrite{NotePath: oldNotePath, NextNotePath: newNotePath, Line: occurrence.line, Before: occurrence.href, After: nextHref})
 		}
-		updated := applyLinkReplacements(string(content), replacements)
+		updated := applyLinkReplacements(string(content.Bytes), replacements)
+		afterMove := string(content.Bytes)
 		if oldNotePath == source && strings.EqualFold(path.Ext(source), ".md") {
-			oldBase, newBase := noteBase(filepath.FromSlash(source)), noteBase(filepath.FromSlash(target))
+			oldBase, newBase := noteBase(source), noteBase(target)
 			if oldBase != newBase {
+				afterMove = rewriteAssetLinksContent(afterMove, oldBase, newBase)
 				updated = rewriteAssetLinksContent(updated, oldBase, newBase)
 			}
 		}
-		if updated != string(content) {
-			plannedFiles = append(plannedFiles, plannedLinkFile{oldPath: oldNotePath, newPath: newNotePath, content: string(content), updated: updated})
+		if updated != string(content.Bytes) {
+			plannedFiles = append(plannedFiles, plannedLinkFile{oldPath: oldNotePath, newPath: newNotePath, content: string(content.Bytes), afterMove: afterMove, updated: updated})
 		}
-		_, _ = hash.Write([]byte(oldNotePath + "\x00" + contentVersion(content) + "\x00" + updated + "\x00"))
+		_, _ = hash.Write([]byte(oldNotePath + "\x00" + content.Version + "\x00" + updated + "\x00"))
 	}
 	sort.Slice(preview.Rewrites, func(left, right int) bool {
 		if preview.Rewrites[left].NotePath != preview.Rewrites[right].NotePath {
@@ -321,39 +326,26 @@ func (r *Repository) markdownNotePaths() ([]string, error) {
 		return nil, ErrNotConfigured
 	}
 	result := []string{}
-	err := filepath.WalkDir(r.root, func(current string, entry fs.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return walkErr
+	entries, err := r.content.walkEntries(func(entry contentEntry) bool {
+		if !entry.Info.IsDir() {
+			return false
 		}
-		if entry.Type()&fs.ModeSymlink != 0 {
-			if entry.IsDir() {
-				return filepath.SkipDir
-			}
-			return nil
-		}
-		if entry.IsDir() {
-			name := strings.ToLower(entry.Name())
-			if current != r.root && (name == ".git" || name == ".trash" || name == "node_modules" || strings.HasSuffix(name, ".assets")) {
-				return filepath.SkipDir
-			}
-			return nil
-		}
-		if !strings.EqualFold(filepath.Ext(entry.Name()), ".md") {
-			return nil
-		}
-		info, err := entry.Info()
-		if err != nil || !info.Mode().IsRegular() {
-			return err
-		}
-		relative, err := filepath.Rel(r.root, current)
-		if err != nil {
-			return err
-		}
-		result = append(result, filepath.ToSlash(relative))
-		return nil
+		name := strings.ToLower(entry.Name)
+		return name == ".git" || name == ".trash" || name == "node_modules" || strings.HasSuffix(name, ".assets")
 	})
+	if err != nil {
+		return nil, err
+	}
+	for _, entry := range entries {
+		if entry.Info.Mode()&os.ModeSymlink != 0 || entry.Info.IsDir() || !entry.Info.Mode().IsRegular() {
+			continue
+		}
+		if strings.EqualFold(path.Ext(entry.Name), ".md") {
+			result = append(result, entry.Path)
+		}
+	}
 	sort.Strings(result)
-	return result, err
+	return result, nil
 }
 
 func markdownCodeMask(content string) []bool {
@@ -405,38 +397,4 @@ func markInlineCode(line string, base int, mask []bool) {
 		}
 		index = end
 	}
-}
-
-func writeMarkdownAtomically(target, content string) error {
-	info, err := os.Stat(target)
-	if err != nil || !info.Mode().IsRegular() {
-		return errors.Join(ErrInvalidPath, err)
-	}
-	temporary, err := os.CreateTemp(filepath.Dir(target), ".varianotes-link-rewrite-*.tmp")
-	if err != nil {
-		return err
-	}
-	temporaryName := temporary.Name()
-	cleanup := func() { _ = temporary.Close(); _ = os.Remove(temporaryName) }
-	if err := temporary.Chmod(info.Mode().Perm()); err != nil {
-		cleanup()
-		return err
-	}
-	if _, err := temporary.WriteString(content); err != nil {
-		cleanup()
-		return err
-	}
-	if err := temporary.Sync(); err != nil {
-		cleanup()
-		return err
-	}
-	if err := temporary.Close(); err != nil {
-		cleanup()
-		return err
-	}
-	if err := os.Rename(temporaryName, target); err != nil {
-		cleanup()
-		return err
-	}
-	return syncDirectory(filepath.Dir(target))
 }

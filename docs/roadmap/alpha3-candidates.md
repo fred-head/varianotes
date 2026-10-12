@@ -245,11 +245,11 @@ Completion criteria:
 
 ## Milestone 31 - Selective encryption for notes and folders
 
-M31 remains in Alpha 3. This checklist is the implementation plan. **P01 is
-complete; P02–P18 remain open.** M31 is not complete until P01–P18 are complete
-and the independent security review in P17 has passed. Encryption activation
-must stay disabled in the UI, API, and any operator command until the P18
-release gate passes.
+M31 remains in Alpha 3. This checklist is the implementation plan. **P01–P02
+are complete; P03–P18 remain open.** M31 is not complete until P01–P18 are
+complete and the independent security review in P17 has passed. Encryption
+activation must stay disabled in the UI, API, and any operator command until
+the P18 release gate passes.
 
 The size labels are relative estimates, not measured durations: S is small, M
 is medium, and L is large or has substantial failure-recovery work. Each step
@@ -322,7 +322,7 @@ requires its listed tests; P17 adds end-to-end and adversarial coverage.
   conflict; traversal, symlink escape, non-regular files, and unsafe sizes are
   rejected; concurrent writes have deterministic outcomes.
 
-- [ ] **P02 — Route every content path through the shared layer**
+- [x] **P02 — Route every content path through the shared layer**
   *(dependencies: P01; size: L)*
   **Goal/scope:** remove direct content access from note operations, link preview
   and rewrite, assets, search, conflicts, and ZIP export, including export's
