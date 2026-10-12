@@ -13,6 +13,8 @@ import (
 	"sync"
 )
 
+const internalTransactionStagePrefix = ".vnotes-txn-"
+
 // contentStore is the shared boundary for reading and replacing ordinary vault
 // files. Higher-level operations choose which paths and sizes are appropriate;
 // this layer owns confinement, version checks, atomic replacement, and
@@ -212,6 +214,9 @@ func (s *contentStore) readDir(relative string) ([]contentEntry, error) {
 	}
 	result := make([]contentEntry, 0, len(entries))
 	for _, entry := range entries {
+		if strings.HasPrefix(entry.Name(), internalTransactionStagePrefix) {
+			continue
+		}
 		entryPath := entry.Name()
 		if relative != "" && relative != "." {
 			entryPath = path.Join(relative, entry.Name())
@@ -494,7 +499,7 @@ func validateStorePath(relative string) error {
 		return ErrInvalidPath
 	}
 	for _, part := range strings.Split(relative, "/") {
-		if part == "" || part == "." || part == ".." {
+		if part == "" || part == "." || part == ".." || strings.HasPrefix(part, internalTransactionStagePrefix) {
 			return ErrInvalidPath
 		}
 	}

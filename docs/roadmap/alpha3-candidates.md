@@ -245,8 +245,8 @@ Completion criteria:
 
 ## Milestone 31 - Selective encryption for notes and folders
 
-M31 remains in Alpha 3. This checklist is the implementation plan. **P01–P05
-are complete; P06–P18 remain open.** M31 is not complete until P01–P18 are
+M31 remains in Alpha 3. This checklist is the implementation plan. **P01–P06
+are complete; P07–P18 remain open.** M31 is not complete until P01–P18 are
 complete and the independent security review in P17 has passed. Encryption
 activation must stay disabled in the UI, API, and any operator command until
 the P18 release gate passes.
@@ -378,7 +378,7 @@ requires its listed tests; P17 adds end-to-end and adversarial coverage.
   closed. Logout, session renewal/revocation, password change, and MFA disable
   lock all in-memory vault keys.
 
-- [ ] **P06 — Transaction journal and restart recovery**
+- [x] **P06 — Transaction journal and restart recovery**
   *(dependencies: P01, P03, P04; size: L)*
   **Goal/scope:** reusable prepare, ciphertext staging, verification, commit
   point, and forward recovery for changes spanning content and catalog files.
@@ -386,6 +386,18 @@ requires its listed tests; P17 adds end-to-end and adversarial coverage.
   boundaries; before commit the old state survives, after commit restart
   completes forward; full disk and permission errors preserve originals and
   block affected content; no plaintext staging files remain.
+  Implemented in `internal/encryption/transaction.go`. The prepared journal is
+  HMAC-authenticated with the vault key; each replacement is verified as
+  object-bound age ciphertext and must match the authenticated next catalog.
+  Ciphertext stages live beside their vault targets, while the catalog stage
+  and journal live in application metadata. Originals remain in place until a
+  durable commit record selects forward recovery. A restart discards a prepared
+  transaction or completes a committed one through `Recover`; callers must
+  recover before serving affected content. Failures after the commit point
+  return a recovery-required error and retain the journal. Staging names are
+  hidden from ordinary file enumeration and direct content reads. These
+  transaction primitives are not wired into vault operations; the M31
+  activation gate remains closed.
 
 - [ ] **P07 — Password changes and authentication-mode rules**
   *(dependencies: P03–P06; size: L)*

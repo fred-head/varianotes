@@ -19,16 +19,20 @@ history. For behavior and deployment, see [README](../README.md).
   and writes, note operations, link rewrites, search, Trash, and ZIP export all
   route through this layer. Later M31 steps will add encrypted storage there.
 - `internal/encryption/` contains the versioned age and key-envelope primitives
-  from M31P03 and the authenticated, durable catalog from M31P04. Catalogs
-  authenticate vault/object identities, logical and physical paths,
+  from M31P03, the authenticated durable catalog from M31P04, the volatile
+  per-vault key manager from M31P05, and the transaction journal from M31P06.
+  Catalogs authenticate vault/object identities, logical and physical paths,
   ciphertext-only digests, explicit protection state, and recursive folder
-  rules. M31P05 adds a volatile per-vault key manager with per-session grants,
-  a 15-minute idle lock, and generation-checked response leases. The store
+  rules. The transaction journal stages verified ciphertext beside vault files,
+  stores its authenticated journal and catalog stage in application metadata,
+  and recovers committed changes forward after restart. Recovery needs the
+  unlocked vault key and must run before affected content is served. The store
   keeps catalogs in server application metadata outside the vault and rejects
   missing, corrupt, or unauthenticated state. The key manager's lock, activity,
   and lock-event routes do not unlock vaults or serve protected content. Key
-  envelopes, catalog, and key manager are not wired into vault operations;
-  encryption stays inactive until the M31 release gate passes.
+  envelopes, catalog, key manager, and transaction journal are not wired into
+  vault operations; encryption stays inactive until the M31 release gate
+  passes.
 - Multiple named vaults on one server are registered in application metadata.
   The registry stores IDs, display names, and filesystem paths. It is not a
   copy of note or asset content.
