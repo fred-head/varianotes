@@ -3,6 +3,8 @@ package app
 import (
 	"archive/zip"
 	"bytes"
+	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"io"
@@ -15,10 +17,12 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/fred-head/varianotes/internal/auth"
+	"github.com/fred-head/varianotes/internal/encryption"
 	"github.com/pquerna/otp/totp"
 )
 
@@ -229,6 +233,170 @@ func TestLoginSessionPersistsAndCanBeRevoked(t *testing.T) {
 	handler.ServeHTTP(afterRevoke, requestAfterRevoke)
 	if afterRevoke.Code != http.StatusUnauthorized {
 		t.Fatalf("revoked session remained authorized: %d", afterRevoke.Code)
+	}
+}
+
+func TestEncryptionLockAPIAndLogoutRevokeInMemoryGrants(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	service, err := auth.Open(t.Context(), auth.Config{Mode: auth.ModeLocal, MetadataPath: filepath.Join(t.TempDir(), "auth.db")}, logger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer service.Close()
+	token, err := service.CreateBootstrapToken(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	sessions, err := auth.NewSessions(service, auth.DefaultSessionOptions(false))
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager := encryption.NewKeyManager()
+	defer manager.Close()
+	handler, err := newHandlerWithKeyManager(logger, t.TempDir(), service, sessions, manager)
+	if err != nil {
+		t.Fatal(err)
+	}
+	setupBody, err := json.Marshal(map[string]string{"bootstrapToken": token.Value, "password": "a sufficiently long password"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	setup := httptest.NewRecorder()
+	handler.ServeHTTP(setup, httptest.NewRequest(http.MethodPost, "/api/auth/setup", bytes.NewReader(setupBody)))
+	if setup.Code != http.StatusOK {
+		t.Fatalf("owner setup failed: %d %s", setup.Code, setup.Body.String())
+	}
+	cookie, csrf := authRequestContextFromResponse(t, setup)
+	if cookie == nil {
+		t.Fatal("owner setup did not issue a session cookie")
+	}
+	sessionHash := sha256.Sum256([]byte(cookie.Value))
+	events, cancel, err := manager.Subscribe("local", sessionHash[:])
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cancel()
+	initialEvent := <-events
+	if !initialEvent.Locked {
+		t.Fatalf("initial encryption event = %#v, want locked", initialEvent)
+	}
+	streamContext, stopStream := context.WithCancel(t.Context())
+	streamRequest := httptest.NewRequest(http.MethodGet, "/api/encryption/lock-events?vaultId=local", nil).WithContext(streamContext)
+	streamRequest.AddCookie(cookie)
+	streamWriter := newSynchronizedEventWriter()
+	streamDone := make(chan struct{})
+	go func() {
+		handler.ServeHTTP(streamWriter, streamRequest)
+		close(streamDone)
+	}()
+	defer func() {
+		stopStream()
+		select {
+		case <-streamDone:
+		case <-time.After(time.Second):
+			t.Error("lock event stream did not stop after cancellation")
+		}
+	}()
+	waitForStreamContent(t, streamWriter, `"locked":true`)
+	key := bytes.Repeat([]byte{12}, encryption.VaultKeySize)
+	if err := manager.Unlock("local", sessionHash[:], key); err != nil {
+		t.Fatal(err)
+	}
+	if unlockEvent := <-events; unlockEvent.Locked {
+		t.Fatalf("unlock event = %#v, want unlocked", unlockEvent)
+	}
+	waitForStreamContent(t, streamWriter, `"locked":false`)
+
+	lockRequest := httptest.NewRequest(http.MethodPost, "/api/encryption/lock", nil)
+	addAuthRequestContext(lockRequest, cookie, csrf)
+	lockResponse := httptest.NewRecorder()
+	handler.ServeHTTP(lockResponse, lockRequest)
+	if lockResponse.Code != http.StatusOK || !strings.Contains(lockResponse.Body.String(), `"locked":true`) {
+		t.Fatalf("manual lock failed: %d %s", lockResponse.Code, lockResponse.Body.String())
+	}
+	if manager.IsUnlocked("local", sessionHash[:]) {
+		t.Fatal("manual lock endpoint retained an encryption grant")
+	}
+	if event := <-events; !event.Locked || event.Reason != encryption.LockReasonManual {
+		t.Fatalf("manual lock event = %#v", event)
+	}
+	waitForStreamContent(t, streamWriter, `"reason":"manual"`)
+	activityRequest := httptest.NewRequest(http.MethodPost, "/api/encryption/activity?vaultId=local", nil)
+	addAuthRequestContext(activityRequest, cookie, csrf)
+	activityResponse := httptest.NewRecorder()
+	handler.ServeHTTP(activityResponse, activityRequest)
+	if activityResponse.Code != http.StatusLocked {
+		t.Fatalf("activity request while locked = %d %s, want 423", activityResponse.Code, activityResponse.Body.String())
+	}
+	stopStream()
+	select {
+	case <-streamDone:
+	case <-time.After(time.Second):
+		t.Fatal("lock event stream did not stop after cancellation")
+	}
+
+	if err := manager.Unlock("local", sessionHash[:], key); err != nil {
+		t.Fatal(err)
+	}
+	_ = <-events
+	loginRequest := httptest.NewRequest(http.MethodPost, "/api/auth/login", strings.NewReader(`{"password":"a sufficiently long password","rememberDevice":false}`))
+	addAuthRequestContext(loginRequest, cookie, csrf)
+	loginResponse := httptest.NewRecorder()
+	handler.ServeHTTP(loginResponse, loginRequest)
+	if loginResponse.Code != http.StatusOK {
+		t.Fatalf("session renewal failed: %d %s", loginResponse.Code, loginResponse.Body.String())
+	}
+	if event := <-events; !event.Locked || event.Reason != encryption.LockReasonSession {
+		t.Fatalf("session renewal lock event = %#v", event)
+	}
+	newCookie, newCSRF := authRequestContextFromResponse(t, loginResponse)
+	if newCookie == nil || newCookie.Value == cookie.Value {
+		t.Fatal("successful login did not rotate the authenticated session")
+	}
+	newSessionHash := sha256.Sum256([]byte(newCookie.Value))
+	if manager.IsUnlocked("local", sessionHash[:]) || manager.IsUnlocked("local", newSessionHash[:]) {
+		t.Fatal("session renewal carried an encryption grant into the new session")
+	}
+	newStreamContext, stopNewStream := context.WithCancel(t.Context())
+	newStreamRequest := httptest.NewRequest(http.MethodGet, "/api/encryption/lock-events?vaultId=local", nil).WithContext(newStreamContext)
+	newStreamRequest.AddCookie(newCookie)
+	newStreamWriter := newSynchronizedEventWriter()
+	newStreamDone := make(chan struct{})
+	go func() {
+		handler.ServeHTTP(newStreamWriter, newStreamRequest)
+		close(newStreamDone)
+	}()
+	defer func() {
+		stopNewStream()
+		select {
+		case <-newStreamDone:
+		case <-time.After(time.Second):
+			t.Error("new lock event stream did not stop after cancellation")
+		}
+	}()
+	waitForStreamContent(t, newStreamWriter, `"locked":true`)
+	if err := manager.Unlock("local", newSessionHash[:], key); err != nil {
+		t.Fatal(err)
+	}
+	waitForStreamContent(t, newStreamWriter, `"locked":false`)
+	logoutRequest := httptest.NewRequest(http.MethodPost, "/api/auth/logout", nil)
+	addAuthRequestContext(logoutRequest, newCookie, newCSRF)
+	logoutResponse := httptest.NewRecorder()
+	handler.ServeHTTP(logoutResponse, logoutRequest)
+	if logoutResponse.Code != http.StatusOK {
+		t.Fatalf("logout failed: %d %s", logoutResponse.Code, logoutResponse.Body.String())
+	}
+	if manager.IsUnlocked("local", newSessionHash[:]) {
+		t.Fatal("logout endpoint retained an encryption grant")
+	}
+	if event := <-events; !event.Locked || event.Reason != encryption.LockReasonLogout {
+		t.Fatalf("logout lock event = %#v", event)
+	}
+	waitForStreamContent(t, newStreamWriter, `"reason":"logout"`)
+	select {
+	case <-newStreamDone:
+	case <-time.After(time.Second):
+		t.Fatal("logout did not close the lock event stream")
 	}
 }
 
@@ -483,6 +651,79 @@ func addAuthRequestContext(request *http.Request, cookie *http.Cookie, token str
 		request.AddCookie(cookie)
 	}
 	request.Header.Set("X-CSRF-Token", token)
+}
+
+type synchronizedEventWriter struct {
+	mu      sync.Mutex
+	header  http.Header
+	status  int
+	body    bytes.Buffer
+	changed chan struct{}
+}
+
+func newSynchronizedEventWriter() *synchronizedEventWriter {
+	return &synchronizedEventWriter{header: make(http.Header), changed: make(chan struct{}, 1)}
+}
+
+func (w *synchronizedEventWriter) Header() http.Header { return w.header }
+
+func (w *synchronizedEventWriter) WriteHeader(status int) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.status == 0 {
+		w.status = status
+	}
+	w.signal()
+}
+
+func (w *synchronizedEventWriter) Write(data []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.status == 0 {
+		w.status = http.StatusOK
+	}
+	count, err := w.body.Write(data)
+	w.signal()
+	return count, err
+}
+
+func (w *synchronizedEventWriter) Flush() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.status == 0 {
+		w.status = http.StatusOK
+	}
+	w.signal()
+}
+
+func (w *synchronizedEventWriter) signal() {
+	select {
+	case w.changed <- struct{}{}:
+	default:
+	}
+}
+
+func (w *synchronizedEventWriter) snapshot() (string, int) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.body.String(), w.status
+}
+
+func waitForStreamContent(t *testing.T, writer *synchronizedEventWriter, content string) {
+	t.Helper()
+	timer := time.NewTimer(time.Second)
+	defer timer.Stop()
+	for {
+		body, _ := writer.snapshot()
+		if strings.Contains(body, content) {
+			return
+		}
+		select {
+		case <-writer.changed:
+		case <-timer.C:
+			t.Fatalf("lock event stream did not contain %q; body=%s", content, body)
+		}
+	}
 }
 
 func TestExplicitDisabledModeDoesNotEnterSetupGate(t *testing.T) {
@@ -1328,6 +1569,9 @@ func TestEveryApplicationAPIRouteDeniesUnauthenticatedAccess(t *testing.T) {
 		path   string
 	}{
 		{http.MethodPost, "/api/auth/logout"},
+		{http.MethodPost, "/api/encryption/lock"},
+		{http.MethodPost, "/api/encryption/activity?vaultId=local"},
+		{http.MethodGet, "/api/encryption/lock-events?vaultId=local"},
 		{http.MethodDelete, "/api/auth/session"},
 		{http.MethodDelete, "/api/auth/sessions"},
 		{http.MethodGet, "/api/auth/sessions"},

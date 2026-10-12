@@ -22,10 +22,13 @@ history. For behavior and deployment, see [README](../README.md).
   from M31P03 and the authenticated, durable catalog from M31P04. Catalogs
   authenticate vault/object identities, logical and physical paths,
   ciphertext-only digests, explicit protection state, and recursive folder
-  rules. The store keeps catalogs in server application metadata outside the
-  vault and rejects missing, corrupt, or unauthenticated state. Neither the
-  primitives nor catalog are wired into vault operations; encryption stays
-  inactive until the M31 release gate passes.
+  rules. M31P05 adds a volatile per-vault key manager with per-session grants,
+  a 15-minute idle lock, and generation-checked response leases. The store
+  keeps catalogs in server application metadata outside the vault and rejects
+  missing, corrupt, or unauthenticated state. The key manager's lock, activity,
+  and lock-event routes do not unlock vaults or serve protected content. Key
+  envelopes, catalog, and key manager are not wired into vault operations;
+  encryption stays inactive until the M31 release gate passes.
 - Multiple named vaults on one server are registered in application metadata.
   The registry stores IDs, display names, and filesystem paths. It is not a
   copy of note or asset content.
