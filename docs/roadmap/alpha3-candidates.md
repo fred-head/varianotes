@@ -245,8 +245,8 @@ Completion criteria:
 
 ## Milestone 31 - Selective encryption for notes and folders
 
-M31 remains in Alpha 3. This checklist is the implementation plan. **P01–P02
-are complete; P03–P18 remain open.** M31 is not complete until P01–P18 are
+M31 remains in Alpha 3. This checklist is the implementation plan. **P01–P04
+are complete; P05–P18 remain open.** M31 is not complete until P01–P18 are
 complete and the independent security review in P17 has passed. Encryption
 activation must stay disabled in the UI, API, and any operator command until
 the P18 release gate passes.
@@ -345,7 +345,7 @@ requires its listed tests; P17 adds end-to-end and adversarial coverage.
   reads, writes, APIs, or operator commands; the M31 activation gate remains
   closed.
 
-- [ ] **P04 — Authenticated catalog and durable rules**
+- [x] **P04 — Authenticated catalog and durable rules**
   *(dependencies: P01, P03; size: M)*
   **Goal/scope:** versioned catalog of vault/object IDs, logical/physical paths,
   ciphertext digests, explicit note protection, and recursive folder rules;
@@ -353,7 +353,14 @@ requires its listed tests; P17 adds end-to-end and adversarial coverage.
   **Acceptance/tests:** empty protected folders retain rules after restart;
   tampered, swapped, missing, or unsupported entries fail closed; `.age`
   collisions are detected; no note text, preview, or plaintext fingerprint is
-  stored in the catalog.
+  stored in the catalog. Implemented in `internal/encryption` with a
+  versioned HMAC-authenticated catalog, random vault/object IDs, ciphertext-only
+  SHA-256 digests, recursive rules, strict metadata/path validation, and an
+  atomic owner-only catalog store in server application metadata. Catalog
+  loading requires the expected vault ID and fails closed for missing,
+  unsupported, corrupt, or unauthenticated state. These catalog primitives
+  remain disconnected from vault operations until later M31 steps and the P18
+  activation gate.
 
 - [ ] **P05 — In-memory key manager and server lock state**
   *(dependencies: P03, P04; size: M)*

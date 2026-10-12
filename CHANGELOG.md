@@ -8,6 +8,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- Added versioned, authenticated encryption catalogs with durable recursive
+  folder rules, object-bound ciphertext digests, and fail-closed metadata
+  loading. Encryption remains inactive pending the M31 release gate.
 - Added filesystem vault creation, adoption of existing folders, and bounded
   ZIP export of ordinary vault files.
 - Added explicit stale-save review that preserves the browser draft and current
