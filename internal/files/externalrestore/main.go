@@ -134,13 +134,29 @@ func run() error {
 
 func readJSON[T any](filename string, limit int64) (T, error) {
 	var value T
-	info, err := os.Lstat(filename)
+	root, err := os.OpenRoot(filepath.Dir(filename))
+	if err != nil {
+		return value, errors.New("metadata directory is unavailable")
+	}
+	defer root.Close()
+	name := filepath.Base(filename)
+	info, err := root.Lstat(name)
 	if err != nil || !info.Mode().IsRegular() || info.Size() <= 0 || info.Size() > limit {
 		return value, errors.New("metadata file is missing, unsafe, or too large")
 	}
-	data, err := os.ReadFile(filename)
+	file, err := root.Open(name)
 	if err != nil {
-		return value, err
+		return value, errors.New("metadata file could not be opened")
+	}
+	openedInfo, statErr := file.Stat()
+	if statErr != nil || !openedInfo.Mode().IsRegular() || !os.SameFile(info, openedInfo) {
+		_ = file.Close()
+		return value, errors.New("metadata file changed while opening")
+	}
+	data, readErr := io.ReadAll(io.LimitReader(file, limit+1))
+	closeErr := file.Close()
+	if err := errors.Join(readErr, closeErr); err != nil || int64(len(data)) > limit {
+		return value, errors.New("metadata file could not be read safely")
 	}
 	decoder := json.NewDecoder(bytes.NewReader(data))
 	decoder.DisallowUnknownFields()
@@ -194,10 +210,10 @@ func validateCatalogPaths(cat catalog) error {
 			return errors.New("catalog contains duplicate or empty object identities")
 		}
 		ids[object.ObjectID], logical[object.LogicalPath], physical[object.PhysicalPath] = true, true, true
-		if _, err := safePath(".", object.LogicalPath); err != nil {
+		if _, err := safeRelative(object.LogicalPath); err != nil {
 			return errors.New("catalog contains an unsafe logical path")
 		}
-		if _, err := safePath(".", object.PhysicalPath); err != nil {
+		if _, err := safeRelative(object.PhysicalPath); err != nil {
 			return errors.New("catalog contains an unsafe physical path")
 		}
 		if object.Protected {
@@ -212,7 +228,7 @@ func validateCatalogPaths(cat catalog) error {
 		}
 	}
 	for _, rule := range cat.FolderRules {
-		if _, err := safePath(".", rule.Path); err != nil {
+		if _, err := safeRelative(rule.Path); err != nil {
 			return errors.New("catalog contains an unsafe folder rule")
 		}
 	}
@@ -220,45 +236,71 @@ func validateCatalogPaths(cat catalog) error {
 }
 
 func restoreTree(vaultRoot, outputRoot string, cat catalog, vaultKey []byte) error {
+	vaultPath, err := filepath.Abs(vaultRoot)
+	if err != nil {
+		return errors.New("backup vault path is invalid")
+	}
+	outputPath, err := filepath.Abs(outputRoot)
+	if err != nil {
+		return errors.New("recovery destination is invalid")
+	}
+	vaultFS, err := os.OpenRoot(vaultPath)
+	if err != nil {
+		return errors.New("backup vault is unavailable")
+	}
+	defer vaultFS.Close()
+	outputFS, err := os.OpenRoot(outputPath)
+	if err != nil {
+		return errors.New("recovery destination is unavailable")
+	}
+	defer outputFS.Close()
 	knownCiphertext := make(map[string]catalogObject)
 	protectedLogical := make(map[string]bool)
 	for _, object := range cat.Objects {
 		if object.Protected {
-			knownCiphertext[filepath.FromSlash(object.PhysicalPath)] = object
-			protectedLogical[filepath.FromSlash(object.LogicalPath)] = true
+			knownCiphertext[object.PhysicalPath] = object
+			protectedLogical[object.LogicalPath] = true
 		}
 	}
 	for _, rule := range cat.FolderRules {
-		directory, err := safePath(outputRoot, rule.Path)
+		directory, err := safeRelative(rule.Path)
 		if err != nil {
 			return err
 		}
-		if err := os.MkdirAll(directory, 0o700); err != nil {
+		if err := outputFS.MkdirAll(directory, 0o700); err != nil {
 			return fmt.Errorf("create protected folder: %w", err)
 		}
 	}
-	err := filepath.WalkDir(vaultRoot, func(filename string, entry os.DirEntry, walkErr error) error {
+	err = filepath.WalkDir(vaultPath, func(filename string, entry os.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return walkErr
 		}
-		if filename == vaultRoot {
+		if filename == vaultPath {
 			return nil
 		}
-		relative, err := filepath.Rel(vaultRoot, filename)
+		relative, err := filepath.Rel(vaultPath, filename)
 		if err != nil {
 			return err
 		}
-		if entry.Type()&os.ModeSymlink != 0 {
+		relative = filepath.ToSlash(relative)
+		relativePath, err := safeRelative(relative)
+		if err != nil {
+			return err
+		}
+		info, err := vaultFS.Lstat(relativePath)
+		if err != nil {
+			return err
+		}
+		if entry.Type()&os.ModeSymlink != 0 || info.Mode()&os.ModeSymlink != 0 {
 			return errors.New("backup vault contains a symbolic link")
 		}
 		if entry.IsDir() {
-			out, err := safePath(outputRoot, filepath.ToSlash(relative))
-			if err != nil {
-				return err
+			if !info.IsDir() {
+				return errors.New("backup directory changed while walking")
 			}
-			return os.MkdirAll(out, 0o700)
+			return outputFS.MkdirAll(relativePath, 0o700)
 		}
-		if !entry.Type().IsRegular() {
+		if !info.Mode().IsRegular() {
 			return errors.New("backup vault contains a non-regular file")
 		}
 		if strings.HasPrefix(entry.Name(), ".vnotes-txn-") || strings.HasSuffix(entry.Name(), ".transaction.json") {
@@ -274,20 +316,20 @@ func restoreTree(vaultRoot, outputRoot string, cat catalog, vaultKey []byte) err
 		if protectedLogical[relative] {
 			return errors.New("backup contains plaintext beside its protected ciphertext")
 		}
-		source, err := os.Open(filename)
+		source, err := vaultFS.Open(relativePath)
 		if err != nil {
 			return err
 		}
-		out, err := safePath(outputRoot, filepath.ToSlash(relative))
-		if err != nil {
+		openedInfo, statErr := source.Stat()
+		if statErr != nil || !openedInfo.Mode().IsRegular() || !os.SameFile(info, openedInfo) {
+			_ = source.Close()
+			return errors.New("backup file changed while opening")
+		}
+		if err := outputFS.MkdirAll(filepath.Dir(relativePath), 0o700); err != nil {
 			_ = source.Close()
 			return err
 		}
-		if err := os.MkdirAll(filepath.Dir(out), 0o700); err != nil {
-			_ = source.Close()
-			return err
-		}
-		destination, err := os.OpenFile(out, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+		destination, err := outputFS.OpenFile(relativePath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
 		if err != nil {
 			_ = source.Close()
 			return err
@@ -304,58 +346,97 @@ func restoreTree(vaultRoot, outputRoot string, cat catalog, vaultKey []byte) err
 		return fmt.Errorf("create temporary identity directory: %w", err)
 	}
 	defer os.RemoveAll(temporary)
+	identityFS, err := os.OpenRoot(temporary)
+	if err != nil {
+		return errors.New("temporary identity directory is unavailable")
+	}
+	defer identityFS.Close()
 	for index, object := range cat.Objects {
 		if !object.Protected {
 			continue
 		}
-		ciphertextPath, err := safePath(vaultRoot, object.PhysicalPath)
+		ciphertextRelative, err := safeRelative(object.PhysicalPath)
 		if err != nil {
 			return err
 		}
-		ciphertext, err := os.ReadFile(ciphertextPath)
+		ciphertextFile, err := vaultFS.Open(ciphertextRelative)
 		if err != nil {
-			return fmt.Errorf("read protected object %q: %w", object.LogicalPath, err)
+			return fmt.Errorf("open protected object %q: %w", object.LogicalPath, err)
 		}
-		digest := sha256.Sum256(ciphertext)
-		if hex.EncodeToString(digest[:]) != object.CiphertextHash {
+		ciphertextInfo, err := ciphertextFile.Stat()
+		if err != nil || !ciphertextInfo.Mode().IsRegular() {
+			_ = ciphertextFile.Close()
+			return fmt.Errorf("protected object %q is not a regular file", object.LogicalPath)
+		}
+		hasher := sha256.New()
+		if _, err := io.Copy(hasher, ciphertextFile); err != nil {
+			_ = ciphertextFile.Close()
+			return fmt.Errorf("hash protected object %q: %w", object.LogicalPath, err)
+		}
+		if hex.EncodeToString(hasher.Sum(nil)) != object.CiphertextHash {
+			_ = ciphertextFile.Close()
 			return fmt.Errorf("ciphertext digest mismatch for %q", object.LogicalPath)
+		}
+		if _, err := ciphertextFile.Seek(0, io.SeekStart); err != nil {
+			_ = ciphertextFile.Close()
+			return fmt.Errorf("rewind protected object %q: %w", object.LogicalPath, err)
 		}
 		envelope := object.ContentKeyEnvelope
 		if len(envelope.Nonce) != chacha20poly1305.NonceSizeX || len(envelope.WrappedKey) == 0 || len(envelope.WrappedKey) > 256 {
+			_ = ciphertextFile.Close()
 			return fmt.Errorf("content key envelope for %q is invalid", object.LogicalPath)
 		}
 		aead, err := chacha20poly1305.NewX(vaultKey)
 		if err != nil {
+			_ = ciphertextFile.Close()
 			return errors.New("create content-key authenticator")
 		}
 		privateIdentity, err := aead.Open(nil, envelope.Nonce, envelope.WrappedKey, []byte(contentKeyAAD+object.ObjectID))
 		if err != nil {
+			_ = ciphertextFile.Close()
 			return fmt.Errorf("authenticate content key for %q", object.LogicalPath)
 		}
 		if _, err := age.ParseX25519Identity(string(privateIdentity)); err != nil {
 			clear(privateIdentity)
+			_ = ciphertextFile.Close()
 			return fmt.Errorf("parse content identity for %q", object.LogicalPath)
 		}
-		identityPath := filepath.Join(temporary, fmt.Sprintf("identity-%d.txt", index))
-		if err := os.WriteFile(identityPath, append(privateIdentity, '\n'), 0o600); err != nil {
+		identityName := fmt.Sprintf("identity-%d.txt", index)
+		identityPath := filepath.Join(temporary, identityName)
+		if err := identityFS.WriteFile(identityName, append(privateIdentity, '\n'), 0o600); err != nil {
 			clear(privateIdentity)
+			_ = ciphertextFile.Close()
 			return fmt.Errorf("write temporary content identity: %w", err)
 		}
 		clear(privateIdentity)
-		output, err := safePath(outputRoot, object.LogicalPath)
+		outputRelative, err := safeRelative(object.LogicalPath)
 		if err != nil {
+			_ = ciphertextFile.Close()
 			return err
 		}
-		if err := os.MkdirAll(filepath.Dir(output), 0o700); err != nil {
+		if err := outputFS.MkdirAll(filepath.Dir(outputRelative), 0o700); err != nil {
+			_ = ciphertextFile.Close()
 			return err
 		}
-		if _, err := os.Lstat(output); err == nil || !errors.Is(err, os.ErrNotExist) {
+		if _, err := outputFS.Lstat(outputRelative); err == nil || !errors.Is(err, os.ErrNotExist) {
+			_ = ciphertextFile.Close()
 			return fmt.Errorf("recovered path %q already exists", object.LogicalPath)
 		}
-		command := exec.Command("age", "--decrypt", "--identity", identityPath, "--output", output, ciphertextPath)
-		outputBytes, err := command.CombinedOutput()
+		outputFile, err := outputFS.OpenFile(outputRelative, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
 		if err != nil {
-			message := strings.TrimSpace(string(outputBytes))
+			_ = ciphertextFile.Close()
+			return fmt.Errorf("create recovered file %q: %w", object.LogicalPath, err)
+		}
+		command := exec.Command("age", "--decrypt", "--identity", identityPath) // #nosec G204 -- fixed age executable; generated identity is in a private temporary directory and file data uses stdin/stdout
+		command.Stdin = ciphertextFile
+		command.Stdout = outputFile
+		var stderr bytes.Buffer
+		command.Stderr = &stderr
+		runErr := command.Run()
+		closeErr := errors.Join(ciphertextFile.Close(), outputFile.Close())
+		if err := errors.Join(runErr, closeErr); err != nil {
+			_ = outputFS.Remove(outputRelative)
+			message := strings.TrimSpace(stderr.String())
 			if message == "" {
 				return fmt.Errorf("official age CLI could not decrypt %q: %w", object.LogicalPath, err)
 			}
@@ -365,7 +446,7 @@ func restoreTree(vaultRoot, outputRoot string, cat catalog, vaultKey []byte) err
 	return nil
 }
 
-func safePath(root, relative string) (string, error) {
+func safeRelative(relative string) (string, error) {
 	if relative == "" || strings.Contains(relative, "\\") || strings.HasPrefix(relative, "/") || path.Clean(relative) != relative {
 		return "", errors.New("unsafe backup path")
 	}
@@ -374,5 +455,5 @@ func safePath(root, relative string) (string, error) {
 			return "", errors.New("unsafe backup path")
 		}
 	}
-	return filepath.Join(root, filepath.FromSlash(relative)), nil
+	return filepath.FromSlash(relative), nil
 }

@@ -619,16 +619,20 @@ requires its listed tests; P17 adds end-to-end and adversarial coverage.
   byte-for-byte. This validates the format and complete backup contents; P18's
   operator instructions remain out of scope.
 
+  The first PR CI pass flagged path-based file access and the age subprocess in
+  the test helper. The helper now uses root-scoped file operations and streams
+  ciphertext/plaintext through opened file handles; the same gosec version
+  passes on that package locally. Full PR CI is being rerun after the fix.
   Local validation passed with serial Go package execution and a 1.5-GiB Go
   memory limit: `go test -p 1 -count=1 ./internal/encryption ./internal/files
   ./internal/app`, `go test -p 1 -count=1 ./internal/auth ./cmd/varianotes`,
   the focused lock-race test under `-race`, `go vet -p 1` for the affected Go
-  packages, and `git diff --check`. The independent reviewer sign-off and
-  required PR CI are still pending. No blocking issue was found in this local
-  test/review pass; it is not an independent security approval. P17 remains
-  open until the independent review passes. Swap use remained at its 3.4-GiB
-  baseline throughout these checks. Encryption activation stays gated; P18 is
-  unchanged.
+  packages, targeted `gosec -quiet ./internal/files/externalrestore`, and
+  `git diff --check`. The independent reviewer sign-off and full required PR CI
+  are still pending. The current local test/review pass has no unresolved
+  finding; it is not an independent security approval. P17 remains open until
+  the independent review passes. Swap use remained at its 3.4-GiB baseline
+  throughout these checks. Encryption activation stays gated; P18 is unchanged.
 
 - [ ] **P18 — Operations documentation and release gate**
   *(dependencies: P01–P17; size: S)*
