@@ -8,6 +8,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- Added M31P12 policy-aware note and folder moves with protected link previews,
+  automatic encryption when moving into a protected folder, and explicit
+  keep-protected or decrypt choices when moving out. Catalog paths and
+  encrypted backlink updates commit through the M31 journal; stale previews
+  leave the source untouched. M31 activation stays gated.
 - Added M31P11 preflight and journaled conversion of existing notes, folders,
   shared attachments, and associated Trash. Unsafe entries, hardlinks, and
   `.age` collisions fail before staging; plaintext originals remain until the

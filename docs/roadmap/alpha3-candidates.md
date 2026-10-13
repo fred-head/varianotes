@@ -489,14 +489,18 @@ requires its listed tests; P17 adds end-to-end and adversarial coverage.
   remains behind the M31 activation gate; protected Trash operations remain
   unavailable until P13.
 
-- [ ] **P12 — Rename, move, and link updates**
+- [x] **P12 — Rename, move, and link updates**
   *(dependencies: P06, P09–P11; size: L)*
   **Goal/scope:** enforce keep-protected/decrypt choices on moves; preserve
   recursive folder policy and update links through encrypted writes.
   **Acceptance/tests:** unprotected-to-protected converts automatically;
   protected-to-unprotected requires a choice; protection survives “keep”;
   decrypting under a protected parent is rejected; stale previews and interrupted
-  multi-note link updates do not corrupt files.
+  multi-note link updates do not corrupt files. Implemented catalog-aware link
+  inventories and previews, journaled encrypted backlink updates, recursive
+  folder-rule remapping, automatic conversion before entering protected
+  destinations, and explicit keep/decrypt behavior when leaving protection.
+  The API remains behind the M31 activation gate.
 
 - [ ] **P13 — Trash and restore**
   *(dependencies: P06, P10–P12; size: M)*
