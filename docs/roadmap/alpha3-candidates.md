@@ -584,10 +584,10 @@ requires its listed tests; P17 adds end-to-end and adversarial coverage.
   earlier-copy, and operator-owned backup warnings are surfaced in the UI.
   Activation remains disabled in the UI and API; no activation action is exposed.
   Focused Go tests for `internal/app`, `internal/files`, and `internal/encryption`
-  passed. The App, AuthGate, and API frontend tests passed (40/40) with a single
-  worker and 2-GB Node heap limit; changed-file ESLint, `go vet -p 1` for the
+  passed. The full frontend suite passed (109/109) with one worker at a time
+  and a 2-GB Node heap limit; changed-file ESLint, `go vet -p 1` for the
   affected Go packages, production build, and `git diff --check` passed. Swap
-  use stayed at 3.4 GiB during the focused tests. Drafts are intentionally not
+  use stayed at 3.4 GiB during validation. Drafts are intentionally not
   recoverable after closing or reloading the browser tab, and physical memory
   erasure is not claimed. P17's integration fault matrix and independent
   security review remain required.

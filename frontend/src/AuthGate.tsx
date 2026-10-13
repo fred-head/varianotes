@@ -22,6 +22,11 @@ export function AuthGate() {
   const [recoveryNewPassword, setRecoveryNewPassword] = useState('')
   const pendingLoginPassword = useRef('')
   const checking = useRef(false)
+  const stateRef = useRef(state)
+
+  useEffect(() => {
+    stateRef.current = state
+  }, [state])
 
   const endBrowserSession = useCallback(() => {
     setCSRFToken()
@@ -36,8 +41,8 @@ export function AuthGate() {
     try {
       const next = await authStatus()
       setStatus(next)
-      if (state !== 'recover' && state !== 'recover-confirm') setState(next.mode === 'disabled' || next.authenticated ? 'ready' : next.setupRequired ? 'setup' : next.mfaRequired ? 'mfa' : 'login')
-      if (!next.authenticated && !next.mfaRequired && state !== 'recover' && state !== 'recover-confirm') {
+      if (stateRef.current !== 'recover' && stateRef.current !== 'recover-confirm') setState(next.mode === 'disabled' || next.authenticated ? 'ready' : next.setupRequired ? 'setup' : next.mfaRequired ? 'mfa' : 'login')
+      if (!next.authenticated && !next.mfaRequired && stateRef.current !== 'recover' && stateRef.current !== 'recover-confirm') {
         pendingLoginPassword.current = ''
         setInitialVaultPassword(undefined)
       }
@@ -50,7 +55,7 @@ export function AuthGate() {
       setState(caught instanceof AuthStatusError && caught.kind==='update' ? 'update' : navigator.onLine ? 'backend' : 'offline')
       setError(caught instanceof Error ? caught.message : 'Authentication status is unavailable.')
     } finally { checking.current = false }
-  }, [state])
+  }, [])
 
   useEffect(() => {
     queueMicrotask(() => void check())
