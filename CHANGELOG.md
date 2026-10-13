@@ -8,6 +8,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- Added M31P16 protection status, per-session unlock and manual lock, recovery
+  code setup and replacement, and password recovery that preserves encrypted
+  content. Locked views hide protected notes while unsaved drafts stay only in
+  tab memory. Moves and Trash restores require an explicit keep-protected or
+  decrypt choice; attachment placeholders and plaintext export/backup warnings
+  remain visible. Encryption activation stays gated.
 - Added M31P15 reauthenticated plaintext ZIP export for protected vaults.
   Exports use logical paths, validate the full archive before streaming, bind
   a one-use grant to the session and lock generation, and reject changed

@@ -1963,6 +1963,8 @@ func TestEveryApplicationAPIRouteDeniesUnauthenticatedAccess(t *testing.T) {
 		path   string
 	}{
 		{http.MethodPost, "/api/auth/logout"},
+		{http.MethodGet, "/api/encryption/status"},
+		{http.MethodPost, "/api/encryption/unlock"},
 		{http.MethodPost, "/api/encryption/lock"},
 		{http.MethodPost, "/api/encryption/recovery-code"},
 		{http.MethodPost, "/api/encryption/recovery-code/confirm"},

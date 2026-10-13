@@ -27,6 +27,14 @@ describe('authenticated API client',()=>{
     window.removeEventListener('varianotes:auth-required',listener)
   })
 
+  it('does not expire the browser session for rejected vault credentials',async()=>{
+    vi.spyOn(globalThis,'fetch').mockResolvedValue(Response.json({code:'invalid_credentials',error:'vault password is incorrect'},{status:401}))
+    const listener=vi.fn();window.addEventListener('varianotes:auth-required',listener)
+    await apiFetch('/api/encryption/unlock',{method:'POST'})
+    expect(listener).not.toHaveBeenCalled()
+    window.removeEventListener('varianotes:auth-required',listener)
+  })
+
   it('broadcasts authentication changes to other tabs and PWA windows',()=>{
     const channels: MockBroadcastChannel[]=[]
     class MockBroadcastChannel {

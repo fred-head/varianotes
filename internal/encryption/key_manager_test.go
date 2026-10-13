@@ -33,6 +33,10 @@ func TestKeyManagerStartsLockedAndRequiresPerSessionUnlock(t *testing.T) {
 	if err := manager.Unlock("vault-a", firstSession, vaultKey); err != nil {
 		t.Fatal(err)
 	}
+	unlocked, generation, err := manager.SessionStatus("vault-a", firstSession)
+	if err != nil || !unlocked || generation == 0 {
+		t.Fatalf("session status after unlock = (%v, %d, %v)", unlocked, generation, err)
+	}
 	assertLockEvent(t, firstEvents, false, LockReasonUnlocked)
 	if manager.IsUnlocked("vault-a", secondSession) {
 		t.Fatal("unlocking one session granted another session access")
@@ -111,6 +115,11 @@ func TestKeyManagerIdleTimerLocksWithoutBackgroundRequestsExtendingIt(t *testing
 	manager.mu.Lock()
 	initialActivity := manager.vaults["vault-b"].lastActivity
 	manager.mu.Unlock()
+	for range 3 {
+		if _, _, err := manager.SessionStatus("vault-b", session); err != nil {
+			t.Fatalf("status poll failed: %v", err)
+		}
+	}
 	lease, err := manager.BeginUse("vault-b", session)
 	if err != nil {
 		t.Fatal(err)
@@ -123,7 +132,7 @@ func TestKeyManagerIdleTimerLocksWithoutBackgroundRequestsExtendingIt(t *testing
 	activityAfterReads := manager.vaults["vault-b"].lastActivity
 	manager.mu.Unlock()
 	if !activityAfterReads.Equal(initialActivity) {
-		t.Fatal("background reads extended the inactivity deadline")
+		t.Fatal("status polling or background reads extended the inactivity deadline")
 	}
 
 	select {

@@ -223,7 +223,7 @@ func handleNotebookExportReauthentication(w http.ResponseWriter, r *http.Request
 	})
 	input.Password = ""
 	if invalidPassword {
-		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "vault password is incorrect"})
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "vault password is incorrect", "code": "invalid_credentials"})
 		return
 	}
 	if err != nil {

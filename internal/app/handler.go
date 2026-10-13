@@ -2,6 +2,7 @@ package app
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/base64"
 	"encoding/json"
@@ -121,6 +122,14 @@ func newHandlerWithKeyManager(logger *slog.Logger, repositoryRoot string, authSe
 			return activeRecord.ID
 		}
 		return "local"
+	}
+	currentNotebookContext := func() (*files.Repository, *protectedNoteAccess, notebookRecord) {
+		activeMu.RLock()
+		defer activeMu.RUnlock()
+		if activeRecord.ID != "" {
+			return repository, activeNoteAccess, activeRecord
+		}
+		return repository, activeNoteAccess, notebookRecord{ID: "local", Name: activeNotebookName, LocalPath: repositoryRoot}
 	}
 	presentationStore := newImagePresentationStore(metadataPath)
 
@@ -754,12 +763,151 @@ func newHandlerWithKeyManager(logger *slog.Logger, repositoryRoot string, authSe
 				writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "owner setup could not be completed"})
 			}
 		})
-		mux.HandleFunc("POST /api/encryption/lock", func(w http.ResponseWriter, _ *http.Request) {
-			if err := keyManager.LockVault(currentNotebookID(), encryption.LockReasonManual); err != nil {
+		mux.HandleFunc("GET /api/encryption/status", func(w http.ResponseWriter, r *http.Request) {
+			setExportNoStore(w)
+			repository, noteAccess, record := currentNotebookContext()
+			protected := noteAccess != nil && noteAccess.enabled
+			if noteAccess != nil && noteAccess.err != nil {
+				writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "vault protection status is unavailable"})
+				return
+			}
+			protection := vaultProtectionState{}
+			if metadataPath != "" && record.ID != "" && repository.Configured() {
+				var err error
+				protection, err = inspectVaultProtection(record, metadataPath)
+				if err != nil || protection.protected != protected {
+					writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "vault protection status is unavailable"})
+					return
+				}
+			}
+			unlocked := false
+			generation := uint64(0)
+			if sessions != nil && sessions.Authenticated(r.Context()) {
+				var err error
+				unlocked, generation, err = keyManager.SessionStatus(record.ID, sessions.CurrentHash(r.Context()))
+				if err != nil && !errors.Is(err, encryption.ErrSessionRequired) {
+					writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "vault lock status is unavailable"})
+					return
+				}
+			}
+			passwordMode := "login"
+			authState, err := authService.State(r.Context())
+			if err != nil {
+				writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "vault password mode is unavailable"})
+				return
+			}
+			mfaEnabled, err := authService.MFAEnabled(r.Context())
+			if err != nil {
+				writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "vault security status is unavailable"})
+				return
+			}
+			if authState.EncryptionPasswordSeparate {
+				passwordMode = "separate"
+			}
+			w.Header().Set("Cache-Control", "no-store, private")
+			writeJSON(w, http.StatusOK, map[string]any{
+				"vaultId": record.ID, "protected": protected, "locked": !unlocked,
+				"generation": generation, "recoveryCodeConfigured": protection.hasRecoveryEnvelope,
+				"unlockPasswordMode": passwordMode, "activationEnabled": false,
+				"autoLockMinutes": int(encryption.DefaultIdleLockTimeout.Minutes()), "mfaEnabled": mfaEnabled,
+			})
+		})
+		mux.HandleFunc("POST /api/encryption/unlock", func(w http.ResponseWriter, r *http.Request) {
+			setExportNoStore(w)
+			if sessions == nil || !sessions.Authenticated(r.Context()) {
+				writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "authentication required"})
+				return
+			}
+			var input struct {
+				Password string `json:"password"`
+			}
+			if !decodeJSONWithLimit(w, r, &input, maxAuthRequestBodySize) {
+				return
+			}
+			if input.Password == "" || len(input.Password) > 1024 {
+				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "vault password is required"})
+				return
+			}
+			clientIP, release, allowed := beginCredentialAttempt(w, r, auth.ThrottleOperationSensitive)
+			if !allowed {
+				return
+			}
+			defer release()
+			_, noteAccess, record := currentNotebookContext()
+			if noteAccess == nil || !noteAccess.enabled {
+				writeJSON(w, http.StatusConflict, map[string]string{"error": "vault protection is not active", "code": "encryption_not_active"})
+				return
+			}
+			if noteAccess.err != nil {
+				writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "encrypted vault is unavailable"})
+				return
+			}
+			protection, err := inspectVaultProtection(record, metadataPath)
+			if err != nil || !protection.protected || !protection.hasEnvelope {
+				writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "vault password envelope is unavailable"})
+				return
+			}
+			envelopeStore, err := encryption.NewVaultKeyEnvelopeStore(protection.envelopePath)
+			if err != nil {
+				writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "vault password envelope is unavailable"})
+				return
+			}
+			envelope, err := envelopeStore.Load()
+			if err != nil {
+				writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "vault password envelope is unavailable"})
+				return
+			}
+			vaultKey, err := encryption.DecryptVaultKey(input.Password, envelope)
+			input.Password = ""
+			if err != nil {
+				if !recordCredentialFailure(w, r, auth.ThrottleOperationSensitive, clientIP) {
+					return
+				}
+				writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "vault password is incorrect", "code": "invalid_credentials"})
+				return
+			}
+			defer clear(vaultKey)
+			if _, err := noteAccess.catalogForKey(vaultKey); err != nil {
+				logger.Warn("vault unlock integrity check failed", "vault", record.ID)
+				writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "encrypted vault content is unavailable"})
+				return
+			}
+			sessionHash := sessions.CurrentHash(r.Context())
+			if !sessions.Authenticated(r.Context()) || len(sessionHash) != sha256.Size {
+				writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "authentication required"})
+				return
+			}
+			if err := keyManager.Unlock(record.ID, sessionHash, vaultKey); err != nil {
+				if errors.Is(err, encryption.ErrVaultKeyMismatch) {
+					writeJSON(w, http.StatusConflict, map[string]string{"error": "vault key state changed; retry unlock"})
+					return
+				}
+				writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "vault could not be unlocked"})
+				return
+			}
+			if err := loginThrottle.SuccessOperation(r.Context(), auth.ThrottleOperationSensitive, clientIP); err != nil {
+				logger.Warn("clear vault unlock throttle failed", "operation", auth.ThrottleOperationSensitive)
+			}
+			unlocked, generation, err := keyManager.SessionStatus(record.ID, sessionHash)
+			if err != nil || !unlocked {
+				writeJSON(w, http.StatusLocked, map[string]string{"error": "vault lock state changed; retry unlock"})
+				return
+			}
+			writeJSON(w, http.StatusOK, map[string]any{"vaultId": record.ID, "unlocked": true, "generation": generation})
+		})
+		mux.HandleFunc("POST /api/encryption/lock", func(w http.ResponseWriter, r *http.Request) {
+			setExportNoStore(w)
+			vaultID := currentNotebookID()
+			if err := keyManager.LockVault(vaultID, encryption.LockReasonManual); err != nil {
 				writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "encryption lock is unavailable"})
 				return
 			}
-			writeJSON(w, http.StatusOK, map[string]bool{"locked": true})
+			unlocked, generation, err := keyManager.SessionStatus(vaultID, sessions.CurrentHash(r.Context()))
+			if err != nil {
+				writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "encryption lock is unavailable"})
+				return
+			}
+			writeJSON(w, http.StatusOK, map[string]any{"vaultId": vaultID, "locked": !unlocked, "generation": generation})
 		})
 		mux.HandleFunc("POST /api/encryption/activity", func(w http.ResponseWriter, r *http.Request) {
 			err := keyManager.Touch(r.URL.Query().Get("vaultId"), sessions.CurrentHash(r.Context()))
@@ -2134,7 +2282,8 @@ func writeRepositoryError(w http.ResponseWriter, err error) {
 	case errors.Is(err, files.ErrLinkPreviewRequired):
 		status, message = http.StatusConflict, "Review the internal note-link updates before moving this item."
 	case errors.Is(err, files.ErrMoveProtectionChoiceRequired):
-		status, message = http.StatusConflict, err.Error()
+		writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error(), "code": "move_protection_choice_required"})
+		return
 	case errors.Is(err, files.ErrMoveDecryptIntoProtected), errors.Is(err, files.ErrInvalidMoveProtectionChoice):
 		status, message = http.StatusBadRequest, err.Error()
 	case errors.Is(err, files.ErrMoveRollbackFailed):

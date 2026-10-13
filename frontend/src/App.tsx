@@ -8,7 +8,7 @@ const MarkdownEditor = lazy(() => import('./components/editor/MarkdownEditor').t
 type Health = 'checking' | 'online' | 'offline'
 type SaveStatus = 'saved' | 'unsaved' | 'saving' | 'error' | 'conflict'
 type Theme = 'dark' | 'light'
-type TreeNode = { name: string; path: string; type: 'directory' | 'file'; children?: TreeNode[] }
+type TreeNode = { name: string; path: string; type: 'directory' | 'file'; protected?: boolean; protectionInherited?: boolean; children?: TreeNode[] }
 type FileResponse = { path: string; content: string; version: string }
 type Draft = FileResponse & { savedContent: string }
 type DocumentStatsSnapshot = { documentKey: string; stats: DocumentStats }
@@ -18,7 +18,9 @@ type CleanupFailure = { path: string; error: string }
 type TrashItem = { id:string; originalPath:string; type:'file'|'directory'; deletedAt:string; size:number; protected?:boolean; protectionChoiceRequired?:boolean }
 type LinkRewrite = { notePath:string; nextNotePath:string; line:number; before:string; after:string }
 type MoveLinkPreview = { source:string; target:string; token:string; rewrites:LinkRewrite[] }
+type PendingProtectionMove = { entry: TreeNode; target: string; rewriteToken?: string }
 type NotebookInfo = { id: string; name: string }
+type EncryptionStatus = { vaultId: string; protected: boolean; locked: boolean; generation: number; recoveryCodeConfigured: boolean; unlockPasswordMode: 'login' | 'separate'; activationEnabled: false; autoLockMinutes: number; mfaEnabled: boolean }
 type NotebookCheck = { state:string; message:string }
 type NotebookHealth = { localFiles:NotebookCheck; writeAccess:NotebookCheck }
 type SearchResult = { path: string; type: 'directory' | 'file' | 'content'; line?: number; excerpt?: string }
@@ -74,7 +76,7 @@ function markdownPaths(entries: TreeNode[]): string[] {
 }
 
 class APIError extends Error {
-  constructor(message: string, readonly status: number) {
+  constructor(message: string, readonly status: number, readonly code?: string) {
     super(message)
   }
 }
@@ -84,12 +86,12 @@ function messageFrom(error: unknown): string {
 }
 
 async function responseJSON<T>(response: Response): Promise<T> {
-  const body = (await response.json()) as T & { error?: string }
-  if (!response.ok) throw new APIError(body.error ?? `Request failed (${response.status})`, response.status)
+  const body = (await response.json()) as T & { error?: string; code?: string }
+  if (!response.ok) throw new APIError(body.error ?? `Request failed (${response.status})`, response.status, body.code)
   return body
 }
 
-export function App({ authMode = 'disabled', runningVersion = 'dev', onLoggedOut = () => undefined }: { authMode?: 'local'|'disabled'; runningVersion?:string; onLoggedOut?:()=>void } = {}) {
+export function App({ authMode = 'disabled', runningVersion = 'dev', onLoggedOut = () => undefined, initialVaultPassword, onInitialVaultPasswordConsumed }: { authMode?: 'local'|'disabled'; runningVersion?:string; onLoggedOut?:()=>void; initialVaultPassword?:string; onInitialVaultPasswordConsumed?:()=>void } = {}) {
   const [theme, setTheme] = useState<Theme>(loadTheme)
   const [autoLockMinutes, setAutoLockMinutes] = useState<AutoLockMinutes>(() => loadAutoLockPreference(localStorage))
   const [settingsOpen, setSettingsOpen] = useState(false)
@@ -135,6 +137,12 @@ export function App({ authMode = 'disabled', runningVersion = 'dev', onLoggedOut
   const [moveEntry, setMoveEntry] = useState<TreeNode>()
   const [moveDestination, setMoveDestination] = useState('')
   const [moveLinkPreview, setMoveLinkPreview] = useState<{ entry:TreeNode; preview:MoveLinkPreview }>()
+  const [moveProtectionChoice, setMoveProtectionChoice] = useState<PendingProtectionMove>()
+  const [encryptionStatus, setEncryptionStatus] = useState<EncryptionStatus>()
+  const [vaultLocked, setVaultLocked] = useState(true)
+  const [unlockDialogOpen, setUnlockDialogOpen] = useState(false)
+  const [unlockError, setUnlockError] = useState<string>()
+  const [unlockBusy, setUnlockBusy] = useState(false)
   const [expandedFolders, setExpandedFolders] = useState<Set<string>>(loadExpandedFolders)
   const [searchQuery, setSearchQuery] = useState('')
   const [searchResults, setSearchResults] = useState<SearchResult[]>([])
@@ -143,6 +151,11 @@ export function App({ authMode = 'disabled', runningVersion = 'dev', onLoggedOut
   const searchController = useRef<AbortController | null>(null)
   const searchRequestGeneration = useRef(0)
   const searchVaultUnlocked = useRef(false)
+  const encryptionStatusRef = useRef<EncryptionStatus | undefined>(undefined)
+  const loadTreeRef = useRef<() => Promise<void>>(async () => undefined)
+  const vaultGeneration = useRef(0)
+  const activeNotebookIDRef = useRef('')
+  const lastServerActivity = useRef(0)
   const activeDraft = useRef<Draft | undefined>(undefined)
   const saveTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined)
   const savePromise = useRef<Promise<FileResponse> | undefined>(undefined)
@@ -152,6 +165,7 @@ export function App({ authMode = 'disabled', runningVersion = 'dev', onLoggedOut
   const autoLockController = useRef<AutoLockController | null>(null)
   const noteHeaderStack = useRef<HTMLDivElement>(null)
   const [noteHeaderHeight, setNoteHeaderHeight] = useState(0)
+  const initialUnlockAttempted = useRef(false)
   const discardSearchState = useCallback(() => {
     searchRequestGeneration.current++
     searchController.current?.abort()
@@ -161,6 +175,8 @@ export function App({ authMode = 'disabled', runningVersion = 'dev', onLoggedOut
     setSearchLoading(false)
     setSearchError(undefined)
   }, [])
+  activeNotebookIDRef.current = activeNotebookID
+  const activeEncryptionStatus = encryptionStatus?.vaultId === activeNotebookID ? encryptionStatus : undefined
 
   useEffect(() => listenForAuthEvents(() => {
     setReadOnly(true)
@@ -226,17 +242,34 @@ export function App({ authMode = 'disabled', runningVersion = 'dev', onLoggedOut
   useEffect(() => {
     if (!activeNotebookID || typeof EventSource === 'undefined') return
     searchVaultUnlocked.current = false
+    vaultGeneration.current = 0
+    encryptionStatusRef.current = undefined
     const source = new EventSource(`/api/encryption/lock-events?vaultId=${encodeURIComponent(activeNotebookID)}`)
     const handleLockEvent = (event: Event) => {
       try {
-        const update = JSON.parse((event as MessageEvent<string>).data) as { vaultId?: string; locked?: boolean }
+        const update = JSON.parse((event as MessageEvent<string>).data) as { vaultId?: string; locked?: boolean; generation?: number }
         if (update.vaultId !== activeNotebookID) return
+        const generation = update.generation ?? 0
+        if (generation < vaultGeneration.current) return
+        vaultGeneration.current = generation
+        const current = encryptionStatusRef.current
+        if (current?.vaultId === activeNotebookID) {
+          const next = { ...current, locked: Boolean(update.locked), generation }
+          encryptionStatusRef.current = next
+          setEncryptionStatus(next)
+        }
+        setVaultLocked(Boolean(update.locked))
         if (!update.locked) {
           searchVaultUnlocked.current = true
+          if (encryptionStatusRef.current?.protected) void loadTreeRef.current()
           return
         }
-        if (!searchVaultUnlocked.current) return
         searchVaultUnlocked.current = false
+        lastServerActivity.current = 0
+        if (saveTimer.current) {
+          clearTimeout(saveTimer.current)
+          saveTimer.current = undefined
+        }
         discardSearchState()
       } catch {
         // Ignore malformed lock events; the protected API still fails closed.
@@ -266,11 +299,13 @@ export function App({ authMode = 'disabled', runningVersion = 'dev', onLoggedOut
       setHealth('online')
     } catch (error) {
       setTreeError(messageFrom(error))
+      if (error instanceof APIError && error.status === 423) setVaultLocked(true)
       if (messageFrom(error) === 'repository is not configured') setNotebookConfigured(false)
     } finally {
       setTreeLoading(false)
     }
   }, [])
+  loadTreeRef.current = loadTree
 
   const loadNotebookInfo = useCallback(async () => {
     try {
@@ -296,6 +331,86 @@ export function App({ authMode = 'disabled', runningVersion = 'dev', onLoggedOut
       // Directly configured notebooks remain usable without a registry.
     }
   }, [])
+
+  const loadEncryptionStatus = useCallback(async () => {
+    if (!activeNotebookID) return
+    try {
+      const response = await apiFetch('/api/encryption/status')
+      const status = await responseJSON<EncryptionStatus>(response)
+      if (status.vaultId !== activeNotebookIDRef.current || status.generation < vaultGeneration.current) return
+      vaultGeneration.current = status.generation
+      encryptionStatusRef.current = status
+      setEncryptionStatus(status)
+      setVaultLocked(status.locked)
+      if (status.protected && !status.locked) void loadTree()
+    } catch {
+      const current = encryptionStatusRef.current
+      if (current?.protected && current.vaultId === activeNotebookIDRef.current) {
+        const locked = { ...current, locked: true }
+        encryptionStatusRef.current = locked
+        setEncryptionStatus(locked)
+        setVaultLocked(true)
+        lastServerActivity.current = 0
+        if (saveTimer.current) {
+          clearTimeout(saveTimer.current)
+          saveTimer.current = undefined
+        }
+        discardSearchState()
+      }
+    }
+  }, [activeNotebookID, discardSearchState, loadTree])
+
+  useEffect(() => {
+    if (!activeNotebookID) return
+    let active = true
+    const refresh = async () => {
+      if (!active) return
+      await loadEncryptionStatus()
+    }
+    void refresh()
+    const onFocus = () => { void refresh() }
+    const onVisibility = () => { if (document.visibilityState === 'visible') void refresh() }
+    window.addEventListener('focus', onFocus)
+    document.addEventListener('visibilitychange', onVisibility)
+    return () => {
+      active = false
+      window.removeEventListener('focus', onFocus)
+      document.removeEventListener('visibilitychange', onVisibility)
+    }
+  }, [activeNotebookID, loadEncryptionStatus])
+
+  useEffect(() => {
+    const reportActivity = () => {
+      const status = encryptionStatusRef.current
+      if (!status?.protected || status.locked || status.vaultId !== activeNotebookID || document.visibilityState === 'hidden') return
+      const now = Date.now()
+      if (now - lastServerActivity.current < 20_000) return
+      lastServerActivity.current = now
+      void apiFetch(`/api/encryption/activity?vaultId=${encodeURIComponent(activeNotebookID)}`, { method: 'POST' }).then((response) => {
+        if (response.status === 423) {
+          setVaultLocked(true)
+          discardSearchState()
+          void loadEncryptionStatus()
+        }
+      }).catch(() => undefined)
+    }
+    window.addEventListener('pointerdown', reportActivity, true)
+    window.addEventListener('keydown', reportActivity, true)
+    window.addEventListener('touchstart', reportActivity, true)
+    return () => {
+      window.removeEventListener('pointerdown', reportActivity, true)
+      window.removeEventListener('keydown', reportActivity, true)
+      window.removeEventListener('touchstart', reportActivity, true)
+    }
+  }, [activeNotebookID, discardSearchState, loadEncryptionStatus])
+
+  useEffect(() => {
+    if (!initialVaultPassword || !encryptionStatus || initialUnlockAttempted.current) return
+    initialUnlockAttempted.current = true
+    onInitialVaultPasswordConsumed?.()
+    if (!encryptionStatus.protected || encryptionStatus.unlockPasswordMode !== 'login' || !encryptionStatus.locked) return
+    void unlockVault(initialVaultPassword, true)
+  }, [initialVaultPassword, encryptionStatus, onInitialVaultPasswordConsumed])
 
   useEffect(() => {
     const checkHealth = () => apiFetch('/api/health').then((response) => {
@@ -362,6 +477,7 @@ export function App({ authMode = 'disabled', runningVersion = 'dev', onLoggedOut
 
   async function saveDraft(): Promise<boolean> {
     if (saveTimer.current) clearTimeout(saveTimer.current)
+    if (encryptionStatusRef.current?.protected && encryptionStatusRef.current.locked) return false
     if (savePromise.current) {
       try {
         await savePromise.current
@@ -413,6 +529,63 @@ export function App({ authMode = 'disabled', runningVersion = 'dev', onLoggedOut
     if (current?.path === snapshot.path && current.content !== current.savedContent) return saveDraft()
     setSaveStatus('saved')
     return true
+  }
+
+  async function unlockVault(password: string, openDialogOnFailure = false) {
+    if (!encryptionStatusRef.current?.protected || !password) return
+    setUnlockBusy(true)
+    setUnlockError(undefined)
+    try {
+      const result = await responseJSON<{ vaultId: string; unlocked: boolean; generation: number }>(await apiFetch('/api/encryption/unlock', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ password }),
+      }))
+      if (result.vaultId !== activeNotebookIDRef.current || result.generation < vaultGeneration.current) {
+        throw new Error('Vault lock state changed. Try unlocking again.')
+      }
+      vaultGeneration.current = result.generation
+      const current = encryptionStatusRef.current
+      if (current?.vaultId === result.vaultId) {
+        const next = { ...current, locked: !result.unlocked, generation: result.generation }
+        encryptionStatusRef.current = next
+        setEncryptionStatus(next)
+      }
+      setVaultLocked(!result.unlocked)
+      lastServerActivity.current = 0
+      setUnlockDialogOpen(false)
+      setUnlockError(undefined)
+    } catch (error) {
+      setUnlockError(messageFrom(error))
+      if (openDialogOnFailure) setUnlockDialogOpen(true)
+    } finally {
+      setUnlockBusy(false)
+    }
+  }
+
+  async function lockVault() {
+    if (!encryptionStatusRef.current?.protected || encryptionStatusRef.current.locked) return
+    if (saveTimer.current) {
+      clearTimeout(saveTimer.current)
+      saveTimer.current = undefined
+    }
+    setOperationError(undefined)
+    try {
+      const result = await responseJSON<{ vaultId: string; locked: boolean; generation: number }>(await apiFetch('/api/encryption/lock', { method: 'POST' }))
+      if (result.vaultId !== activeNotebookIDRef.current || result.generation < vaultGeneration.current) return
+      vaultGeneration.current = result.generation
+      const current = encryptionStatusRef.current
+      if (current?.vaultId === result.vaultId) {
+        const next = { ...current, locked: result.locked, generation: result.generation }
+        encryptionStatusRef.current = next
+        setEncryptionStatus(next)
+      }
+      setVaultLocked(result.locked)
+      lastServerActivity.current = 0
+      discardSearchState()
+    } catch (error) {
+      setOperationError(messageFrom(error))
+    }
   }
   async function applySaveConflict(action: 'keep_mine' | 'use_server' | 'edit_combined', content?: string) {
     const pending = saveConflict
@@ -516,6 +689,10 @@ export function App({ authMode = 'disabled', runningVersion = 'dev', onLoggedOut
 
   async function openNote(path: string, disposition: 'current' | 'new' = 'current') {
     if (path === selectedPath) return
+    if (encryptionStatusRef.current?.protected && encryptionStatusRef.current.locked) {
+      setUnlockDialogOpen(true)
+      return
+    }
     if (!(await saveDraft())) return
     setNoteLoading(true)
     setNoteError(undefined)
@@ -548,6 +725,10 @@ export function App({ authMode = 'disabled', runningVersion = 'dev', onLoggedOut
       setSaveStatus('saved')
     } catch (error) {
       setNoteError(messageFrom(error))
+      if (error instanceof APIError && error.status === 423) {
+        setVaultLocked(true)
+        discardSearchState()
+      }
     } finally {
       setNoteLoading(false)
     }
@@ -624,7 +805,7 @@ export function App({ authMode = 'disabled', runningVersion = 'dev', onLoggedOut
     }
   }
 
-  async function performMove(entry: TreeNode, target: string, rewriteToken?:string) {
+  async function performMove(entry: TreeNode, target: string, rewriteToken?:string, protectionChoice?:'keep'|'decrypt') {
     if (target === entry.path) return
     if (!(await saveDraft())) return
     setOperationBusy(true)
@@ -638,7 +819,7 @@ export function App({ authMode = 'disabled', runningVersion = 'dev', onLoggedOut
           return
         }
       }
-      const response = await apiFetch('/api/repository/move', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ source: entry.path, target, ...(rewriteToken ? { rewriteToken } : {}) }) })
+      const response = await apiFetch('/api/repository/move', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ source: entry.path, target, ...(rewriteToken ? { rewriteToken } : {}), ...(protectionChoice ? { protectionChoice } : {}) }) })
       await responseJSON<{ path: string }>(response)
       const affectedPath = selectedPath === entry.path || selectedPath?.startsWith(`${entry.path}/`)
         ? target + selectedPath.slice(entry.path.length)
@@ -669,7 +850,11 @@ export function App({ authMode = 'disabled', runningVersion = 'dev', onLoggedOut
         updateReadOnly(affectedReadOnly ?? false, affectedPath)
       }
     } catch (error) {
-      setOperationError(messageFrom(error))
+      if (error instanceof APIError && error.code === 'move_protection_choice_required') {
+        setMoveProtectionChoice({ entry, target, rewriteToken })
+      } else {
+        setOperationError(messageFrom(error))
+      }
     } finally {
       setOperationBusy(false)
     }
@@ -680,6 +865,13 @@ export function App({ authMode = 'disabled', runningVersion = 'dev', onLoggedOut
     if (!pending) return
     setMoveLinkPreview(undefined)
     await performMove(pending.entry, pending.preview.target, pending.preview.token)
+  }
+
+  async function confirmProtectionMove(choice: 'keep' | 'decrypt') {
+    const pending = moveProtectionChoice
+    if (!pending) return
+    setMoveProtectionChoice(undefined)
+    await performMove(pending.entry, pending.target, pending.rewriteToken, choice)
   }
 
   function beginRename(entry: TreeNode) {
@@ -980,7 +1172,7 @@ export function App({ authMode = 'disabled', runningVersion = 'dev', onLoggedOut
         <div ref={noteHeaderStack} className="varianotes-note-header-stack sticky top-0 z-10 bg-zinc-950/90 backdrop-blur">
         <header className="flex items-center justify-between gap-2 border-b border-zinc-800 px-3 py-3 sm:gap-4 sm:px-8">
           <div className="flex min-w-0 items-center gap-2"><button type="button" aria-label="Open notebook navigation" aria-controls="notebook-navigation" aria-expanded={mobileNavigationOpen} onClick={() => setMobileNavigationOpen(true)} className="flex h-9 w-9 shrink-0 items-center justify-center rounded-md border border-zinc-700 text-lg text-zinc-300 hover:bg-zinc-800 lg:hidden">☰</button><p className="min-w-0 truncate text-sm text-zinc-400">{selectedPath ?? 'Select a Markdown file'}</p></div>
-          <div className="flex shrink-0 items-center gap-2">{selectedPath && <><button type="button" onClick={() => void toggleReadOnly()} className={`rounded-md border px-3 py-1.5 text-xs font-semibold ${readOnly ? 'border-amber-500 bg-amber-400/15 text-amber-200' : 'border-zinc-700 text-zinc-200 hover:bg-zinc-800'}`} aria-pressed={readOnly}>{readOnly ? '🔒 Read only' : '✎ Edit'}</button><button type="button" disabled={readOnly || saveStatus === 'saved' || saveStatus === 'saving'} onClick={() => void saveDraft()} className="rounded-md border border-zinc-700 px-3 py-1.5 text-xs font-medium text-zinc-200 hover:bg-zinc-800 disabled:cursor-default disabled:opacity-40">Save</button></>}</div>
+          <div className="flex shrink-0 items-center gap-2">{activeEncryptionStatus?.protected && <><span className={`hidden text-xs sm:inline ${vaultLocked ? 'text-amber-300' : 'text-emerald-300'}`}>{vaultLocked ? 'Vault locked' : 'Vault unlocked'}</span><button type="button" onClick={() => vaultLocked ? setUnlockDialogOpen(true) : void lockVault()} className="min-h-9 rounded-md border border-zinc-700 px-3 text-xs font-semibold text-zinc-200 hover:bg-zinc-800">{vaultLocked ? 'Unlock vault' : 'Lock vault'}</button></>}{selectedPath && <><button type="button" disabled={vaultLocked && Boolean(activeEncryptionStatus?.protected)} onClick={() => void toggleReadOnly()} className={`rounded-md border px-3 py-1.5 text-xs font-semibold ${readOnly ? 'border-amber-500 bg-amber-400/15 text-amber-200' : 'border-zinc-700 text-zinc-200 hover:bg-zinc-800'}`} aria-pressed={readOnly}>{readOnly ? '🔒 Read only' : '✎ Edit'}</button><button type="button" disabled={vaultLocked && Boolean(activeEncryptionStatus?.protected) || readOnly || saveStatus === 'saved' || saveStatus === 'saving'} onClick={() => void saveDraft()} className="rounded-md border border-zinc-700 px-3 py-1.5 text-xs font-medium text-zinc-200 hover:bg-zinc-800 disabled:cursor-default disabled:opacity-40">Save</button></>}</div>
         </header>
         {tabs.length > 0 && <NoteTabs tabs={tabs} activePath={selectedPath} onActivate={(path) => void activateTab(path)} onClose={(path) => void closeTab(path)} />}
         </div>
@@ -989,19 +1181,23 @@ export function App({ authMode = 'disabled', runningVersion = 'dev', onLoggedOut
         {installPrompt && !installPromptDismissed && <div className="flex items-center justify-between gap-3 border-b border-zinc-800 bg-zinc-900/60 px-4 py-2 text-xs text-zinc-300 sm:px-8"><span>Install VariaNotes for a standalone app experience.</span><div className="flex shrink-0 items-center gap-1"><button type="button" onClick={() => void installApplication()} className="min-h-9 rounded-md border border-zinc-600 px-3 font-medium hover:bg-zinc-800">Install app</button><button type="button" onClick={dismissInstallPrompt} aria-label="Dismiss install suggestion" title="Dismiss" className="flex min-h-9 min-w-9 items-center justify-center rounded-md text-lg text-zinc-500 hover:bg-zinc-800 hover:text-zinc-200">×</button></div></div>}
 
         <article className={`mx-auto w-full ${notebookSidebarCollapsed ? 'max-w-none' : 'max-w-4xl'} flex-1 px-5 sm:px-8 ${selectedPath ? 'pt-2 pb-8 sm:pt-2 sm:pb-12' : 'py-8 sm:py-12'}`}>
-          {!selectedPath && <EmptyState notebookConfigured={notebookConfigured !== false} onAddNotebook={() => setAddNotebookOpen(true)} />}
+          {activeEncryptionStatus?.protected && vaultLocked
+            ? <section role="status" aria-labelledby="vault-locked-title" className="mx-auto max-w-xl rounded-xl border border-amber-800/70 bg-amber-950/20 p-5"><h2 id="vault-locked-title" className="text-lg font-semibold text-amber-100">Protected vault is locked</h2><p className="mt-2 text-sm leading-6 text-zinc-300">Protected note contents and attachments are hidden until you unlock this vault. Any unsaved draft remains only in this tab's memory and will reappear after unlock. Closing or reloading this tab loses that draft.</p><button type="button" onClick={() => { setUnlockError(undefined); setUnlockDialogOpen(true) }} className="mt-4 min-h-10 rounded-md bg-amber-500 px-4 text-sm font-semibold text-zinc-950 hover:bg-amber-400">Unlock vault</button></section>
+            : !selectedPath && <EmptyState notebookConfigured={notebookConfigured !== false} onAddNotebook={() => setAddNotebookOpen(true)} />}
           {noteLoading && <p className="text-sm text-zinc-400">Loading note…</p>}
-          {noteError && <ErrorMessage>{noteError}</ErrorMessage>}
-		  {saveError && <ErrorMessage>{saveStatus === 'conflict' ? 'This note changed elsewhere. Your version is still preserved in this editor and has not overwritten the other version. Review both versions before choosing the result.' : `This note could not be saved on the VariaNotes server. Your current editor content is still visible. Try saving again before leaving the note. Details: ${saveError}`}</ErrorMessage>}
-          {!noteLoading && note && <Suspense fallback={<p className="text-sm text-zinc-400">Loading editor…</p>}><MarkdownEditor key={editorDocumentKey} documentKey={editorDocumentKey} notePath={note.path} markdown={note.content} readOnly={readOnly} onChange={updateDraft} onStats={publishDocumentStats} notePaths={markdownPaths(entries)} onOpenNoteLink={openInternalNoteLink} stickyToolbar /></Suspense>}
+          {!activeEncryptionStatus?.protected || !vaultLocked ? noteError && <ErrorMessage>{noteError}</ErrorMessage> : null}
+		  {(!activeEncryptionStatus?.protected || !vaultLocked) && saveError && <ErrorMessage>{saveStatus === 'conflict' ? 'This note changed elsewhere. Your version is still preserved in this editor and has not overwritten the other version. Review both versions before choosing the result.' : `This note could not be saved on the VariaNotes server. Your current editor content is still visible. Try saving again before leaving the note. Details: ${saveError}`}</ErrorMessage>}
+          {(!activeEncryptionStatus?.protected || !vaultLocked) && !noteLoading && note && <Suspense fallback={<p className="text-sm text-zinc-400">Loading editor…</p>}><MarkdownEditor key={editorDocumentKey} documentKey={editorDocumentKey} notePath={note.path} markdown={note.content} readOnly={readOnly} onChange={updateDraft} onStats={publishDocumentStats} notePaths={markdownPaths(entries)} onOpenNoteLink={openInternalNoteLink} stickyToolbar /></Suspense>}
         </article>
-		{selectedPath && note && <DocumentStatusBar status={saveStatus} stats={visibleDocumentStats} />}
+		{selectedPath && note && (!activeEncryptionStatus?.protected || !vaultLocked) && <DocumentStatusBar status={saveStatus} stats={visibleDocumentStats} />}
       </main>
       {contextMenu && <div className="fixed inset-0 z-40" onClick={() => setContextMenu(undefined)} onContextMenu={(event) => { event.preventDefault(); setContextMenu(undefined) }}><div className="fixed" style={{ left: contextMenu.x, top: contextMenu.y }} onClick={(event) => event.stopPropagation()}><ActionMenu entry={contextMenu.entry} onNewNote={(entry) => { setContextMenu(undefined); createEntry('file', entry) }} onNewFolder={(entry) => { setContextMenu(undefined); createEntry('directory', entry) }} onOpenNewTab={openEntryInNewTab} onRename={beginRename} onMove={beginMove} onDelete={requestDeleteEntry} /></div></div>}
       {createRequest && <TextInputDialog title={createRequest.type === 'file' ? 'New Note' : 'New Folder'} label={createRequest.type === 'file' ? `Note name${createRequest.parent ? ` in ${createRequest.parent}` : ''}` : `Folder name${createRequest.parent ? ` in ${createRequest.parent}` : ''}`} initialValue={createRequest.suggested} confirmLabel="Create" onCancel={() => setCreateRequest(undefined)} onConfirm={(value) => void submitCreateEntry(value)} />}
       {deleteRequest && <ConfirmationDialog title="Move to Trash?" message={`Move “${deleteRequest.path}” to Trash?${deleteRequest.type === 'file' ? ' Its owned image assets will move with it.' : ' Everything inside this folder will move with it.'} You can restore it later.`} confirmLabel="Move to Trash" danger onCancel={() => setDeleteRequest(undefined)} onConfirm={() => { const entry = deleteRequest; setDeleteRequest(undefined); void deleteEntry(entry) }} />}
       {moveEntry && <FolderPicker entries={entries} notebookName={notebookName} moving={moveEntry} destination={moveDestination} onDestination={setMoveDestination} onCancel={() => setMoveEntry(undefined)} onConfirm={() => void confirmMove()} />}
       {moveLinkPreview && <MoveLinkPreviewDialog preview={moveLinkPreview.preview} onCancel={() => setMoveLinkPreview(undefined)} onConfirm={() => void confirmMoveLinkRewrites()} />}
+      {moveProtectionChoice && <MoveProtectionDialog entry={moveProtectionChoice.entry} target={moveProtectionChoice.target} busy={operationBusy} onCancel={() => setMoveProtectionChoice(undefined)} onChoose={(choice) => void confirmProtectionMove(choice)} />}
+      {unlockDialogOpen && activeEncryptionStatus?.protected && <VaultUnlockDialog passwordMode={activeEncryptionStatus.unlockPasswordMode} busy={unlockBusy} error={unlockError} onCancel={() => { setUnlockDialogOpen(false); setUnlockError(undefined) }} onUnlock={(password) => void unlockVault(password)} />}
       {settingsOpen && <SettingsDialog mode="settings" authMode={authMode} runningVersion={runningVersion} onLoggedOut={onLoggedOut} autoLockMinutes={autoLockMinutes} onAutoLockMinutes={setAutoLockMinutes} onClose={() => setSettingsOpen(false)} />}
       {addNotebookOpen && <SettingsDialog mode="onboarding" autoLockMinutes={autoLockMinutes} onAutoLockMinutes={setAutoLockMinutes} onNotebookAdded={async () => { await activateCreatedVault(); setAddNotebookOpen(false); setManageNotebooksOpen(true) }} onClose={() => setAddNotebookOpen(false)} />}
       {manageNotebooksOpen && <ManageNotebooksDialog notebooks={notebooks} activeNotebookID={activeNotebookID} operationsBlocked={operationBusy || saveStatus === 'saving' || saveStatus === 'unsaved'} onChanged={refreshNotebookRegistrations} onClose={() => setManageNotebooksOpen(false)} />}
@@ -1116,8 +1312,9 @@ export function SettingsDialog({ mode = 'settings', authMode = 'disabled', runni
           </form>
         </section>}
         {mode === 'settings' && <>
-          <section aria-labelledby="settings-storage-title"><h3 id="settings-storage-title" className="text-sm font-semibold text-zinc-200">Storage and recovery</h3><p className="mt-1 text-xs leading-5 text-zinc-400">The server folder is the canonical copy. The operator is responsible for backups and restore. Export a vault from Manage Vaults; an export is a portable copy, not automatic backup.</p><p className="mt-2 text-xs leading-5 text-zinc-500">Note content is online-only. When the server is unavailable, VariaNotes cannot load or save vault files.</p></section>
-          <section aria-labelledby="auto-lock-title"><h3 id="auto-lock-title" className="text-sm font-semibold text-zinc-200">Editor</h3><label className="mt-2 block text-sm text-zinc-300">Auto-lock notes<select value={autoLockMinutes} onChange={(event) => onAutoLockMinutes(parseAutoLockMinutes(event.target.value))} className="mt-1.5 min-h-10 w-full rounded-md border border-zinc-700 bg-zinc-950 px-3 text-sm outline-none focus:border-amber-500">{autoLockOptions.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</select></label></section>
+          <section aria-labelledby="settings-storage-title"><h3 id="settings-storage-title" className="text-sm font-semibold text-zinc-200">Storage and recovery</h3><p className="mt-1 text-xs leading-5 text-zinc-400">The server folder is the canonical copy. The operator is responsible for backups and restore. Export a vault from Manage Vaults; an export is a portable copy, not automatic backup.</p><p className="mt-2 text-xs leading-5 text-zinc-500">Exports containing protected content are unencrypted ZIP files. Earlier backups and copies may also contain plaintext. VariaNotes does not erase prior copies or provide a backup service.</p><p className="mt-2 text-xs leading-5 text-zinc-500">Note content is online-only. When the server is unavailable, VariaNotes cannot load or save vault files.</p></section>
+          <section aria-labelledby="auto-lock-title"><h3 id="auto-lock-title" className="text-sm font-semibold text-zinc-200">Editor</h3><p className="mt-1 text-xs leading-5 text-zinc-500">This only makes the editor read-only and saves its draft. Protected vaults have a separate server-side lock after 15 minutes without activity.</p><label className="mt-2 block text-sm text-zinc-300">Make editor read-only after<select value={autoLockMinutes} onChange={(event) => onAutoLockMinutes(parseAutoLockMinutes(event.target.value))} className="mt-1.5 min-h-10 w-full rounded-md border border-zinc-700 bg-zinc-950 px-3 text-sm outline-none focus:border-amber-500">{autoLockOptions.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</select></label></section>
+          {authMode === 'local' && <EncryptionRecoverySettings />}
           {authMode === 'local' && <SecurityPanel authMode={authMode} onLoggedOut={onLoggedOut} />}
           <section aria-labelledby="asset-cleanup-title" className="rounded-md border border-zinc-800 p-3"><div className="flex flex-wrap items-center justify-between gap-2"><div><h3 id="asset-cleanup-title" className="text-sm font-semibold text-zinc-200">Unused image assets</h3><p className="mt-1 text-xs text-zinc-500">Review unreferenced image files before removing them from this vault.</p></div><button type="button" disabled={cleanupBusy} onClick={() => void scanAssets()} className="min-h-9 rounded border border-zinc-700 px-3 text-xs text-zinc-200">{cleanupBusy ? 'Scanning…' : cleanupAssets ? 'Scan again' : 'Scan vault'}</button></div>
             {cleanupError && <p role="alert" className="mt-3 text-xs text-red-300">{cleanupError}</p>}
@@ -1129,6 +1326,92 @@ export function SettingsDialog({ mode = 'settings', authMode = 'disabled', runni
     </section>
     {confirmCleanup && <ConfirmationDialog title="Remove unused assets?" message={`Permanently remove ${selectedCount} unreferenced image assets (${formatBytes(totalSize)}) from the active vault?`} confirmLabel="Remove assets" danger busy={cleanupBusy} onCancel={() => setConfirmCleanup(false)} onConfirm={() => void deleteSelectedAssets()} />}
   </div>
+}
+
+function EncryptionRecoverySettings() {
+  const [status, setStatus] = useState<EncryptionStatus>()
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState<string>()
+  const [notice, setNotice] = useState<string>()
+  const [challenge, setChallenge] = useState<string>()
+  const [recoveryCode, setRecoveryCode] = useState('')
+
+  const load = useCallback(async () => {
+    try {
+      setStatus(await responseJSON<EncryptionStatus>(await apiFetch('/api/encryption/status')))
+    } catch (caught) {
+      setError(messageFrom(caught))
+    }
+  }, [])
+
+  useEffect(() => {
+    let active = true
+    queueMicrotask(() => { if (active) void load() })
+    return () => { active = false }
+  }, [load])
+
+  async function prepare(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault()
+    const form = event.currentTarget
+    const values = new FormData(form)
+    setBusy(true)
+    setError(undefined)
+    setNotice(undefined)
+    try {
+      const payload: Record<string, string> = {
+        currentPassword: String(values.get('encryptionRecoveryCurrentPassword') ?? ''),
+        mfaCode: String(values.get('encryptionRecoveryMfa') ?? ''),
+      }
+      if (status?.unlockPasswordMode === 'separate') payload.encryptionPassword = String(values.get('encryptionRecoveryPassword') ?? '')
+      const result = await responseJSON<{ challengeId: string; recoveryCode: string }>(await apiFetch('/api/encryption/recovery-code', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload),
+      }))
+      form.reset()
+      setChallenge(result.challengeId)
+      setRecoveryCode(result.recoveryCode)
+    } catch (caught) {
+      setError(messageFrom(caught))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  async function confirm(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault()
+    if (!challenge) return
+    const values = new FormData(event.currentTarget)
+    setBusy(true)
+    setError(undefined)
+    setNotice(undefined)
+    try {
+      await responseJSON(await apiFetch('/api/encryption/recovery-code/confirm', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ challengeId: challenge, recoveryCode: String(values.get('confirmRecoveryCode') ?? ''), confirmed: values.get('recoveryCodeStored') === 'on' }),
+      }))
+      setChallenge(undefined)
+      setRecoveryCode('')
+      setNotice('Recovery code saved and confirmed. Keep it separately from the server and your backups.')
+      await load()
+    } catch (caught) {
+      setError(messageFrom(caught))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const copyCode = async () => {
+    if (!navigator.clipboard) {
+      setError('Clipboard is unavailable; select and copy the recovery code manually.')
+      return
+    }
+    try {
+      await navigator.clipboard.writeText(recoveryCode)
+      setNotice('Recovery code copied. Store it separately before confirming.')
+    } catch {
+      setError('Clipboard is unavailable; select and copy the recovery code manually.')
+    }
+  }
+  return <section aria-labelledby="encryption-recovery-title" className="rounded-md border border-zinc-800 p-3"><h3 id="encryption-recovery-title" className="text-sm font-semibold text-zinc-200">Vault protection and recovery</h3>{error && <p role="alert" className="mt-3 rounded border border-red-900/70 bg-red-950/30 p-3 text-xs text-red-200">{error}</p>}{notice && <p role="status" className="mt-3 rounded border border-emerald-900/70 bg-emerald-950/20 p-3 text-xs text-emerald-300">{notice}</p>}{!status && !error && <p className="mt-2 text-xs text-zinc-500">Loading protection status…</p>}{status && <><p className="mt-2 text-xs leading-5 text-zinc-400">{status.protected ? `This vault is protected. A recovery code is ${status.recoveryCodeConfigured ? 'configured' : 'not configured'}.` : 'This vault is not protected.'}</p><p className="mt-2 rounded border border-amber-800/60 bg-amber-950/20 p-3 text-xs leading-5 text-amber-100">Encryption activation remains disabled in the interface and API until the full M31 release gate and independent security review pass. Recovery codes are shown once, remain only in this browser tab until you confirm, and must be stored separately. Earlier backups keep their existing recovery envelopes.</p>{status.protected && !challenge && <form onSubmit={(event) => void prepare(event)} className="mt-4 space-y-3"><h4 className="text-xs font-medium text-zinc-200">{status.recoveryCodeConfigured ? 'Replace recovery code' : 'Set up recovery code'}</h4><p className="text-xs leading-5 text-zinc-500">This creates a one-time code for recovering encrypted vault keys while preserving ciphertext. {status.unlockPasswordMode === 'separate' ? 'The separate encryption password is also required.' : 'Use your current sign-in password.'}</p><SecurityPassword name="encryptionRecoveryCurrentPassword" label="Current sign-in password" autoComplete="current-password"/>{status.unlockPasswordMode === 'separate' && <SecurityPassword name="encryptionRecoveryPassword" label="Current encryption password" autoComplete="current-password"/>}{status.mfaEnabled && <SecurityCode name="encryptionRecoveryMfa" label="Authenticator or recovery code"/>}<button type="submit" disabled={busy} className="min-h-10 rounded-md border border-zinc-700 px-3 text-xs text-zinc-200 disabled:opacity-50">{busy ? 'Preparing…' : status.recoveryCodeConfigured ? 'Replace recovery code' : 'Create recovery code'}</button></form>}{challenge && <form onSubmit={(event) => void confirm(event)} className="mt-4 space-y-3"><h4 className="text-xs font-medium text-zinc-200">Save and confirm this code</h4><p className="text-xs leading-5 text-amber-100">Store this code somewhere separate from VariaNotes. It is displayed only during this step; it will not be stored in browser storage.</p><div className="rounded border border-zinc-700 bg-zinc-950 p-3"><code className="select-all break-all font-mono text-sm text-zinc-100">{recoveryCode}</code><button type="button" onClick={() => void copyCode()} className="mt-3 min-h-9 rounded border border-zinc-700 px-3 text-xs text-zinc-300">Copy recovery code</button></div><label className="block text-xs text-zinc-300">Re-enter the recovery code to confirm<input name="confirmRecoveryCode" required autoComplete="off" spellCheck={false} className="mt-1.5 min-h-10 w-full rounded border border-zinc-700 bg-zinc-950 px-3 font-mono text-xs"/></label><label className="flex items-start gap-2 text-xs leading-5 text-zinc-300"><input name="recoveryCodeStored" type="checkbox" required className="mt-0.5 h-4 w-4"/>I stored this code separately and understand that replacing it does not update older backups.</label><div className="flex justify-end gap-2"><button type="button" disabled={busy} onClick={() => { setChallenge(undefined); setRecoveryCode(''); setError(undefined); setNotice(undefined) }} className="min-h-9 rounded px-3 text-xs text-zinc-400">Cancel</button><button type="submit" disabled={busy} className="min-h-9 rounded bg-amber-500 px-3 text-xs font-semibold text-zinc-950 disabled:opacity-50">{busy ? 'Confirming…' : 'Confirm saved code'}</button></div></form>}</>}</section>
 }
 
 function SecurityPanel({ authMode, onLoggedOut }: { authMode:'local'|'disabled'; onLoggedOut:()=>void }) {
@@ -1388,6 +1671,7 @@ function TreeEntry(props: TreeEntryProps) {
         {isRenaming
           ? <InlineRename value={renameValue} onChange={onRenameValue} onCommit={onRenameCommit} onCancel={onRenameCancel} />
           : <button type="button" className="min-w-0 flex-1 truncate py-1.5 pr-2 text-left text-sm" onClick={(event) => onSelect(entry, !isFolder && (event.ctrlKey || event.metaKey) ? 'new' : 'current')} onAuxClick={(event) => { if (!isFolder && event.button === 1) { event.preventDefault(); onSelect(entry, 'new') } }} onDoubleClick={() => { if (isFolder) onToggleFolder(entry.path) }}>{isFolder ? entry.name : entry.name.replace(/\.md$/i, '')}</button>}
+        {entry.protected && <span role="img" aria-label={entry.protectionInherited ? 'Protected by parent folder' : 'Protected'} title={entry.protectionInherited ? 'Protection inherited from a protected folder' : 'Protected'} className="mr-1 shrink-0 text-xs text-amber-300">🔒</span>}
       </div>
       {isFolder && expanded && entry.children && <ul className="ml-4 border-l border-zinc-800 pl-2">{entry.children.map((child) => <TreeEntry key={child.path} {...props} entry={child} />)}</ul>}
     </li>
@@ -1435,6 +1719,16 @@ function MoveLinkPreviewDialog({ preview, onCancel, onConfirm }: { preview:MoveL
   const grouped = new Map<string,LinkRewrite[]>()
   for (const rewrite of preview.rewrites) grouped.set(rewrite.notePath, [...(grouped.get(rewrite.notePath) ?? []), rewrite])
   return <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/75 p-3 sm:p-4" onMouseDown={(event) => { if (event.target === event.currentTarget) onCancel() }}><section role="dialog" aria-modal="true" aria-labelledby="move-links-title" className="flex max-h-[92vh] w-full max-w-3xl flex-col rounded-xl border border-zinc-700 bg-zinc-900 shadow-2xl"><header className="border-b border-zinc-800 px-4 py-3 sm:px-5"><h2 id="move-links-title" className="text-lg font-semibold">Update note links?</h2><p className="mt-1 text-sm text-zinc-400">Moving <span className="text-zinc-200">{preview.source}</span> to <span className="text-zinc-200">{preview.target}</span> requires {preview.rewrites.length} portable Markdown link {preview.rewrites.length === 1 ? 'update' : 'updates'}.</p></header><div className="min-h-0 overflow-y-auto p-4 sm:p-5"><p className="mb-4 text-sm leading-6 text-zinc-400">Review the exact changes below. VariaNotes will stop if any note changed after this preview, and will never guess about unsupported or ambiguous Markdown.</p><div className="space-y-3">{[...grouped.entries()].map(([notePath,rewrites]) => <section key={notePath} className="rounded-lg border border-zinc-800 bg-zinc-950 p-3"><h3 className="text-sm font-medium text-zinc-200">{notePath}{rewrites[0].nextNotePath !== notePath && <span className="text-zinc-500"> → {rewrites[0].nextNotePath}</span>}</h3><ul className="mt-2 space-y-2">{rewrites.map((rewrite,index) => <li key={`${rewrite.line}:${index}`} className="text-xs"><span className="text-zinc-500">Line {rewrite.line}</span><div className="mt-1 break-all font-mono text-red-300">− {rewrite.before}</div><div className="break-all font-mono text-emerald-300">+ {rewrite.after}</div></li>)}</ul></section>)}</div></div><footer className="flex flex-wrap justify-end gap-2 border-t border-zinc-800 p-4"><button type="button" onClick={onCancel} className="min-h-10 rounded-md border border-zinc-700 px-4 text-sm text-zinc-300 hover:bg-zinc-800">Cancel move</button><button type="button" onClick={onConfirm} className="min-h-10 rounded-md bg-amber-500 px-4 text-sm font-medium text-zinc-950 hover:bg-amber-400">Move and update links</button></footer></section></div>
+}
+
+function MoveProtectionDialog({ entry, target, busy, onCancel, onChoose }: { entry:TreeNode; target:string; busy:boolean; onCancel:()=>void; onChoose:(choice:'keep'|'decrypt')=>void }) {
+  const noun = entry.type === 'directory' ? 'This folder and its protected descendants' : 'This note and its protected attachments'
+  return <div className="fixed inset-0 z-[60] flex items-center justify-center bg-black/80 p-4"><section role="dialog" aria-modal="true" aria-labelledby="move-protection-title" className="w-full max-w-lg rounded-xl border border-zinc-700 bg-zinc-900 p-5 shadow-2xl"><h2 id="move-protection-title" className="text-lg font-semibold">Choose protection after moving</h2><p className="mt-2 text-sm leading-6 text-zinc-300">{noun} will move from <span className="font-medium text-zinc-100">{entry.path}</span> to <span className="font-medium text-zinc-100">{target}</span>. Choose whether the moved content stays protected or is decrypted. For a folder, the choice applies to its whole subtree.</p><p className="mt-2 text-xs leading-5 text-zinc-500">A shared attachment remains protected while any protected note still references it.</p><div className="mt-5 flex flex-wrap justify-end gap-2"><button type="button" disabled={busy} onClick={onCancel} className="min-h-10 rounded-md border border-zinc-700 px-3 text-sm text-zinc-300">Cancel</button><button type="button" disabled={busy} onClick={() => onChoose('decrypt')} className="min-h-10 rounded-md border border-zinc-700 px-3 text-sm text-zinc-200">Decrypt and move</button><button type="button" disabled={busy} onClick={() => onChoose('keep')} className="min-h-10 rounded-md bg-amber-500 px-3 text-sm font-semibold text-zinc-950">Keep protection</button></div></section></div>
+}
+
+function VaultUnlockDialog({ passwordMode, busy, error, onCancel, onUnlock }: { passwordMode:'login'|'separate'; busy:boolean; error?:string; onCancel:()=>void; onUnlock:(password:string)=>void }) {
+  const [password, setPassword] = useState('')
+  return <div className="fixed inset-0 z-[70] flex items-center justify-center bg-black/80 p-4"><form role="dialog" aria-modal="true" aria-labelledby="vault-unlock-title" onSubmit={(event) => { event.preventDefault(); onUnlock(password) }} className="w-full max-w-md rounded-xl border border-zinc-700 bg-zinc-900 p-5 shadow-2xl"><h2 id="vault-unlock-title" className="text-lg font-semibold">Unlock protected vault</h2><p className="mt-2 text-sm leading-6 text-zinc-400">{passwordMode === 'login' ? 'Enter your current sign-in password to unlock this vault.' : 'Enter the separate encryption password for this vault. Your sign-in password is not used for encryption.'}</p><label className="mt-4 block text-sm text-zinc-300">{passwordMode === 'login' ? 'Sign-in password' : 'Encryption password'}<input autoFocus type="password" required maxLength={1024} autoComplete="current-password" value={password} onChange={(event) => setPassword(event.target.value)} className="mt-1.5 min-h-11 w-full rounded-md border border-zinc-700 bg-zinc-950 px-3 text-sm outline-none focus:border-amber-500" /></label>{error && <p role="alert" className="mt-3 rounded border border-red-900/70 bg-red-950/30 p-3 text-sm text-red-200">{error}</p>}<div className="mt-5 flex justify-end gap-2"><button type="button" disabled={busy} onClick={onCancel} className="min-h-10 rounded-md border border-zinc-700 px-3 text-sm text-zinc-300">Cancel</button><button type="submit" disabled={busy || !password} className="min-h-10 rounded-md bg-amber-500 px-4 text-sm font-semibold text-zinc-950 disabled:opacity-50">{busy ? 'Unlocking…' : 'Unlock'}</button></div></form></div>
 }
 
 function FolderPicker({ entries, notebookName, moving, destination, onDestination, onCancel, onConfirm }: { entries: TreeNode[]; notebookName: string; moving: TreeNode; destination: string; onDestination: (path: string) => void; onCancel: () => void; onConfirm: () => void }) {
