@@ -2,6 +2,7 @@ package encryption
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -100,6 +101,253 @@ func TestTransactionDeleteRemovesContentAndCatalogEntryTogether(t *testing.T) {
 		t.Fatalf("deleted ciphertext still exists: %v", err)
 	}
 	assertTransactionCatalog(t, fixture, fixture.nextCatalog)
+	assertNoTransactionStages(t, fixture)
+}
+
+func TestConversionTransactionKeepsOriginalUntilCommitAndChecksSource(t *testing.T) {
+	fixture := newPlaintextConversionFixture(t, []byte("selected existing note"))
+	tx, err := fixture.journal.Prepare(fixture.changes, fixture.nextCatalog, fixture.key)
+	if err != nil {
+		t.Fatalf("prepare conversion transaction: %v", err)
+	}
+	if content, err := os.ReadFile(filepath.Join(fixture.vaultRoot, "Note.md")); err != nil || string(content) != "selected existing note" {
+		t.Fatalf("plaintext original changed before commit: %q err=%v", content, err)
+	}
+	if _, err := os.Lstat(filepath.Join(fixture.vaultRoot, "Note.md.age")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("ciphertext target appeared before commit: %v", err)
+	}
+	journalBytes, err := os.ReadFile(filepath.Join(fixture.catalogStore.directory, fixture.journal.name))
+	if err != nil {
+		t.Fatal(err)
+	}
+	plaintextDigest := CiphertextSHA256([]byte("selected existing note"))
+	if bytes.Contains(journalBytes, []byte(plaintextDigest)) {
+		t.Fatal("prepared journal persisted the plaintext source digest")
+	}
+	if err := os.WriteFile(filepath.Join(fixture.vaultRoot, "Note.md"), []byte("concurrent edit"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); !errors.Is(err, ErrTransactionConflict) {
+		t.Fatalf("commit after source changed = %v, want conflict", err)
+	}
+	if content, err := os.ReadFile(filepath.Join(fixture.vaultRoot, "Note.md")); err != nil || string(content) != "concurrent edit" {
+		t.Fatalf("concurrent source edit was lost: %q err=%v", content, err)
+	}
+	if _, err := os.Lstat(filepath.Join(fixture.vaultRoot, "Note.md.age")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("ciphertext target was installed after a source conflict: %v", err)
+	}
+	assertTransactionCatalog(t, fixture, fixture.oldCatalog)
+	assertNoTransactionStages(t, fixture)
+}
+
+func TestConversionTransactionRejectsHardlinksAtPrepareAndCommit(t *testing.T) {
+	t.Run("preflight", func(t *testing.T) {
+		fixture := newPlaintextConversionFixture(t, []byte("selected existing note"))
+		if err := os.Link(filepath.Join(fixture.vaultRoot, "Note.md"), filepath.Join(filepath.Dir(fixture.vaultRoot), "outside.md")); err != nil {
+			t.Skipf("hard links are unavailable: %v", err)
+		}
+		if _, err := fixture.journal.Prepare(fixture.changes, fixture.nextCatalog, fixture.key); !errors.Is(err, ErrInvalidTransaction) {
+			t.Fatalf("prepare with hard-linked source = %v, want invalid transaction", err)
+		}
+		assertPlaintextConversionNotCommitted(t, fixture)
+	})
+
+	t.Run("after prepare", func(t *testing.T) {
+		fixture := newPlaintextConversionFixture(t, []byte("selected existing note"))
+		tx, err := fixture.journal.Prepare(fixture.changes, fixture.nextCatalog, fixture.key)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Link(filepath.Join(fixture.vaultRoot, "Note.md"), filepath.Join(filepath.Dir(fixture.vaultRoot), "outside.md")); err != nil {
+			t.Skipf("hard links are unavailable: %v", err)
+		}
+		if err := tx.Commit(); !errors.Is(err, ErrInvalidTransaction) {
+			t.Fatalf("commit after adding a hard link = %v, want invalid transaction", err)
+		}
+		assertPlaintextConversionNotCommitted(t, fixture)
+		if _, err := os.Stat(filepath.Join(filepath.Dir(fixture.vaultRoot), "outside.md")); err != nil {
+			t.Fatalf("hard-linked alias was removed: %v", err)
+		}
+	})
+}
+
+func TestConversionTransactionCancellationAndInjectedFailuresPreserveSource(t *testing.T) {
+	phases := []string{
+		"transaction.journal.prepared.write", "transaction.journal.prepared.file_sync",
+		"transaction.journal.prepared.rename", "transaction.journal.prepared.directory_sync",
+		"transaction.content_stage.write", "transaction.content_stage.file_sync",
+		"transaction.content_stage.directory_sync", "transaction.catalog_stage.write",
+		"transaction.catalog_stage.file_sync", "transaction.catalog_stage.directory_sync",
+		"transaction.commit.before",
+	}
+	for _, phase := range phases {
+		t.Run(phase, func(t *testing.T) {
+			fixture := newPlaintextConversionFixture(t, []byte("keep until commit"))
+			fired := false
+			fixture.journal.fault = func(actual string) error {
+				if !fired && actual == phase {
+					fired = true
+					return errors.New("injected disk failure")
+				}
+				return nil
+			}
+			tx, err := fixture.journal.Prepare(fixture.changes, fixture.nextCatalog, fixture.key)
+			if err == nil {
+				if phase != "transaction.commit.before" {
+					t.Fatalf("Prepare did not hit injected phase %q", phase)
+				}
+				err = tx.Commit()
+			}
+			if err == nil || !fired {
+				t.Fatalf("injected phase %q returned %v, fired=%v", phase, err, fired)
+			}
+			if recoverErr := fixture.journal.Recover(fixture.key); recoverErr != nil {
+				t.Fatalf("recover after injected phase %q: %v", phase, recoverErr)
+			}
+			assertPlaintextConversionNotCommitted(t, fixture)
+		})
+	}
+
+	t.Run("cancellation during staging", func(t *testing.T) {
+		fixture := newPlaintextConversionFixture(t, []byte("keep until commit"))
+		ctx, cancel := context.WithCancel(context.Background())
+		fixture.journal.fault = func(actual string) error {
+			if actual == "transaction.content_stage.file_sync" {
+				cancel()
+			}
+			return nil
+		}
+		if _, err := fixture.journal.PrepareContext(ctx, fixture.changes, fixture.nextCatalog, fixture.key); !errors.Is(err, context.Canceled) {
+			t.Fatalf("canceled stage error = %v", err)
+		}
+		assertPlaintextConversionNotCommitted(t, fixture)
+	})
+}
+
+func TestConversionTransactionRecoversForwardAfterCommitPoint(t *testing.T) {
+	fixture := newPlaintextConversionFixture(t, []byte("recover after commit"))
+	tx, err := fixture.journal.Prepare(fixture.changes, fixture.nextCatalog, fixture.key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	injectTransactionFailure(fixture.journal, "transaction.commit.after")
+	if err := tx.Commit(); !errors.Is(err, ErrTransactionNeedsRecovery) {
+		t.Fatalf("commit failure after durable point = %v", err)
+	}
+	if content, err := os.ReadFile(filepath.Join(fixture.vaultRoot, "Note.md")); err != nil || string(content) != "recover after commit" {
+		t.Fatalf("source changed before recovery: %q err=%v", content, err)
+	}
+	restarted, err := NewTransactionJournal(fixture.vaultRoot, fixture.catalogStore)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := restarted.Recover(fixture.key); err != nil {
+		t.Fatalf("recover committed conversion: %v", err)
+	}
+	if _, err := os.Lstat(filepath.Join(fixture.vaultRoot, "Note.md")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("plaintext source survived committed recovery: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(fixture.vaultRoot, "Note.md.age")); err != nil {
+		t.Fatalf("ciphertext target missing after recovery: %v", err)
+	}
+	assertTransactionCatalog(t, fixture, fixture.nextCatalog)
+	assertNoTransactionStages(t, fixture)
+}
+
+func TestConversionTransactionRestartBeforeCommitPreservesSource(t *testing.T) {
+	fixture := newPlaintextConversionFixture(t, []byte("restart before commit"))
+	if _, err := fixture.journal.Prepare(fixture.changes, fixture.nextCatalog, fixture.key); err != nil {
+		t.Fatalf("prepare conversion: %v", err)
+	}
+	restarted, err := NewTransactionJournal(fixture.vaultRoot, fixture.catalogStore)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := restarted.Recover(fixture.key); err != nil {
+		t.Fatalf("discard uncommitted conversion after restart: %v", err)
+	}
+	assertPlaintextConversionNotCommitted(t, fixture)
+}
+
+func TestTransactionCanCommitFolderRuleWithoutContentChanges(t *testing.T) {
+	fixture := newTransactionFixture(t, 1)
+	fixture.nextCatalog = fixture.oldCatalog
+	fixture.nextCatalog.FolderRules = append(fixture.nextCatalog.FolderRules, FolderProtectionRule{Path: "empty"})
+	if err := os.Mkdir(filepath.Join(fixture.vaultRoot, "empty"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	tx, err := fixture.journal.Prepare(nil, fixture.nextCatalog, fixture.key)
+	if err != nil {
+		t.Fatalf("prepare catalog-only transaction: %v", err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("commit catalog-only transaction: %v", err)
+	}
+	assertTransactionCatalog(t, fixture, fixture.nextCatalog)
+	assertTransactionFiles(t, fixture, fixture.oldBytes)
+	assertNoTransactionStages(t, fixture)
+}
+
+func newPlaintextConversionFixture(t *testing.T, plaintext []byte) transactionFixture {
+	t.Helper()
+	base := t.TempDir()
+	vaultRoot := filepath.Join(base, "vault")
+	if err := os.Mkdir(vaultRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	key := bytes.Repeat([]byte{0x73}, VaultKeySize)
+	oldCatalog, err := NewCatalog()
+	if err != nil {
+		t.Fatal(err)
+	}
+	objectID, err := NewCatalogObjectID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ciphertext, envelope, err := EncryptContent(key, objectID, plaintext)
+	if err != nil {
+		t.Fatal(err)
+	}
+	object := CatalogObject{
+		ObjectID: objectID, Kind: CatalogObjectNote, LogicalPath: "Note.md", PhysicalPath: "Note.md.age",
+		CiphertextHash: CiphertextSHA256(ciphertext), ContentKeyEnvelope: &envelope, Protected: true,
+	}
+	nextCatalog := Catalog{Version: CatalogFormatVersion, VaultID: oldCatalog.VaultID, Objects: []CatalogObject{object}, FolderRules: []FolderProtectionRule{}}
+	catalogStore, err := NewCatalogStore(filepath.Join(base, "metadata", "vault", "catalog.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := catalogStore.Save(oldCatalog, key); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(vaultRoot, "Note.md"), plaintext, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	journal, err := NewTransactionJournal(vaultRoot, catalogStore)
+	if err != nil {
+		t.Fatal(err)
+	}
+	changes := []CiphertextChange{
+		{Path: "Note.md.age", ObjectID: objectID, Ciphertext: ciphertext, ContentKeyEnvelope: envelope},
+		{Path: "Note.md", Delete: true, ExpectedSHA256: CiphertextSHA256(plaintext), RejectHardlinks: true},
+	}
+	return transactionFixture{
+		vaultRoot: vaultRoot, catalogStore: catalogStore, journal: journal, key: key,
+		changes: changes, oldBytes: map[string][]byte{"Note.md": append([]byte(nil), plaintext...)},
+		oldCatalog: oldCatalog, nextCatalog: nextCatalog,
+	}
+}
+
+func assertPlaintextConversionNotCommitted(t *testing.T, fixture transactionFixture) {
+	t.Helper()
+	content, err := os.ReadFile(filepath.Join(fixture.vaultRoot, "Note.md"))
+	if err != nil || !bytes.Equal(content, fixture.oldBytes["Note.md"]) {
+		t.Fatalf("plaintext source was not preserved: %q err=%v", content, err)
+	}
+	if _, err := os.Lstat(filepath.Join(fixture.vaultRoot, "Note.md.age")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("ciphertext target was installed before commit: %v", err)
+	}
+	assertTransactionCatalog(t, fixture, fixture.oldCatalog)
 	assertNoTransactionStages(t, fixture)
 }
 

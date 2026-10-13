@@ -8,6 +8,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- Added M31P11 preflight and journaled conversion of existing notes, folders,
+  shared attachments, and associated Trash. Unsafe entries, hardlinks, and
+  `.age` collisions fail before staging; plaintext originals remain until the
+  commit point and committed conversions recover forward. M31 activation stays
+  gated.
 - Added M31P10 catalog-backed image attachments with stable object identities,
   encrypted first-write uploads, shared Markdown-relative references, and
   locked-image placeholders. Multipart uploads stay bounded in memory without

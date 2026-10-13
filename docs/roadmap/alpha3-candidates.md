@@ -245,8 +245,8 @@ Completion criteria:
 
 ## Milestone 31 - Selective encryption for notes and folders
 
-M31 remains in Alpha 3. This checklist is the implementation plan. **P01–P10
-are complete; P11–P18 remain open.** M31 is not complete until P01–P18 are
+M31 remains in Alpha 3. This checklist is the implementation plan. **P01–P11
+are complete; P12–P18 remain open.** M31 is not complete until P01–P18 are
 complete and the independent security review in P17 has passed. Encryption
 activation must stay disabled in the UI, API, and any operator command until
 the P18 release gate passes.
@@ -468,16 +468,26 @@ requires its listed tests; P17 adds end-to-end and adversarial coverage.
   uploads stream through a bounded reader without temporary files. Locked image
   requests return no content and the editor shows “Geschützter Anhang”; shared
   cleanup tests retain an object until every reference is removed. M31
-  activation remains gated by P11–P18 and the independent security review.
+  activation remains gated by P12–P18 and the independent security review.
 
-- [ ] **P11 — Convert existing notes, folders, and attachments**
+- [x] **P11 — Convert existing notes, folders, and attachments**
   *(dependencies: P04, P06, P09, P10; size: L)*
   **Goal/scope:** preflight, inventory, stage, verify, and convert selected
   existing content, including recursive files and associated Trash.
   **Acceptance/tests:** detect collisions, symlinks, hardlinks, and unsupported
   entries before conversion; inject cancellation, disk errors, and restart at
   every phase; preserve originals before commit; resume after commit; never show
-  partial conversion as complete.
+  partial conversion as complete. Implemented as a prepared repository
+  conversion: preflight inventories Markdown notes, supported attachments,
+  shared referenced images, recursive folder contents, and Trash items selected
+  by their original path. Unsafe or unsupported entries, untracked `.age`
+  collisions, and multiply linked files fail before staging. The transaction
+  verifies ciphertext and catalog stages, keeps plaintext originals until its
+  durable commit point, and then deletes originals and installs ciphertext
+  through forward recovery. The journal stores only a vault-keyed source
+  fingerprint. Empty folder rules use a catalog-only transaction. Conversion
+  remains behind the M31 activation gate; protected Trash operations remain
+  unavailable until P13.
 
 - [ ] **P12 — Rename, move, and link updates**
   *(dependencies: P06, P09–P11; size: L)*
