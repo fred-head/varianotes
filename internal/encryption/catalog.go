@@ -15,6 +15,8 @@ import (
 	"strings"
 	"unicode"
 	"unicode/utf8"
+
+	"golang.org/x/crypto/chacha20poly1305"
 )
 
 const (
@@ -59,12 +61,13 @@ type Catalog struct {
 // objects have identical logical and physical paths and no digest. Protected
 // objects use a .age physical path and carry a digest of ciphertext only.
 type CatalogObject struct {
-	ObjectID       string            `json:"object_id"`
-	Kind           CatalogObjectKind `json:"kind"`
-	LogicalPath    string            `json:"logical_path"`
-	PhysicalPath   string            `json:"physical_path"`
-	CiphertextHash string            `json:"ciphertext_sha256,omitempty"`
-	Protected      bool              `json:"protected"`
+	ObjectID           string              `json:"object_id"`
+	Kind               CatalogObjectKind   `json:"kind"`
+	LogicalPath        string              `json:"logical_path"`
+	PhysicalPath       string              `json:"physical_path"`
+	CiphertextHash     string              `json:"ciphertext_sha256,omitempty"`
+	ContentKeyEnvelope *ContentKeyEnvelope `json:"content_key_envelope,omitempty"`
+	Protected          bool                `json:"protected"`
 }
 
 // FolderProtectionRule protects every current and future descendant of Path.
@@ -300,10 +303,10 @@ func validateCatalog(catalog Catalog) error {
 		logicalPaths[object.LogicalPath] = struct{}{}
 		physicalPaths[object.PhysicalPath] = struct{}{}
 		if object.Protected {
-			if object.PhysicalPath != object.LogicalPath+".age" || !isSHA256Hex(object.CiphertextHash) {
+			if object.PhysicalPath != object.LogicalPath+".age" || !isSHA256Hex(object.CiphertextHash) || !validCatalogContentKeyEnvelope(object.ObjectID, object.ContentKeyEnvelope) {
 				return ErrInvalidCatalog
 			}
-		} else if object.PhysicalPath != object.LogicalPath || object.CiphertextHash != "" {
+		} else if object.PhysicalPath != object.LogicalPath || object.CiphertextHash != "" || object.ContentKeyEnvelope != nil {
 			return ErrInvalidCatalog
 		}
 	}
@@ -339,6 +342,11 @@ func validateCatalog(catalog Catalog) error {
 		}
 	}
 	return nil
+}
+
+func validCatalogContentKeyEnvelope(objectID string, envelope *ContentKeyEnvelope) bool {
+	return envelope != nil && envelope.Version == FormatVersion && envelope.ObjectID == objectID &&
+		len(envelope.Nonce) == chacha20poly1305.NonceSizeX && len(envelope.Ciphertext) > 0 && len(envelope.Ciphertext) <= maxContentKeyBytes
 }
 
 func hasFileAncestor(paths map[string]struct{}) bool {

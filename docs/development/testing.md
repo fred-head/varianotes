@@ -10,6 +10,9 @@ for every small change.
 
 The authoritative targets are in [`../../Makefile`](../../Makefile),
 `frontend/package.json`, and [CI](../../.github/workflows/ci.yml).
+The Makefile directs both Go build temporaries and `testing.T.TempDir()` data
+to its persistent cache directory. Set `TMPDIR` to a persistent location when
+running Go tests directly instead of through Make.
 
 | Change | Focused validation | Broader check when warranted |
 | --- | --- | --- |

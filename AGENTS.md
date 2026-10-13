@@ -49,7 +49,10 @@ for dependency work.
 For Go development, tests, vet, and security scans, use the persistent caches
 `GOCACHE=/home/fredmin/.cache/go-build`,
 `GOMODCACHE=/home/fredmin/go/pkg/mod`, and
-`GOTMPDIR=/home/fredmin/.cache/varianotes/go-tmp`. Do not put large Go caches in
+`GOTMPDIR=/home/fredmin/.cache/varianotes/go-tmp`. Also set
+`TMPDIR=/home/fredmin/.cache/varianotes/go-tmp`: Go's `testing.T.TempDir()` uses
+`TMPDIR`, not `GOTMPDIR`. The Makefile exports both temporary-directory
+variables for its Go targets. Do not put large Go caches or test data in
 RAM-backed `/tmp`.
 
 ## Validation

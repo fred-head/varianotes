@@ -3,10 +3,12 @@
 GOCACHE ?= $(HOME)/.cache/go-build
 GOMODCACHE ?= $(HOME)/go/pkg/mod
 GOTMPDIR ?= $(HOME)/.cache/varianotes/go-tmp
+TMPDIR ?= $(GOTMPDIR)
 
 export GOCACHE
 export GOMODCACHE
 export GOTMPDIR
+export TMPDIR
 
 build:
 	docker compose build

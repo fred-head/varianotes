@@ -93,10 +93,20 @@ func newHandlerWithKeyManager(logger *slog.Logger, repositoryRoot string, authSe
 	}
 	var activeMu sync.RWMutex
 	var notebookSwitchMu sync.Mutex
+	noteRecord := activeRecord
+	if noteRecord.ID == "" && repository.Configured() {
+		noteRecord = notebookRecord{ID: "local", LocalPath: repositoryRoot}
+	}
+	activeNoteAccess := newProtectedNoteAccess(repository, metadataPath, noteRecord)
 	currentRepository := func() *files.Repository {
 		activeMu.RLock()
 		defer activeMu.RUnlock()
 		return repository
+	}
+	currentContentContext := func() (*files.Repository, *protectedNoteAccess) {
+		activeMu.RLock()
+		defer activeMu.RUnlock()
+		return repository, activeNoteAccess
 	}
 	currentNotebookName := func() string {
 		activeMu.RLock()
@@ -844,12 +854,14 @@ func newHandlerWithKeyManager(logger *slog.Logger, repositoryRoot string, authSe
 			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "notebook files are unavailable"})
 			return
 		}
+		nextNoteAccess := newProtectedNoteAccess(nextRepository, metadataPath, record)
 		if err := setActiveNotebook(metadataPath, record.ID); err != nil {
 			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "notebook could not be activated"})
 			return
 		}
 		activeMu.Lock()
 		repository = nextRepository
+		activeNoteAccess = nextNoteAccess
 		activeRecord = record
 		activeNotebookName = record.Name
 		activeMu.Unlock()
@@ -925,6 +937,9 @@ func newHandlerWithKeyManager(logger *slog.Logger, repositoryRoot string, authSe
 		repository, err := files.NewRepository(record.LocalPath)
 		if err != nil {
 			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "notebook files are unavailable"})
+			return
+		}
+		if rejectUnimplementedProtectedOperation(w, newProtectedNoteAccess(repository, metadataPath, record)) {
 			return
 		}
 		if err := repository.ValidateArchive(); err != nil {
@@ -1011,14 +1026,45 @@ func newHandlerWithKeyManager(logger *slog.Logger, repositoryRoot string, authSe
 			emptyRepository, _ := files.NewRepository("")
 			activeMu.Lock()
 			repository = emptyRepository
+			activeNoteAccess = nil
 			activeRecord = notebookRecord{}
 			activeNotebookName = "Notebooks"
 			activeMu.Unlock()
 		}
 		w.WriteHeader(http.StatusNoContent)
 	})
-	mux.HandleFunc("GET /api/repository/tree", func(w http.ResponseWriter, _ *http.Request) {
-		tree, err := currentRepository().Tree()
+	mux.HandleFunc("GET /api/repository/tree", func(w http.ResponseWriter, r *http.Request) {
+		repository, noteAccess := currentContentContext()
+		lease, encrypted := beginProtectedNoteLease(w, r, noteAccess, sessions, keyManager)
+		if encrypted {
+			if lease == nil {
+				return
+			}
+			var catalog encryption.Catalog
+			if err := lease.UseKey(func(key []byte) error {
+				var loadErr error
+				catalog, loadErr = noteAccess.catalogForKey(key)
+				return loadErr
+			}); err != nil {
+				lease.Close()
+				writeProtectedNoteError(w, err)
+				return
+			}
+			err := lease.Commit(func() error {
+				tree, treeErr := repository.TreeWithCatalog(catalog)
+				if treeErr != nil {
+					return treeErr
+				}
+				w.Header().Set("Cache-Control", "no-store, private")
+				writeJSON(w, http.StatusOK, map[string]any{"entries": tree})
+				return nil
+			})
+			if err != nil {
+				writeProtectedNoteError(w, err)
+			}
+			return
+		}
+		tree, err := repository.Tree()
 		if err != nil {
 			writeRepositoryError(w, err)
 			return
@@ -1026,7 +1072,11 @@ func newHandlerWithKeyManager(logger *slog.Logger, repositoryRoot string, authSe
 		writeJSON(w, http.StatusOK, map[string]any{"entries": tree})
 	})
 	mux.HandleFunc("GET /api/repository/search", func(w http.ResponseWriter, r *http.Request) {
-		results, err := currentRepository().Search(r.URL.Query().Get("q"))
+		repository, noteAccess := currentContentContext()
+		if rejectUnimplementedProtectedOperation(w, noteAccess) {
+			return
+		}
+		results, err := repository.Search(r.URL.Query().Get("q"))
 		if err != nil {
 			writeRepositoryError(w, err)
 			return
@@ -1035,7 +1085,37 @@ func newHandlerWithKeyManager(logger *slog.Logger, repositoryRoot string, authSe
 	})
 	mux.HandleFunc("GET /api/repository/file", func(w http.ResponseWriter, r *http.Request) {
 		filePath := r.URL.Query().Get("path")
-		markdown, err := currentRepository().ReadMarkdown(filePath)
+		repository, noteAccess := currentContentContext()
+		lease, encrypted := beginProtectedNoteLease(w, r, noteAccess, sessions, keyManager)
+		if encrypted {
+			if lease == nil {
+				return
+			}
+			var markdown files.Markdown
+			if err := lease.UseKey(func(key []byte) error {
+				catalog, loadErr := noteAccess.catalogForKey(key)
+				if loadErr != nil {
+					return loadErr
+				}
+				var readErr error
+				markdown, _, readErr = repository.ReadMarkdownWithCatalog(filePath, catalog, key)
+				return readErr
+			}); err != nil {
+				lease.Close()
+				writeProtectedNoteError(w, err)
+				return
+			}
+			err := lease.Commit(func() error {
+				w.Header().Set("Cache-Control", "no-store, private")
+				writeJSON(w, http.StatusOK, map[string]string{"path": filePath, "content": markdown.Content, "version": markdown.Version})
+				return nil
+			})
+			if err != nil {
+				writeProtectedNoteError(w, err)
+			}
+			return
+		}
+		markdown, err := repository.ReadMarkdown(filePath)
 		if err != nil {
 			writeRepositoryError(w, err)
 			return
@@ -1055,7 +1135,41 @@ func newHandlerWithKeyManager(logger *slog.Logger, repositoryRoot string, authSe
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid save request"})
 			return
 		}
-		markdown, err := currentRepository().WriteMarkdown(filePath, input.Content, input.Version)
+		repository, noteAccess := currentContentContext()
+		lease, encrypted := beginProtectedNoteLease(w, r, noteAccess, sessions, keyManager)
+		if encrypted {
+			if lease == nil {
+				return
+			}
+			var operation *files.PreparedMarkdownOperation
+			if err := lease.UseKey(func(key []byte) error {
+				catalog, loadErr := noteAccess.catalogForKey(key)
+				if loadErr != nil {
+					return loadErr
+				}
+				var prepareErr error
+				operation, _, prepareErr = repository.PrepareMarkdownWriteWithCatalog(filePath, input.Content, input.Version, catalog, key, noteAccess.store, noteAccess.journal)
+				return prepareErr
+			}); err != nil {
+				lease.Close()
+				writeProtectedNoteError(w, err)
+				return
+			}
+			err := lease.Commit(func() error {
+				return operation.Commit(func(markdown files.Markdown) error {
+					w.Header().Set("Cache-Control", "no-store, private")
+					writeJSON(w, http.StatusOK, map[string]string{"path": filePath, "content": markdown.Content, "version": markdown.Version})
+					return nil
+				})
+			})
+			if err != nil {
+				operation.Abort()
+				noteAccess.needsRecovery()
+				writeProtectedNoteError(w, err)
+			}
+			return
+		}
+		markdown, err := repository.WriteMarkdown(filePath, input.Content, input.Version)
 		if err != nil {
 			writeRepositoryError(w, err)
 			return
@@ -1071,7 +1185,41 @@ func newHandlerWithKeyManager(logger *slog.Logger, repositoryRoot string, authSe
 		if !decodeJSON(w, r, &input) {
 			return
 		}
-		markdown, err := currentRepository().WriteMarkdown(input.Path, input.Content, input.ExpectedVersion)
+		repository, noteAccess := currentContentContext()
+		lease, encrypted := beginProtectedNoteLease(w, r, noteAccess, sessions, keyManager)
+		if encrypted {
+			if lease == nil {
+				return
+			}
+			var operation *files.PreparedMarkdownOperation
+			if err := lease.UseKey(func(key []byte) error {
+				catalog, loadErr := noteAccess.catalogForKey(key)
+				if loadErr != nil {
+					return loadErr
+				}
+				var prepareErr error
+				operation, _, prepareErr = repository.PrepareMarkdownWriteWithCatalog(input.Path, input.Content, input.ExpectedVersion, catalog, key, noteAccess.store, noteAccess.journal)
+				return prepareErr
+			}); err != nil {
+				lease.Close()
+				writeProtectedNoteError(w, err)
+				return
+			}
+			err := lease.Commit(func() error {
+				return operation.Commit(func(markdown files.Markdown) error {
+					w.Header().Set("Cache-Control", "no-store, private")
+					writeJSON(w, http.StatusOK, map[string]string{"path": input.Path, "content": markdown.Content, "version": markdown.Version})
+					return nil
+				})
+			})
+			if err != nil {
+				operation.Abort()
+				noteAccess.needsRecovery()
+				writeProtectedNoteError(w, err)
+			}
+			return
+		}
+		markdown, err := repository.WriteMarkdown(input.Path, input.Content, input.ExpectedVersion)
 		if err != nil {
 			writeRepositoryError(w, err)
 			return
@@ -1086,7 +1234,43 @@ func newHandlerWithKeyManager(logger *slog.Logger, repositoryRoot string, authSe
 		if !decodeJSON(w, r, &input) {
 			return
 		}
-		if err := currentRepository().Create(input.Path, input.Type); err != nil {
+		repository, noteAccess := currentContentContext()
+		if input.Type == "file" {
+			lease, encrypted := beginProtectedNoteLease(w, r, noteAccess, sessions, keyManager)
+			if encrypted {
+				if lease == nil {
+					return
+				}
+				var operation *files.PreparedMarkdownOperation
+				if err := lease.UseKey(func(key []byte) error {
+					catalog, loadErr := noteAccess.catalogForKey(key)
+					if loadErr != nil {
+						return loadErr
+					}
+					var prepareErr error
+					operation, _, prepareErr = repository.PrepareMarkdownCreateWithCatalog(input.Path, catalog, key, noteAccess.store, noteAccess.journal)
+					return prepareErr
+				}); err != nil {
+					lease.Close()
+					writeProtectedNoteError(w, err)
+					return
+				}
+				err := lease.Commit(func() error {
+					return operation.Commit(func(files.Markdown) error {
+						w.Header().Set("Cache-Control", "no-store, private")
+						writeJSON(w, http.StatusCreated, map[string]string{"path": input.Path, "type": input.Type})
+						return nil
+					})
+				})
+				if err != nil {
+					operation.Abort()
+					noteAccess.needsRecovery()
+					writeProtectedNoteError(w, err)
+				}
+				return
+			}
+		}
+		if err := repository.Create(input.Path, input.Type); err != nil {
 			writeRepositoryError(w, err)
 			return
 		}
@@ -1099,6 +1283,9 @@ func newHandlerWithKeyManager(logger *slog.Logger, repositoryRoot string, authSe
 			RewriteToken string `json:"rewriteToken"`
 		}
 		if !decodeJSON(w, r, &input) {
+			return
+		}
+		if _, noteAccess := currentContentContext(); rejectUnimplementedProtectedOperation(w, noteAccess) {
 			return
 		}
 		if input.RewriteToken == "" {
@@ -1139,6 +1326,9 @@ func newHandlerWithKeyManager(logger *slog.Logger, repositoryRoot string, authSe
 		if !decodeJSON(w, r, &input) {
 			return
 		}
+		if _, noteAccess := currentContentContext(); rejectUnimplementedProtectedOperation(w, noteAccess) {
+			return
+		}
 		preview, err := currentRepository().PreviewMoveLinks(input.Source, input.Target)
 		if err != nil {
 			writeRepositoryError(w, err)
@@ -1147,6 +1337,9 @@ func newHandlerWithKeyManager(logger *slog.Logger, repositoryRoot string, authSe
 		writeJSON(w, http.StatusOK, preview)
 	})
 	mux.HandleFunc("GET /api/repository/links", func(w http.ResponseWriter, r *http.Request) {
+		if _, noteAccess := currentContentContext(); rejectUnimplementedProtectedOperation(w, noteAccess) {
+			return
+		}
 		links, err := currentRepository().NoteLinks(r.URL.Query().Get("path"))
 		if err != nil {
 			writeRepositoryError(w, err)
@@ -1155,6 +1348,9 @@ func newHandlerWithKeyManager(logger *slog.Logger, repositoryRoot string, authSe
 		writeJSON(w, http.StatusOK, map[string]any{"links": links})
 	})
 	mux.HandleFunc("DELETE /api/repository/entry", func(w http.ResponseWriter, r *http.Request) {
+		if _, noteAccess := currentContentContext(); rejectUnimplementedProtectedOperation(w, noteAccess) {
+			return
+		}
 		item, err := currentRepository().MoveToTrash(r.URL.Query().Get("path"))
 		if err != nil {
 			writeRepositoryError(w, err)
@@ -1166,6 +1362,9 @@ func newHandlerWithKeyManager(logger *slog.Logger, repositoryRoot string, authSe
 		writeJSON(w, http.StatusOK, item)
 	})
 	mux.HandleFunc("GET /api/repository/trash", func(w http.ResponseWriter, _ *http.Request) {
+		if _, noteAccess := currentContentContext(); rejectUnimplementedProtectedOperation(w, noteAccess) {
+			return
+		}
 		items, err := currentRepository().TrashItems()
 		if err != nil {
 			writeRepositoryError(w, err)
@@ -1174,6 +1373,9 @@ func newHandlerWithKeyManager(logger *slog.Logger, repositoryRoot string, authSe
 		writeJSON(w, http.StatusOK, map[string]any{"items": items})
 	})
 	mux.HandleFunc("POST /api/repository/trash/{trashID}/restore", func(w http.ResponseWriter, r *http.Request) {
+		if _, noteAccess := currentContentContext(); rejectUnimplementedProtectedOperation(w, noteAccess) {
+			return
+		}
 		item, err := currentRepository().RestoreTrashItem(r.PathValue("trashID"))
 		if err != nil {
 			writeRepositoryError(w, err)
@@ -1182,6 +1384,9 @@ func newHandlerWithKeyManager(logger *slog.Logger, repositoryRoot string, authSe
 		writeJSON(w, http.StatusOK, item)
 	})
 	mux.HandleFunc("DELETE /api/repository/trash/{trashID}", func(w http.ResponseWriter, r *http.Request) {
+		if _, noteAccess := currentContentContext(); rejectUnimplementedProtectedOperation(w, noteAccess) {
+			return
+		}
 		item, err := currentRepository().DeleteTrashItem(r.PathValue("trashID"))
 		if err != nil {
 			writeRepositoryError(w, err)
@@ -1190,6 +1395,9 @@ func newHandlerWithKeyManager(logger *slog.Logger, repositoryRoot string, authSe
 		writeJSON(w, http.StatusOK, item)
 	})
 	mux.HandleFunc("POST /api/repository/assets", func(w http.ResponseWriter, r *http.Request) {
+		if _, noteAccess := currentContentContext(); rejectUnimplementedProtectedOperation(w, noteAccess) {
+			return
+		}
 		r.Body = http.MaxBytesReader(w, r.Body, maxAssetRequestBodySize)
 		// #nosec G120 -- MaxBytesReader enforces the complete multipart request limit before parsing.
 		if err := r.ParseMultipartForm(maxAssetRequestBodySize); err != nil {
@@ -1213,6 +1421,9 @@ func newHandlerWithKeyManager(logger *slog.Logger, repositoryRoot string, authSe
 		writeJSON(w, http.StatusCreated, map[string]string{"path": asset.RelativePath})
 	})
 	mux.HandleFunc("GET /api/repository/asset", func(w http.ResponseWriter, r *http.Request) {
+		if _, noteAccess := currentContentContext(); rejectUnimplementedProtectedOperation(w, noteAccess) {
+			return
+		}
 		asset, err := currentRepository().ReadAsset(r.URL.Query().Get("note"), r.URL.Query().Get("path"))
 		if err != nil {
 			writeRepositoryError(w, err)
@@ -1225,6 +1436,9 @@ func newHandlerWithKeyManager(logger *slog.Logger, repositoryRoot string, authSe
 		_, _ = w.Write(asset.Content)
 	})
 	mux.HandleFunc("GET /api/repository/image-presentations", func(w http.ResponseWriter, r *http.Request) {
+		if _, noteAccess := currentContentContext(); rejectUnimplementedProtectedOperation(w, noteAccess) {
+			return
+		}
 		note := r.URL.Query().Get("note")
 		if _, err := currentRepository().ReadMarkdown(note); err != nil {
 			writeRepositoryError(w, err)
@@ -1246,6 +1460,9 @@ func newHandlerWithKeyManager(logger *slog.Logger, repositoryRoot string, authSe
 			PreviousImage string                `json:"previousImage"`
 		}
 		if !decodeJSON(w, r, &input) {
+			return
+		}
+		if _, noteAccess := currentContentContext(); rejectUnimplementedProtectedOperation(w, noteAccess) {
 			return
 		}
 		if !input.Size.valid() {
@@ -1270,6 +1487,9 @@ func newHandlerWithKeyManager(logger *slog.Logger, repositoryRoot string, authSe
 		writeJSON(w, http.StatusOK, map[string]string{"image": input.Image, "size": string(input.Size)})
 	})
 	mux.HandleFunc("DELETE /api/repository/image-presentation", func(w http.ResponseWriter, r *http.Request) {
+		if _, noteAccess := currentContentContext(); rejectUnimplementedProtectedOperation(w, noteAccess) {
+			return
+		}
 		note, image := r.URL.Query().Get("note"), r.URL.Query().Get("image")
 		if _, err := currentRepository().ReadAsset(note, image); err != nil {
 			writeRepositoryError(w, err)
@@ -1283,6 +1503,9 @@ func newHandlerWithKeyManager(logger *slog.Logger, repositoryRoot string, authSe
 		w.WriteHeader(http.StatusNoContent)
 	})
 	mux.HandleFunc("GET /api/repository/assets/unreferenced", func(w http.ResponseWriter, _ *http.Request) {
+		if _, noteAccess := currentContentContext(); rejectUnimplementedProtectedOperation(w, noteAccess) {
+			return
+		}
 		assets, err := currentRepository().UnreferencedAssets()
 		if err != nil {
 			writeRepositoryError(w, err)
@@ -1295,6 +1518,9 @@ func newHandlerWithKeyManager(logger *slog.Logger, repositoryRoot string, authSe
 			Paths []string `json:"paths"`
 		}
 		if !decodeJSON(w, r, &input) {
+			return
+		}
+		if _, noteAccess := currentContentContext(); rejectUnimplementedProtectedOperation(w, noteAccess) {
 			return
 		}
 		result, err := currentRepository().DeleteUnreferencedAssets(input.Paths)
@@ -1335,6 +1561,7 @@ func newHandlerWithKeyManager(logger *slog.Logger, repositoryRoot string, authSe
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "vault folder could not be opened"})
 			return
 		}
+		createdNoteAccess := newProtectedNoteAccess(createdRepository, metadataPath, record)
 		if err := registerActiveNotebook(metadataPath, record); err != nil {
 			removeManagedNotebookDirectory(notebookBase, id, localPath)
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "vault could not be registered"})
@@ -1342,6 +1569,7 @@ func newHandlerWithKeyManager(logger *slog.Logger, repositoryRoot string, authSe
 		}
 		activeMu.Lock()
 		repository = createdRepository
+		activeNoteAccess = createdNoteAccess
 		activeRecord = record
 		activeNotebookName = record.Name
 		activeMu.Unlock()
@@ -1395,12 +1623,14 @@ func newHandlerWithKeyManager(logger *slog.Logger, repositoryRoot string, authSe
 			return
 		}
 		record := notebookRecord{ID: id, Name: input.Name, LocalPath: localPath}
+		vaultNoteAccess := newProtectedNoteAccess(repositoryForVault, metadataPath, record)
 		if err := registerActiveNotebook(metadataPath, record); err != nil {
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "vault could not be registered"})
 			return
 		}
 		activeMu.Lock()
 		repository = repositoryForVault
+		activeNoteAccess = vaultNoteAccess
 		activeRecord = record
 		activeNotebookName = record.Name
 		activeMu.Unlock()

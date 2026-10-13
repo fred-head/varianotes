@@ -15,9 +15,13 @@ history. For behavior and deployment, see [README](../README.md).
   browser draft and current server file for an explicit decision.
 - `internal/files/content.go` is the shared boundary for ordinary file reads
   and version-checked atomic replacements. It enforces root confinement, size
-  limits, and coordination with repository mutations. Markdown and asset reads
-  and writes, note operations, link rewrites, search, Trash, and ZIP export all
-  route through this layer. Later M31 steps will add encrypted storage there.
+  limits, and coordination with repository mutations. `internal/files/protected.go`
+  adds policy-aware Markdown operations: protected notes use catalog logical
+  paths, ciphertext-backed versions, and the transaction journal; ordinary
+  notes retain atomic version checks. Protected responses are published through
+  per-session key leases so a completed lock hides late results. Operations not
+  yet implemented for encryption, including search, assets, moves, Trash, and
+  ZIP export, fail closed for encrypted vaults.
 - `internal/encryption/` contains the versioned age and key-envelope primitives
   from M31P03, the authenticated durable catalog from M31P04, the volatile
   per-vault key manager from M31P05, the transaction journal from M31P06, and
@@ -42,11 +46,10 @@ history. For behavior and deployment, see [README](../README.md).
   password leaves envelopes untouched and marks the encryption password
   separate from later login changes. Disabling authentication checks all
   registered vaults and remains blocked while encryption metadata or
-  ciphertext exists, including in Trash. The key manager's lock, activity, and
-  lock-event routes do not unlock vaults or serve protected content. Key
-  envelopes, catalog, key manager, and transaction journal are not wired into
-  vault content operations;
-  encryption stays inactive until the M31 release gate passes.
+  ciphertext exists, including in Trash. Protected note reads, creates, saves,
+  and conflict checks now use the key manager, authenticated catalog, and
+  transaction journal. There is still no user-facing unlock or activation path;
+  encryption remains gated until all M31 steps and the release review pass.
 - Multiple named vaults on one server are registered in application metadata.
   The registry stores IDs, display names, and filesystem paths. It is not a
   copy of note or asset content.

@@ -1061,11 +1061,18 @@ func validateTransactionBindings(changes []CiphertextChange, catalog Catalog) er
 			}
 			continue
 		}
-		if !exists || !object.Protected || object.ObjectID != change.ObjectID || object.CiphertextHash != transactionDigest(change.Ciphertext) {
+		if !exists || !object.Protected || object.ObjectID != change.ObjectID || object.CiphertextHash != transactionDigest(change.Ciphertext) || !equalContentKeyEnvelope(object.ContentKeyEnvelope, &change.ContentKeyEnvelope) {
 			return ErrInvalidTransaction
 		}
 	}
 	return nil
+}
+
+func equalContentKeyEnvelope(first, second *ContentKeyEnvelope) bool {
+	if first == nil || second == nil || first.Version != second.Version || first.ObjectID != second.ObjectID {
+		return false
+	}
+	return bytes.Equal(first.Nonce, second.Nonce) && bytes.Equal(first.Ciphertext, second.Ciphertext)
 }
 
 func isTransactionContentPath(value string) bool {

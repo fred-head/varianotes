@@ -8,6 +8,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- Added M31P09 policy-aware protected Markdown reads, first-write encrypted
+  note creation, and journaled saves with ciphertext-backed conflict versions.
+  The wrapped per-file age key is stored in the authenticated catalog. Locked
+  and corrupt content fails closed; M31 activation remains gated.
 - Added one-time, 256-bit vault-key recovery codes with confirmation before
   activation and journaled multi-vault password recovery. Successful recovery
   rotates the code and vault-key envelopes, changes the local password, revokes
@@ -23,7 +27,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Added the volatile M31 key manager with per-session unlock grants, a
   15-minute inactivity lock, explicit activity tracking, generation-checked
   response leases, manual/logout locking, and session-scoped lock events.
-  No unlock or protected-content API is enabled; M31 remains gated.
+  User-facing unlock and activation remain unavailable while M31 is gated.
 - Added versioned, authenticated encryption catalogs with durable recursive
   folder rules, object-bound ciphertext digests, and fail-closed metadata
   loading. Encryption remains inactive pending the M31 release gate.
