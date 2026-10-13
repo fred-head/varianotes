@@ -125,6 +125,7 @@ func newHandlerWithKeyManager(logger *slog.Logger, repositoryRoot string, authSe
 	presentationStore := newImagePresentationStore(metadataPath)
 
 	mux := http.NewServeMux()
+	exportGrants := newExportGrantStore()
 	beginCredentialAttempt := func(w http.ResponseWriter, r *http.Request, operation string) (netip.Addr, func(), bool) {
 		clientIP := requestIdentity.ClientIP(r)
 		errorMessage := "too many authentication attempts"
@@ -926,39 +927,13 @@ func newHandlerWithKeyManager(logger *slog.Logger, repositoryRoot string, authSe
 		writeJSON(w, http.StatusOK, map[string]any{"localFiles": map[string]string{"state": localState, "message": localMessage}, "writeAccess": map[string]string{"state": writeState, "message": writeMessage}})
 	})
 	mux.HandleFunc("GET /api/notebooks/{notebookID}/export", func(w http.ResponseWriter, r *http.Request) {
-		record, err := findNotebook(metadataPath, r.PathValue("notebookID"))
-		if err != nil {
-			if errors.Is(err, os.ErrNotExist) {
-				writeJSON(w, http.StatusNotFound, map[string]string{"error": "notebook not found"})
-			} else {
-				writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "notebook could not be exported"})
-			}
-			return
-		}
-		repository, err := files.NewRepository(record.LocalPath)
-		if err != nil {
-			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "notebook files are unavailable"})
-			return
-		}
-		if rejectUnimplementedProtectedOperation(w, newProtectedNoteAccess(repository, metadataPath, record)) {
-			return
-		}
-		if err := repository.ValidateArchive(); err != nil {
-			if errors.Is(err, files.ErrExportTooLarge) || errors.Is(err, files.ErrExportTooManyEntries) {
-				writeJSON(w, http.StatusRequestEntityTooLarge, map[string]string{"error": "vault is too large to export in one archive"})
-			} else {
-				writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "vault could not be inspected for export"})
-			}
-			return
-		}
-		filename := strings.TrimSpace(record.Name) + ".zip"
-		w.Header().Set("Content-Type", "application/zip")
-		w.Header().Set("Content-Disposition", mime.FormatMediaType("attachment", map[string]string{"filename": filename}))
-		w.Header().Set("Cache-Control", "no-store")
-		w.Header().Set("X-Content-Type-Options", "nosniff")
-		if err := repository.WriteArchive(w); err != nil {
-			logger.Warn("notebook export stream failed", "notebook", record.ID, "error", err)
-		}
+		handleNotebookExport(w, r, logger, metadataPath, sessions, keyManager, exportGrants, false)
+	})
+	mux.HandleFunc("POST /api/notebooks/{notebookID}/export/reauth", func(w http.ResponseWriter, r *http.Request) {
+		handleNotebookExportReauthentication(w, r, metadataPath, sessions, keyManager, exportGrants)
+	})
+	mux.HandleFunc("POST /api/notebooks/{notebookID}/export", func(w http.ResponseWriter, r *http.Request) {
+		handleNotebookExport(w, r, logger, metadataPath, sessions, keyManager, exportGrants, true)
 	})
 	mux.HandleFunc("DELETE /api/notebooks/{notebookID}", func(w http.ResponseWriter, r *http.Request) {
 		notebookID := r.PathValue("notebookID")

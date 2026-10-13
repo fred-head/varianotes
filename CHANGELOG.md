@@ -8,6 +8,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- Added M31P15 reauthenticated plaintext ZIP export for protected vaults.
+  Exports use logical paths, validate the full archive before streaming, bind
+  a one-use grant to the session and lock generation, and reject changed
+  snapshots. Protected exports warn that the ZIP and earlier backups may
+  contain plaintext; no server-side plaintext ZIP is staged.
 - Added M31P14 search over protected notes only while a valid session key lease
   is active. Search requests avoid putting query text in URLs, results use
   `no-store`, and the browser drops results and ignores late responses after a

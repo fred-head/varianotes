@@ -208,6 +208,56 @@ type KeyLease struct {
 	mu         sync.Mutex
 }
 
+// Generation identifies the lock epoch captured by this lease. It contains no
+// key material and is useful only together with the vault and session binding.
+func (l *KeyLease) Generation() uint64 {
+	if l == nil {
+		return 0
+	}
+	return l.generation
+}
+
+// GenerationCurrent reports whether a session still has a grant from the
+// supplied lock epoch. Callers may retain this non-secret binding without
+// retaining a copied vault key between requests.
+func (m *KeyManager) GenerationCurrent(vaultID string, sessionID []byte, generation uint64) bool {
+	if m == nil || !validVaultID(vaultID) || generation == 0 {
+		return false
+	}
+	session, ok := sessionKey(sessionID)
+	if !ok {
+		return false
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.closed {
+		return false
+	}
+	m.expireLocked(time.Now())
+	state := m.vaults[vaultID]
+	if state == nil || len(state.key) != VaultKeySize || state.generation != generation {
+		return false
+	}
+	grant, ok := state.grants[session]
+	return ok && grant.generation == generation
+}
+
+// CheckCurrent reports whether this lease still belongs to the active session
+// grant. Long running streams should call it between bounded chunks so a lock
+// or logout stops further publication.
+func (l *KeyLease) CheckCurrent() error {
+	if l == nil || l.manager == nil {
+		return ErrVaultLocked
+	}
+	l.mu.Lock()
+	closed := l.closed
+	l.mu.Unlock()
+	if closed || !l.manager.leaseCurrent(l) {
+		return ErrVaultLocked
+	}
+	return nil
+}
+
 func (l *KeyLease) UseKey(work func([]byte) error) error {
 	if l == nil || work == nil || l.manager == nil {
 		return ErrVaultLocked

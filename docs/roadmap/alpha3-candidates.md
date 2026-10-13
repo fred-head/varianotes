@@ -245,8 +245,8 @@ Completion criteria:
 
 ## Milestone 31 - Selective encryption for notes and folders
 
-M31 remains in Alpha 3. This checklist is the implementation plan. **P01–P14
-are complete; P15–P18 remain open.** M31 is not complete until P01–P18 are
+M31 remains in Alpha 3. This checklist is the implementation plan. **P01–P15
+are complete; P16–P18 remain open.** M31 is not complete until P01–P18 are
 complete and the independent security review in P17 has passed. Encryption
 activation must stay disabled in the UI, API, and any operator command until
 the P18 release gate passes.
@@ -537,7 +537,7 @@ requires its listed tests; P17 adds end-to-end and adversarial coverage.
   request logs. Browser storage and the protected API cache policy are covered
   by focused tests. No claim of physical memory erasure is made.
 
-- [ ] **P15 — Reauthenticated plaintext ZIP export**
+- [x] **P15 — Reauthenticated plaintext ZIP export**
   *(dependencies: P05, P06, P09–P14; size: L)*
   **Goal/scope:** snapshot export contents, re-prompt for current password if any
   protected note or shared attachment is included, then stream logical plaintext
@@ -546,6 +546,24 @@ requires its listed tests; P17 adds end-to-end and adversarial coverage.
   never does; concurrent mutations cannot bypass reauthentication; corrupt files
   fail before streaming; no server-side plaintext ZIP staging; keyfiles/journals
   are excluded; lock/logout invalidates the one-use grant.
+  Implemented authenticated archive snapshots for ordinary and protected notes
+  and attachments. Protected ZIP entries use logical paths; ciphertext,
+  catalog bindings, shared attachments, size bounds, and plain-file content
+  fingerprints are checked before streaming. Export reauthentication decrypts
+  the current vault-key envelope, verifies it matches the active session lease,
+  and issues a two-minute one-use token bound to that session and lock
+  generation. Consumption rechecks the complete archive snapshot; lock,
+  logout, session renewal, and token replay invalidate the grant. Unknown
+  ciphertext and plaintext attachments referenced by protected notes fail
+  closed. No plaintext ZIP is written to server disk; application metadata,
+  Trash, legacy Git data, and journal staging files are excluded.
+  Focused Go tests cover protected notes and shared attachments, logical ZIP
+  paths, wrong passwords, corrupt ciphertext before output, snapshot changes,
+  one-use replay, lock/logout, and ordinary exports. The focused frontend test,
+  ESLint, TypeScript check, and `go vet` passed. A protected export requires a
+  currently unlocked session; P16 supplies the lock and unlock UI. A lock stops
+  an active stream at its next bounded read, but cannot retract bytes already
+  sent. Exported ZIPs and earlier backups remain plaintext by design.
 
 - [ ] **P16 — Protection, lock, recovery, and export UI**
   *(dependencies: P05, P07–P15; size: M)*
