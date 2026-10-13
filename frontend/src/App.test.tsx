@@ -572,6 +572,58 @@ describe('Trash bulk actions', () => {
     await waitFor(() => expect(fetchMock.mock.calls.some(([, init]) => init?.method === 'POST' && JSON.parse(String(init.body)).protectionChoice === 'decrypt')).toBe(true))
   })
 
+  it('reauthenticates before downloading a protected plaintext ZIP and shows the export warning', async () => {
+    const fetchMock = vi.mocked(globalThis.fetch)
+    const fallback = fetchMock.getMockImplementation()!
+    fetchMock.mockImplementation(async (input, init) => {
+      const url = String(input)
+      if (url === '/api/notebooks/personal/health') return Response.json({ localFiles: { state: 'ok' }, writeAccess: { state: 'ok' } })
+      if (url === '/api/notebooks/personal/export' && !init?.method) return Response.json({ code: 'export_reauthentication_required' }, { status: 428 })
+      if (url === '/api/notebooks/personal/export/reauth' && init?.method === 'POST') return Response.json({ token: 'one-use-export-token' })
+      if (url === '/api/notebooks/personal/export' && init?.method === 'POST') return new Response('zip bytes', { status: 200, headers: { 'Content-Type': 'application/zip' } })
+      return fallback(input, init)
+    })
+    const createDescriptor = Object.getOwnPropertyDescriptor(URL, 'createObjectURL')
+    const revokeDescriptor = Object.getOwnPropertyDescriptor(URL, 'revokeObjectURL')
+    Object.defineProperty(URL, 'createObjectURL', { configurable: true, value: vi.fn(() => 'blob:protected-export') })
+    Object.defineProperty(URL, 'revokeObjectURL', { configurable: true, value: vi.fn() })
+
+    const view = render(<App />)
+    const switcher = view.container.querySelector('[aria-haspopup="menu"]') as HTMLButtonElement
+    await waitFor(() => expect(switcher).toBeTruthy())
+    fireEvent.click(switcher)
+    fireEvent.click(view.getByRole('menuitem', { name: 'Manage Vaults' }))
+    const card = (await view.findByRole('heading', { name: 'Personal Notes' })).closest('section') as HTMLElement
+    fireEvent.click(within(card).getByRole('button', { name: 'Export ZIP' }))
+
+    const dialog = await view.findByRole('dialog', { name: 'Confirm protected export' })
+    expect(dialog.textContent).toContain('This ZIP is unencrypted and contains plaintext.')
+    expect(dialog.textContent).toContain('Earlier backups may also contain plaintext copies.')
+    const password = within(dialog).getByLabelText('Vault password') as HTMLInputElement
+    fireEvent.change(password, { target: { value: 'fresh vault password sentinel' } })
+    const confirm = within(dialog).getByRole('checkbox')
+    const download = within(dialog).getByRole('button', { name: 'Export unencrypted ZIP' }) as HTMLButtonElement
+    expect(download.disabled).toBe(true)
+    fireEvent.click(confirm)
+    expect(download.disabled).toBe(false)
+    fireEvent.click(download)
+
+    await waitFor(() => expect(fetchMock.mock.calls.some(([url, init]) => String(url) === '/api/notebooks/personal/export' && init?.method === 'POST')).toBe(true))
+    const reauthCall = fetchMock.mock.calls.find(([url]) => String(url) === '/api/notebooks/personal/export/reauth')
+    const exportCall = fetchMock.mock.calls.find(([url, init]) => String(url) === '/api/notebooks/personal/export' && init?.method === 'POST')
+    expect(reauthCall && JSON.parse(String(reauthCall[1]?.body))).toEqual({ password: 'fresh vault password sentinel' })
+    expect(exportCall && JSON.parse(String(exportCall[1]?.body))).toEqual({ token: 'one-use-export-token' })
+    expect(String(reauthCall?.[0])).not.toContain('fresh vault password sentinel')
+    expect(localStorage.getItem('fresh vault password sentinel')).toBeNull()
+    expect(sessionStorage.getItem('fresh vault password sentinel')).toBeNull()
+    expect(await view.queryByRole('dialog', { name: 'Confirm protected export' })).toBeNull()
+
+    if (createDescriptor) Object.defineProperty(URL, 'createObjectURL', createDescriptor)
+    else Reflect.deleteProperty(URL, 'createObjectURL')
+    if (revokeDescriptor) Object.defineProperty(URL, 'revokeObjectURL', revokeDescriptor)
+    else Reflect.deleteProperty(URL, 'revokeObjectURL')
+  })
+
   it('selects all items and permanently deletes the complete selection', async () => {
     const items = [
       { id: '1'.repeat(32), originalPath: 'One.md', type: 'file' as const, deletedAt: '2026-08-28T10:00:00Z', size: 10 },

@@ -1778,7 +1778,7 @@ func TestAdoptVaultPreservesLegacyGitDirectoryAndExportOmitsIt(t *testing.T) {
 	}
 	archive := httptest.NewRecorder()
 	handler.ServeHTTP(archive, httptest.NewRequest(http.MethodGet, "/api/notebooks/"+record.ID+"/export", nil))
-	if archive.Code != http.StatusOK || archive.Header().Get("Cache-Control") != "no-store" {
+	if archive.Code != http.StatusOK || archive.Header().Get("Cache-Control") != "no-store, private" {
 		t.Fatalf("vault export failed or is cacheable: %d %s", archive.Code, archive.Body.String())
 	}
 	zipReader, err := zip.NewReader(bytes.NewReader(archive.Body.Bytes()), int64(archive.Body.Len()))
@@ -1987,6 +1987,9 @@ func TestEveryApplicationAPIRouteDeniesUnauthenticatedAccess(t *testing.T) {
 		{http.MethodPatch, "/api/notebooks/example"},
 		{http.MethodPatch, "/api/notebooks/example/ssh-key"},
 		{http.MethodGet, "/api/notebooks/example/health"},
+		{http.MethodGet, "/api/notebooks/example/export"},
+		{http.MethodPost, "/api/notebooks/example/export/reauth"},
+		{http.MethodPost, "/api/notebooks/example/export"},
 		{http.MethodDelete, "/api/notebooks/example"},
 		{http.MethodGet, "/api/repository/tree"},
 		{http.MethodPost, "/api/repository/search"},

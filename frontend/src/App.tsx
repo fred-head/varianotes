@@ -1210,6 +1210,9 @@ function ManageNotebooksDialog({ notebooks, activeNotebookID, operationsBlocked,
   const [removing, setRemoving] = useState<NotebookInfo>()
   const [deleteLocal, setDeleteLocal] = useState(false)
   const [confirmation, setConfirmation] = useState('')
+  const [exporting, setExporting] = useState<NotebookInfo>()
+  const [exportPassword, setExportPassword] = useState('')
+  const [exportWarningConfirmed, setExportWarningConfirmed] = useState(false)
 
   const checkHealth = useCallback(async (notebook: NotebookInfo) => {
     try {
@@ -1258,19 +1261,62 @@ function ManageNotebooksDialog({ notebooks, activeNotebookID, operationsBlocked,
     setError(undefined)
     try {
       const response = await apiFetch(`/api/notebooks/${encodeURIComponent(notebook.id)}/export`)
+      if (response.status === 428) {
+        const body = await response.json() as { code?: string }
+        if (body.code === 'export_reauthentication_required') {
+          setExporting(notebook)
+          setExportPassword('')
+          setExportWarningConfirmed(false)
+          return
+        }
+        throw new APIError('The vault export could not be prepared.', response.status)
+      }
       if (!response.ok) await responseJSON(response)
-      const blob = await response.blob()
-      const url = URL.createObjectURL(blob)
-      const anchor = document.createElement('a')
-      anchor.href = url
-      anchor.download = `${notebook.name.replace(/[\\/:*?"<>|]/g, '_') || 'Vault'}.zip`
-      anchor.click()
-      URL.revokeObjectURL(url)
+      await downloadNotebookExport(response, notebook)
     } catch (caught) {
       setError(messageFrom(caught))
     } finally {
       setBusy(false)
     }
+  }
+
+  async function reauthenticateExport(event: FormEvent) {
+    event.preventDefault()
+    if (!exporting || !exportWarningConfirmed) return
+    setBusy(true)
+    setError(undefined)
+    try {
+      const notebook = exporting
+      const grant = await responseJSON<{ token: string }>(await apiFetch(`/api/notebooks/${encodeURIComponent(notebook.id)}/export/reauth`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ password: exportPassword }),
+      }))
+      const response = await apiFetch(`/api/notebooks/${encodeURIComponent(notebook.id)}/export`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ token: grant.token }),
+      })
+      if (!response.ok) await responseJSON(response)
+      await downloadNotebookExport(response, notebook)
+      setExporting(undefined)
+      setExportWarningConfirmed(false)
+    } catch (caught) {
+      setError(messageFrom(caught))
+    } finally {
+      setExportPassword('')
+      setBusy(false)
+    }
+  }
+
+  async function downloadNotebookExport(response: Response, notebook: NotebookInfo) {
+    const blob = await response.blob()
+    const url = URL.createObjectURL(blob)
+    const anchor = document.createElement('a')
+    anchor.href = url
+    anchor.download = `${notebook.name.replace(/[\\/:*?"<>|]/g, '_') || 'Vault'}.zip`
+    anchor.click()
+    globalThis.setTimeout(() => URL.revokeObjectURL(url), 1000)
   }
 
   return <>
@@ -1291,6 +1337,7 @@ function ManageNotebooksDialog({ notebooks, activeNotebookID, operationsBlocked,
           {notebooks.length === 0 && <p className="rounded-md border border-zinc-800 p-4 text-sm text-zinc-400">No registered vaults.</p>}
         </div>
         <footer className="flex justify-end border-t border-zinc-800 p-4"><button type="button" onClick={onClose} className="rounded-md bg-amber-500 px-4 py-2 text-sm font-medium text-zinc-950">Done</button></footer>
+        {exporting && <div role="dialog" aria-modal="true" aria-labelledby="export-protected-title" className="fixed inset-0 z-[70] flex items-center justify-center bg-black/75 p-4"><form onSubmit={(event) => void reauthenticateExport(event)} className="w-full max-w-md rounded-xl border border-zinc-700 bg-zinc-900 p-5 shadow-2xl"><h3 id="export-protected-title" className="text-lg font-semibold">Confirm protected export</h3><p className="mt-2 text-sm leading-6 text-zinc-300">Enter the current vault password again to export {exporting.name}.</p><label className="mt-4 block text-sm text-zinc-300">Vault password<input type="password" autoComplete="current-password" required maxLength={1024} value={exportPassword} onChange={(event) => setExportPassword(event.target.value)} className="mt-1.5 min-h-11 w-full rounded-md border border-zinc-700 bg-zinc-950 px-3 text-sm outline-none focus:border-amber-500"/></label><p className="mt-3 rounded border border-amber-800/70 bg-amber-950/20 p-3 text-xs leading-5 text-amber-100">This ZIP is unencrypted and contains plaintext. Earlier backups may also contain plaintext copies.</p><label className="mt-3 flex items-start gap-2 text-xs leading-5 text-zinc-300"><input type="checkbox" required checked={exportWarningConfirmed} onChange={(event) => setExportWarningConfirmed(event.target.checked)} className="mt-0.5 h-4 w-4"/>I understand this export is unencrypted and earlier backups may contain plaintext.</label>{error && <ErrorMessage>{error}</ErrorMessage>}<div className="mt-5 flex justify-end gap-2"><button type="button" disabled={busy} onClick={() => { setExporting(undefined); setExportPassword(''); setExportWarningConfirmed(false); setError(undefined) }} className="min-h-10 rounded px-3 text-xs text-zinc-300">Cancel</button><button type="submit" disabled={busy || !exportWarningConfirmed} className="min-h-10 rounded bg-amber-500 px-3 text-xs font-semibold text-zinc-950 disabled:opacity-50">{busy ? 'Preparing ZIP…' : 'Export unencrypted ZIP'}</button></div></form></div>}
       </section>
     </div>
     {removing && <div role="alertdialog" aria-modal="true" aria-labelledby="remove-vault-title" className="fixed inset-0 z-[60] flex items-center justify-center bg-black/75 p-4"><div className="w-full max-w-md rounded-lg border border-zinc-700 bg-zinc-900 p-5"><h3 id="remove-vault-title" className="font-semibold">Remove {removing.name}?</h3><p className="mt-2 text-xs leading-5 text-zinc-400">The safe default removes only the registration. Vault files remain on disk.</p><label className="mt-4 flex items-start gap-2 text-xs text-red-200"><input type="checkbox" checked={deleteLocal} onChange={(event) => { setDeleteLocal(event.target.checked); setConfirmation('') }} className="mt-0.5"/>Also permanently delete this local vault folder.</label>{deleteLocal && <><p className="mt-2 text-xs leading-5 text-amber-200">This permanently removes every file in the folder, including notes, assets, Trash, and any legacy <code>.git</code> history. Operator backups may retain copies.</p><label className="mt-3 block text-xs text-zinc-300">Type <strong>{removing.name}</strong> to confirm<input value={confirmation} onChange={(event) => setConfirmation(event.target.value)} className="mt-1 min-h-10 w-full rounded border border-red-800 bg-zinc-950 px-2"/></label></>}<div className="mt-5 flex justify-end gap-2"><button type="button" onClick={() => setRemoving(undefined)} className="min-h-10 px-3 text-xs">Cancel</button><button type="button" disabled={busy || operationsBlocked || (deleteLocal && confirmation !== removing.name)} onClick={() => void remove()} className="min-h-10 rounded border border-red-800 px-3 text-xs text-red-200">{deleteLocal ? 'Delete vault folder' : 'Remove registration'}</button></div></div></div>}
