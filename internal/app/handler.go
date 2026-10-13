@@ -1072,16 +1072,48 @@ func newHandlerWithKeyManager(logger *slog.Logger, repositoryRoot string, authSe
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"entries": tree})
 	})
-	mux.HandleFunc("GET /api/repository/search", func(w http.ResponseWriter, r *http.Request) {
-		repository, noteAccess := currentContentContext()
-		if rejectUnimplementedProtectedOperation(w, noteAccess) {
+	mux.HandleFunc("POST /api/repository/search", func(w http.ResponseWriter, r *http.Request) {
+		var input struct {
+			Query string `json:"query"`
+		}
+		if !decodeJSONWithLimit(w, r, &input, maxSearchRequestBodySize) {
 			return
 		}
-		results, err := repository.Search(r.URL.Query().Get("q"))
+		repository, noteAccess := currentContentContext()
+		lease, encrypted := beginProtectedNoteLease(w, r, noteAccess, sessions, keyManager)
+		if encrypted {
+			if lease == nil {
+				return
+			}
+			defer lease.Close()
+			var results []files.SearchResult
+			if err := lease.UseKey(func(key []byte) error {
+				catalog, loadErr := noteAccess.catalogForKey(key)
+				if loadErr != nil {
+					return loadErr
+				}
+				var searchErr error
+				results, searchErr = repository.SearchWithCatalog(input.Query, catalog, key)
+				return searchErr
+			}); err != nil {
+				writeProtectedNoteError(w, err)
+				return
+			}
+			if err := lease.Commit(func() error {
+				w.Header().Set("Cache-Control", "no-store, private")
+				writeJSON(w, http.StatusOK, map[string]any{"results": results})
+				return nil
+			}); err != nil {
+				writeProtectedNoteError(w, err)
+			}
+			return
+		}
+		results, err := repository.Search(input.Query)
 		if err != nil {
 			writeRepositoryError(w, err)
 			return
 		}
+		w.Header().Set("Cache-Control", "no-store")
 		writeJSON(w, http.StatusOK, map[string]any{"results": results})
 	})
 	mux.HandleFunc("GET /api/repository/file", func(w http.ResponseWriter, r *http.Request) {
@@ -2044,6 +2076,7 @@ func newHandlerWithKeyManager(logger *slog.Logger, repositoryRoot string, authSe
 }
 
 const maxRequestBodySize = (10 << 20) + (64 << 10)
+const maxSearchRequestBodySize = 8 << 10
 const maxAssetRequestBodySize = (10 << 20) + (1 << 20)
 const maxAuthRequestBodySize = 4 << 10
 
@@ -2133,6 +2166,8 @@ func writeRepositoryError(w http.ResponseWriter, err error) {
 		status, message = http.StatusServiceUnavailable, files.ErrMoveRollbackFailed.Error()
 	case errors.Is(err, files.ErrFileTooLarge):
 		status, message = http.StatusRequestEntityTooLarge, err.Error()
+	case errors.Is(err, files.ErrSearchQueryTooLong):
+		status, message = http.StatusBadRequest, err.Error()
 	case errors.Is(err, files.ErrAssetTooLarge):
 		status, message = http.StatusRequestEntityTooLarge, err.Error()
 	case errors.Is(err, files.ErrUnsupportedMedia):

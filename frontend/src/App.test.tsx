@@ -35,7 +35,12 @@ beforeEach(() => {
     if (url === '/api/notebooks/work/activate' && init?.method === 'POST') { active = 'work'; return Response.json({ id: 'work', name: 'Work' }) }
     if (url === '/api/notebooks/local' && init?.method === 'DELETE') { notebooks = notebooks.filter((notebook) => notebook.id !== 'local'); return new Response(null, { status: 204 }) }
     if (url === '/api/repository/tree') return Response.json({ entries: active === 'personal' ? [...(noteTrashed ? [] : [{ name: notePath, path: notePath, type: 'file' }]), { name: 'Second.md', path: 'Second.md', type: 'file' }] : [{ name: 'Work.md', path: 'Work.md', type: 'file' }] })
-    if (url === '/api/repository/search?q=auto-lock') return Response.json({ results: [{ path: 'Note.md', type: 'content', line: 1, excerpt: '# Auto-lock note' }] })
+    if (url === '/api/repository/search' && init?.method === 'POST') {
+      const body = JSON.parse(String(init.body)) as { query: string }
+      if (body.query === 'auto-lock') return Response.json({ results: [{ path: 'Note.md', type: 'content', line: 1, excerpt: '# Auto-lock note' }] })
+      if (body.query === 'search-sentinel-7e3f1') return Response.json({ results: [{ path: 'Private.md', type: 'content', line: 1, excerpt: 'search-sentinel-7e3f1 protected excerpt' }] })
+      return Response.json({ results: [] })
+    }
     if (url === '/api/repository/move/preview' && init?.method === 'POST') { const body = JSON.parse(String(init.body)); return Response.json({ source:body.source,target:body.target,token:'rewrite-token',rewrites:[{notePath:'Second.md',nextNotePath:'Second.md',line:1,before:'Note.md',after:body.target}] }) }
     if (url === '/api/repository/move' && init?.method === 'POST') { const body = JSON.parse(String(init.body)); notePath = body.target; return Response.json({ path:body.target,rewrites:[] }) }
     if (url === '/api/repository/entry?path=Note.md' && init?.method === 'DELETE') { noteTrashed = true; const item = { id: 'b'.repeat(32), originalPath: 'Note.md', type: 'file' as const, deletedAt: '2026-08-28T10:00:00Z', size: 42 }; trashItems = [item]; return Response.json(item) }
@@ -438,7 +443,63 @@ describe('App auto-lock integration', () => {
     expect(result.textContent).toContain('Auto-lock note')
     fireEvent.click(result)
     await waitFor(() => expect(view.container.textContent).toContain('Auto-lock note'))
-    expect(vi.mocked(globalThis.fetch).mock.calls.some(([url]) => String(url) === '/api/repository/search?q=auto-lock')).toBe(true)
+    expect(vi.mocked(globalThis.fetch).mock.calls.some(([url, init]) => String(url) === '/api/repository/search' && init?.method === 'POST' && JSON.parse(String(init.body)).query === 'auto-lock')).toBe(true)
+  })
+
+  it('keeps search data out of browser storage and discards it on server lock, including late responses', async () => {
+    const eventSources: Array<{ url: string; listeners: Map<string, EventListener>; closed: boolean; close: () => void; addEventListener: (type: string, listener: EventListener) => void; removeEventListener: (type: string, listener: EventListener) => void; emit: (locked: boolean) => void }> = []
+    class EventSourceStub {
+      url: string
+      listeners = new Map<string, EventListener>()
+      closed = false
+      constructor(url: string) { this.url = url; eventSources.push(this) }
+      addEventListener(type: string, listener: EventListener) { this.listeners.set(type, listener) }
+      removeEventListener(type: string) { this.listeners.delete(type) }
+      close() { this.closed = true }
+      emit(locked: boolean) {
+        const listener = this.listeners.get('encryption-lock')
+        listener?.(new MessageEvent('encryption-lock', { data: JSON.stringify({ vaultId: 'personal', locked }) }))
+      }
+    }
+    vi.stubGlobal('EventSource', EventSourceStub)
+    const searchSentinel = 'search-sentinel-7e3f1'
+    let finishLateResponse: ((response: Response) => void) | undefined
+    const fetchMock = vi.mocked(globalThis.fetch)
+    const originalFetch = fetchMock.getMockImplementation()!
+    fetchMock.mockImplementation((input, init) => {
+      if (String(input) === '/api/repository/search' && JSON.parse(String(init?.body)).query === 'late-sentinel') {
+        return new Promise<Response>((resolve) => { finishLateResponse = resolve })
+      }
+      return originalFetch(input, init)
+    })
+
+    const view = render(<App />)
+    const search = await view.findByRole('searchbox', { name: 'Search this notebook' })
+    await waitFor(() => expect(eventSources.some((source) => source.url.includes('vaultId=personal'))).toBe(true))
+    const source = eventSources.find((item) => item.url.includes('vaultId=personal'))!
+    source.emit(false)
+
+    fireEvent.change(search, { target: { value: searchSentinel } })
+    const result = await view.findByRole('button', { name: /Private.*L1/ })
+    expect(result.textContent).toContain(searchSentinel)
+    const storageSnapshot = [localStorage, sessionStorage].flatMap((storage) => Array.from({ length: storage.length }, (_, index) => `${storage.key(index)}=${storage.getItem(storage.key(index)!)}`)).join(' ')
+    expect(storageSnapshot).not.toContain(searchSentinel)
+    source.emit(true)
+    await waitFor(() => expect((search as HTMLInputElement).value).toBe(''))
+    expect(view.queryByRole('button', { name: /Private.*L1/ })).toBeNull()
+
+    source.emit(false)
+    fireEvent.change(search, { target: { value: 'late-sentinel' } })
+    await waitFor(() => expect(finishLateResponse).toBeDefined())
+    source.emit(true)
+    await act(async () => {
+      finishLateResponse?.(Response.json({ results: [{ path: 'Private.md', type: 'content', line: 1, excerpt: 'late-sentinel plaintext' }] }))
+      await Promise.resolve()
+    })
+    expect((search as HTMLInputElement).value).toBe('')
+    expect(view.container.textContent).not.toContain('late-sentinel')
+    const updatedStorageSnapshot = [localStorage, sessionStorage].flatMap((storage) => Array.from({ length: storage.length }, (_, index) => `${storage.key(index)}=${storage.getItem(storage.key(index)!)}`)).join(' ')
+    expect(updatedStorageSnapshot).not.toContain('late-sentinel')
   })
 
   it('opens mobile notebook navigation and closes it after choosing a note', async () => {
