@@ -48,8 +48,13 @@ history. For behavior and deployment, see [README](../README.md).
   registered vaults and remains blocked while encryption metadata or
   ciphertext exists, including in Trash. Protected note reads, creates, saves,
   and conflict checks now use the key manager, authenticated catalog, and
-  transaction journal. There is still no user-facing unlock or activation path;
-  encryption remains gated until all M31 steps and the release review pass.
+  transaction journal. M31P11 adds a prepared conversion path for existing
+  Markdown, supported attachments, recursively selected folders, and associated
+  Trash; it fails closed on collisions, symlinks, hardlinks, and unsupported
+  entries, then commits plaintext removal and ciphertext/catalog installation
+  through forward recovery. The application still exposes no user-facing
+  unlock or activation path; encryption remains gated until all M31 steps and
+  the release review pass.
 - Multiple named vaults on one server are registered in application metadata.
   The registry stores IDs, display names, and filesystem paths. It is not a
   copy of note or asset content.

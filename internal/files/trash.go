@@ -25,6 +25,7 @@ const (
 var (
 	ErrInvalidTrashID   = errors.New("invalid trash item ID")
 	ErrRestoreCollision = errors.New("the original location is already in use")
+	ErrTrashEncrypted   = errors.New("encrypted Trash content requires the protected restore operation")
 	trashIDPattern      = regexp.MustCompile(`^[0-9a-f]{32}$`)
 )
 
@@ -48,6 +49,7 @@ type resolvedTrashItem struct {
 	contentPath string
 	assetsPath  string
 	assetsExist bool
+	encrypted   bool
 }
 
 func (r *Repository) MoveToTrash(relative string) (TrashItem, error) {
@@ -193,6 +195,9 @@ func (r *Repository) RestoreTrashItem(id string) (TrashItem, error) {
 	if err != nil {
 		return TrashItem{}, err
 	}
+	if item.encrypted {
+		return TrashItem{}, ErrTrashEncrypted
+	}
 	if err := r.ensureSafeRestoreParent(path.Dir(item.OriginalPath)); err != nil {
 		return TrashItem{}, err
 	}
@@ -244,6 +249,9 @@ func (r *Repository) DeleteTrashItem(id string) (TrashItem, error) {
 	if err != nil {
 		return TrashItem{}, err
 	}
+	if item.encrypted {
+		return TrashItem{}, ErrTrashEncrypted
+	}
 	if err := r.content.removeAll(item.root); err != nil {
 		return TrashItem{}, err
 	}
@@ -293,6 +301,14 @@ func (r *Repository) loadTrashItem(id string) (resolvedTrashItem, error) {
 	contentRoot := path.Join(itemRoot, trashContentName)
 	contentPath := path.Join(contentRoot, "item")
 	contentInfo, err := r.content.lstat(contentPath)
+	encrypted := false
+	if errors.Is(err, os.ErrNotExist) && metadata.Type == "file" {
+		contentPath += ".age"
+		contentInfo, err = r.content.lstat(contentPath)
+		if err == nil {
+			encrypted = true
+		}
+	}
 	if err != nil || contentInfo.Mode()&os.ModeSymlink != 0 {
 		return resolvedTrashItem{}, ErrInvalidPath
 	}
@@ -308,11 +324,43 @@ func (r *Repository) loadTrashItem(id string) (resolvedTrashItem, error) {
 			return resolvedTrashItem{}, err
 		}
 	}
+	if !encrypted {
+		encrypted, err = r.trashPathHasCiphertext(contentPath)
+		if err != nil {
+			return resolvedTrashItem{}, err
+		}
+	}
+	if !encrypted && assetsExist {
+		encrypted, err = r.trashPathHasCiphertext(assetsPath)
+		if err != nil {
+			return resolvedTrashItem{}, err
+		}
+	}
 	size, err := r.trashItemSize(contentPath, assetsPath, assetsExist)
 	if err != nil {
 		return resolvedTrashItem{}, err
 	}
-	return resolvedTrashItem{TrashItem: TrashItem{ID: id, OriginalPath: metadata.OriginalPath, Type: metadata.Type, DeletedAt: metadata.DeletedAt, Size: size}, root: itemRoot, contentPath: contentPath, assetsPath: assetsPath, assetsExist: assetsExist}, nil
+	return resolvedTrashItem{TrashItem: TrashItem{ID: id, OriginalPath: metadata.OriginalPath, Type: metadata.Type, DeletedAt: metadata.DeletedAt, Size: size}, root: itemRoot, contentPath: contentPath, assetsPath: assetsPath, assetsExist: assetsExist, encrypted: encrypted}, nil
+}
+
+func (r *Repository) trashPathHasCiphertext(relative string) (bool, error) {
+	info, err := r.content.lstat(relative)
+	if err != nil {
+		return false, err
+	}
+	if !info.IsDir() {
+		return strings.EqualFold(path.Ext(relative), ".age"), nil
+	}
+	entries, err := r.content.entriesUnder(relative)
+	if err != nil {
+		return false, err
+	}
+	for _, entry := range entries {
+		if strings.EqualFold(path.Ext(entry.Name), ".age") {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 func (r *Repository) ensureTrashRoot(create bool) (string, error) {

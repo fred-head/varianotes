@@ -2,6 +2,7 @@ package encryption
 
 import (
 	"bytes"
+	"context"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
@@ -45,6 +46,13 @@ type CiphertextChange struct {
 	Ciphertext         []byte
 	ContentKeyEnvelope ContentKeyEnvelope
 	Delete             bool
+	// ExpectedSHA256 binds a delete to the bytes read during conversion. It is
+	// checked in memory while preparing; only a vault-keyed fingerprint is
+	// persisted for forward recovery.
+	ExpectedSHA256 string
+	// RejectHardlinks makes deletion fail closed if another path still shares
+	// the source inode. It is used when converting plaintext originals.
+	RejectHardlinks bool
 }
 
 // TransactionJournal coordinates ciphertext replacements and an authenticated
@@ -72,11 +80,13 @@ type transactionRecord struct {
 }
 
 type transactionChange struct {
-	Path     string `json:"path"`
-	ObjectID string `json:"object_id,omitempty"`
-	Stage    string `json:"stage,omitempty"`
-	SHA256   string `json:"sha256,omitempty"`
-	Delete   bool   `json:"delete,omitempty"`
+	Path                string `json:"path"`
+	ObjectID            string `json:"object_id,omitempty"`
+	Stage               string `json:"stage,omitempty"`
+	SHA256              string `json:"sha256,omitempty"`
+	Delete              bool   `json:"delete,omitempty"`
+	ExpectedFingerprint string `json:"expected_fingerprint,omitempty"`
+	RejectHardlinks     bool   `json:"reject_hardlinks,omitempty"`
 }
 
 type transactionPayload struct {
@@ -135,7 +145,19 @@ func NewTransactionJournal(vaultDirectory string, catalog *CatalogStore) (*Trans
 // prepared journal, stages ciphertext and the next authenticated catalog, and
 // verifies every staged byte. No live content or catalog path is changed.
 func (j *TransactionJournal) Prepare(changes []CiphertextChange, catalog Catalog, vaultKey []byte) (*PreparedTransaction, error) {
-	if j == nil || len(vaultKey) != VaultKeySize || len(changes) == 0 || len(changes) > maxTransactionChanges {
+	return j.PrepareContext(context.Background(), changes, catalog, vaultKey)
+}
+
+// PrepareContext stages a transaction and aborts it if the caller cancels
+// before every ciphertext and the authenticated catalog have been verified.
+func (j *TransactionJournal) PrepareContext(ctx context.Context, changes []CiphertextChange, catalog Catalog, vaultKey []byte) (*PreparedTransaction, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if j == nil || len(vaultKey) != VaultKeySize || len(changes) > maxTransactionChanges {
 		return nil, ErrInvalidTransaction
 	}
 	encodedCatalog, err := MarshalCatalog(catalog, vaultKey)
@@ -171,6 +193,9 @@ func (j *TransactionJournal) Prepare(changes []CiphertextChange, catalog Catalog
 	seen := make(map[string]struct{}, len(changes))
 	var totalBytes int64
 	for _, change := range changes {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		if !isTransactionContentPath(change.Path) {
 			return nil, ErrInvalidTransaction
 		}
@@ -179,11 +204,11 @@ func (j *TransactionJournal) Prepare(changes []CiphertextChange, catalog Catalog
 		}
 		seen[change.Path] = struct{}{}
 		if change.Delete {
-			if len(change.Ciphertext) != 0 || change.ObjectID != "" || change.ContentKeyEnvelope.Version != 0 || len(change.ContentKeyEnvelope.Ciphertext) != 0 {
+			if len(change.Ciphertext) != 0 || change.ObjectID != "" || change.ContentKeyEnvelope.Version != 0 || len(change.ContentKeyEnvelope.Ciphertext) != 0 || (change.ExpectedSHA256 != "" && !isSHA256Hex(change.ExpectedSHA256)) {
 				return nil, ErrInvalidTransaction
 			}
 		} else {
-			if len(change.Ciphertext) == 0 || len(change.Ciphertext) > maxTransactionFileBytes || !isCatalogID(change.ObjectID) {
+			if len(change.Ciphertext) == 0 || len(change.Ciphertext) > maxTransactionFileBytes || !isCatalogID(change.ObjectID) || change.ExpectedSHA256 != "" || change.RejectHardlinks {
 				return nil, ErrInvalidTransaction
 			}
 			totalBytes += int64(len(change.Ciphertext))
@@ -201,11 +226,23 @@ func (j *TransactionJournal) Prepare(changes []CiphertextChange, catalog Catalog
 		if err != nil {
 			return nil, err
 		}
+		if change.ExpectedSHA256 != "" && prior[change.Path] != change.ExpectedSHA256 {
+			return nil, ErrTransactionConflict
+		}
+		if change.RejectHardlinks {
+			info, statErr := root.Lstat(filepath.FromSlash(change.Path))
+			if statErr != nil || !hasSingleLink(info) {
+				return nil, errors.Join(ErrInvalidTransaction, statErr)
+			}
+		}
 		if previous, exists := previousObjects[change.Path]; exists && previous.Protected && prior[change.Path] != previous.CiphertextHash {
 			return nil, ErrCatalogCiphertextCheck
 		}
 	}
 	if err := j.ensureNoPendingJournal(); err != nil {
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 
@@ -221,7 +258,10 @@ func (j *TransactionJournal) Prepare(changes []CiphertextChange, catalog Catalog
 	ordered := append([]CiphertextChange(nil), changes...)
 	sort.Slice(ordered, func(a, b int) bool { return ordered[a].Path < ordered[b].Path })
 	for index, change := range ordered {
-		entry := transactionChange{Path: change.Path, ObjectID: change.ObjectID, Delete: change.Delete}
+		entry := transactionChange{Path: change.Path, ObjectID: change.ObjectID, Delete: change.Delete, RejectHardlinks: change.RejectHardlinks}
+		if change.ExpectedSHA256 != "" {
+			entry.ExpectedFingerprint = transactionSourceFingerprint(vaultKey, change.ExpectedSHA256)
+		}
 		if !change.Delete {
 			entry.Stage = transactionContentStageName(id, index)
 			entry.SHA256 = transactionDigest(change.Ciphertext)
@@ -238,6 +278,9 @@ func (j *TransactionJournal) Prepare(changes []CiphertextChange, catalog Catalog
 		journal: j, record: record, key: append([]byte(nil), vaultKey...), prior: prior, priorCatalog: priorCatalog,
 	}
 	for index, change := range ordered {
+		if err := ctx.Err(); err != nil {
+			return nil, j.abortPrepared(tx, err)
+		}
 		entry := record.Changes[index]
 		if change.Delete {
 			continue
@@ -258,6 +301,9 @@ func (j *TransactionJournal) Prepare(changes []CiphertextChange, catalog Catalog
 	if err := j.verifyPreparedStages(root, record, encodedCatalog); err != nil {
 		return nil, j.abortPrepared(tx, err)
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, j.abortPrepared(tx, err)
+	}
 	return tx, nil
 }
 
@@ -265,6 +311,15 @@ func (j *TransactionJournal) Prepare(changes []CiphertextChange, catalog Catalog
 // durably records the forward-only decision, and applies it. Any error after
 // that decision leaves the journal in place and returns ErrTransactionNeedsRecovery.
 func (tx *PreparedTransaction) Commit() error {
+	return tx.CommitContext(context.Background())
+}
+
+// CommitContext observes cancellation until the durable forward commit point.
+// Once that point is written, recovery always finishes the transaction.
+func (tx *PreparedTransaction) CommitContext(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if tx == nil || tx.journal == nil || tx.used {
 		return ErrInvalidTransaction
 	}
@@ -285,6 +340,9 @@ func (tx *PreparedTransaction) Commit() error {
 	if record.ID != tx.record.ID || record.State != "prepared" {
 		return ErrTransactionJournalCorrupt
 	}
+	if err := ctx.Err(); err != nil {
+		return j.abortPrepared(tx, err)
+	}
 	for _, entry := range record.Changes {
 		current, digestErr := transactionTargetDigest(root, entry.Path)
 		if digestErr != nil {
@@ -293,6 +351,12 @@ func (tx *PreparedTransaction) Commit() error {
 		if current != tx.prior[entry.Path] {
 			return j.abortPrepared(tx, ErrTransactionConflict)
 		}
+		if entry.RejectHardlinks {
+			info, statErr := root.Lstat(filepath.FromSlash(entry.Path))
+			if statErr != nil || !hasSingleLink(info) {
+				return j.abortPrepared(tx, errors.Join(ErrInvalidTransaction, statErr))
+			}
+		}
 	}
 	currentCatalog, err := j.currentCatalogDigest()
 	if err != nil {
@@ -300,6 +364,9 @@ func (tx *PreparedTransaction) Commit() error {
 	}
 	if currentCatalog != tx.priorCatalog {
 		return j.abortPrepared(tx, ErrTransactionConflict)
+	}
+	if err := ctx.Err(); err != nil {
+		return j.abortPrepared(tx, err)
 	}
 	if err := j.fail("transaction.commit.before"); err != nil {
 		return j.abortPrepared(tx, err)
@@ -320,6 +387,30 @@ func (tx *PreparedTransaction) Commit() error {
 		return errors.Join(ErrTransactionNeedsRecovery, err)
 	}
 	return nil
+}
+
+// Abort discards staged state while the transaction is still prepared. A
+// committed transaction cannot be rolled back and must be recovered forward.
+func (tx *PreparedTransaction) Abort() error {
+	if tx == nil || tx.journal == nil || tx.used {
+		return ErrInvalidTransaction
+	}
+	tx.used = true
+	defer clear(tx.key)
+	j := tx.journal
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	record, err := j.loadRecord(tx.key)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if record.ID != tx.record.ID || record.State != "prepared" {
+		return ErrTransactionNeedsRecovery
+	}
+	return tx.journal.cleanupRecord(record)
 }
 
 // Recover discards a prepared transaction because its live targets are still
@@ -551,7 +642,16 @@ func (j *TransactionJournal) applyCommitted(root *os.Root, record transactionRec
 			if err := validateTransactionTarget(root, entry.Path); err != nil {
 				return err
 			}
-			if _, err := root.Lstat(filepath.FromSlash(entry.Path)); err == nil {
+			if info, err := root.Lstat(filepath.FromSlash(entry.Path)); err == nil {
+				if entry.ExpectedFingerprint != "" {
+					actual, digestErr := transactionTargetDigest(root, entry.Path)
+					if digestErr != nil || transactionSourceFingerprint(vaultKey, actual) != entry.ExpectedFingerprint {
+						return errors.Join(ErrTransactionNeedsRecovery, ErrTransactionConflict, digestErr)
+					}
+				}
+				if entry.RejectHardlinks && !hasSingleLink(info) {
+					return errors.Join(ErrTransactionNeedsRecovery, ErrInvalidTransaction)
+				}
 				if err := j.fail("transaction.content.delete"); err != nil {
 					return err
 				}
@@ -1020,7 +1120,7 @@ func transactionPayloadFromRecord(record transactionRecord) transactionPayload {
 
 func validateTransactionRecord(record transactionRecord) error {
 	if record.Version != transactionFormatVersion || !isCatalogID(record.ID) || !isCatalogID(record.VaultID) ||
-		(record.State != "prepared" && record.State != "committed") || len(record.Changes) == 0 ||
+		(record.State != "prepared" && record.State != "committed") ||
 		len(record.Changes) > maxTransactionChanges || record.CatalogStage != transactionCatalogStageName(record.ID) ||
 		!isSHA256Hex(record.CatalogSHA256) {
 		return ErrInvalidTransaction
@@ -1035,10 +1135,10 @@ func validateTransactionRecord(record transactionRecord) error {
 		}
 		seen[entry.Path] = struct{}{}
 		if entry.Delete {
-			if entry.ObjectID != "" || entry.Stage != "" || entry.SHA256 != "" {
+			if entry.ObjectID != "" || entry.Stage != "" || entry.SHA256 != "" || (entry.ExpectedFingerprint != "" && !isSHA256Hex(entry.ExpectedFingerprint)) {
 				return ErrInvalidTransaction
 			}
-		} else if !isCatalogID(entry.ObjectID) || entry.Stage != transactionContentStageName(record.ID, index) || !isSHA256Hex(entry.SHA256) {
+		} else if !isCatalogID(entry.ObjectID) || entry.Stage != transactionContentStageName(record.ID, index) || !isSHA256Hex(entry.SHA256) || entry.ExpectedFingerprint != "" || entry.RejectHardlinks {
 			return ErrInvalidTransaction
 		}
 		if index > 0 && record.Changes[index-1].Path >= entry.Path {
@@ -1118,4 +1218,11 @@ func transactionCatalogStageName(id string) string {
 func transactionDigest(data []byte) string {
 	digest := sha256.Sum256(data)
 	return hex.EncodeToString(digest[:])
+}
+
+func transactionSourceFingerprint(vaultKey []byte, digest string) string {
+	authenticator := hmac.New(sha256.New, vaultKey)
+	_, _ = authenticator.Write([]byte("varianotes/transaction-source-fingerprint/v1\x00"))
+	_, _ = authenticator.Write([]byte(digest))
+	return hex.EncodeToString(authenticator.Sum(nil))
 }
