@@ -42,6 +42,7 @@ func main() {
 		os.Exit(1)
 	}
 	authConfig.PasswordCoordinator = app.NewPasswordChangeCoordinator(os.Getenv("VARIANOTES_NOTEBOOK_METADATA"))
+	authConfig.RecoveryCoordinator = app.NewRecoveryCodeCoordinator(os.Getenv("VARIANOTES_NOTEBOOK_METADATA"))
 	authService, err := auth.Open(context.Background(), authConfig, logger)
 	if err != nil {
 		logger.Error("initialize authentication metadata", "error", err)
@@ -106,6 +107,7 @@ func runAuthCommand(ctx context.Context, logger *slog.Logger, arguments []string
 		return fmt.Errorf("configure authentication: %w", err)
 	}
 	config.PasswordCoordinator = app.NewPasswordChangeCoordinator(os.Getenv("VARIANOTES_NOTEBOOK_METADATA"))
+	config.RecoveryCoordinator = app.NewRecoveryCodeCoordinator(os.Getenv("VARIANOTES_NOTEBOOK_METADATA"))
 	if arguments[1] == "reset-mfa" {
 		config.AllowMFAKeyRecovery = true
 	}

@@ -14,7 +14,7 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const currentSchemaVersion = 8
+const currentSchemaVersion = 9
 
 type State struct {
 	Mode                       Mode
@@ -26,11 +26,13 @@ type State struct {
 }
 
 type Service struct {
-	db            *sql.DB
-	config        Config
-	logger        *slog.Logger
-	credentialMu  sync.Mutex
-	encryptionKey []byte
+	db                *sql.DB
+	config            Config
+	logger            *slog.Logger
+	credentialMu      sync.Mutex
+	encryptionKey     []byte
+	pendingRecoveryMu sync.Mutex
+	pendingRecovery   map[string]pendingRecoveryChallenge
 }
 
 type migration struct {
@@ -156,6 +158,17 @@ var migrations = []migration{
 			`ALTER TABLE auth_configuration ADD COLUMN encryption_password_separate INTEGER NOT NULL DEFAULT 0 CHECK (encryption_password_separate IN (0, 1))`,
 		},
 	},
+	{
+		version: 9,
+		statements: []string{
+			`CREATE TABLE auth_encryption_recovery_journal (
+				id INTEGER PRIMARY KEY CHECK (id = 1),
+				phase TEXT NOT NULL CHECK (phase IN ('prepared', 'committed')),
+				payload BLOB NOT NULL,
+				created_at TEXT NOT NULL
+			) STRICT`,
+		},
+	},
 }
 
 func Open(ctx context.Context, config Config, logger *slog.Logger) (*Service, error) {
@@ -209,6 +222,15 @@ func (s *Service) Close() error {
 	if s == nil || s.db == nil {
 		return nil
 	}
+	s.credentialMu.Lock()
+	defer s.credentialMu.Unlock()
+	s.pendingRecoveryMu.Lock()
+	for challenge, pending := range s.pendingRecovery {
+		clear(pending.plan)
+		clear(pending.sessionHash)
+		delete(s.pendingRecovery, challenge)
+	}
+	s.pendingRecoveryMu.Unlock()
 	return s.db.Close()
 }
 
@@ -297,6 +319,9 @@ func (s *Service) initialize(ctx context.Context) error {
 	if err := s.recoverPasswordChange(ctx); err != nil {
 		return err
 	}
+	if err := s.recoverEncryptionRecovery(ctx); err != nil {
+		return err
+	}
 	if err := s.reconcileConfiguration(ctx); err != nil {
 		return err
 	}
@@ -365,6 +390,7 @@ func (s *Service) reconcileConfiguration(ctx context.Context) error {
 			`DELETE FROM auth_password_credentials`,
 			`DELETE FROM auth_mfa_configuration`,
 			`DELETE FROM auth_password_change_journal`,
+			`DELETE FROM auth_encryption_recovery_journal`,
 		} {
 			if _, err := tx.ExecContext(ctx, statement); err != nil {
 				return fmt.Errorf("invalidate authentication state: %w", err)

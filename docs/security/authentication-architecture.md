@@ -62,8 +62,10 @@ Public minimum:
 
 - `GET /api/health`, containing liveness and application version only,
 - static application-shell files required to render setup/login,
-- narrowly scoped setup, login, MFA challenge, and auth-status routes; these
-  expose no vault, filesystem, or host metadata.
+- narrowly scoped setup, login, MFA challenge, password-recovery prepare and
+  confirm, and auth-status routes; password recovery requires the separate
+  high-entropy code, applies same-origin checks, and exposes no vault,
+  filesystem, or host metadata.
 
 Protected:
 
@@ -93,6 +95,9 @@ The database is limited to:
 - security events that contain neither credentials nor note content,
 - an interrupted password-change journal containing only encrypted old/new
   vault-key envelopes and a transaction phase,
+- an interrupted encryption-recovery journal containing encrypted old/new
+  vault-key envelopes, a derived password credential when required, and a
+  transaction phase,
 - versioned migration records.
 
 It must never contain Markdown, asset bytes, vault trees, external credentials,
@@ -119,6 +124,39 @@ an explicit encryption password, so a later separate encryption password does
 not depend on local login. Password recovery without the prior password records
 that separation, so future login-password changes leave the existing envelopes
 alone. OIDC identity tokens are never encryption keys.
+
+M31P08 creates a 256-bit recovery code and shows it once. The code itself is
+never written to disk; each protected vault stores only a password-encrypted
+vault-key envelope made with that code. The displayed form starts with
+`VNRC1-` and groups uppercase hexadecimal characters for copying. The owner
+must confirm the displayed code before those envelopes become active.
+Confirmation verifies the code and
+the authenticated catalog for every protected vault. A pending setup challenge
+is kept only in process memory, so a restart before confirmation leaves the
+previous recovery state unchanged. The confirmation challenge expires after
+10 minutes.
+
+Password recovery first checks the current code across every protected vault
+and prepares replacement password and code envelopes. It displays the new code
+once and requires confirmation before changing any envelope or the login
+credential. A durable prepared journal rolls back on restart; after the
+credential and committed phase are written in one SQLite transaction, startup
+finishes the envelope updates forward. A successful recovery revokes all
+sessions, sets the vault password to the new local password, and requires a new
+login. Existing MFA remains enabled. Replacing a code while signed in requires
+the current login password and, when the encryption password has been
+separated, that separate password too.
+
+Store the code outside the VariaNotes data volume and separately from backups.
+Application metadata backups contain the encrypted recovery envelopes but not
+the code. A restored backup can be recovered with the code that was active
+when that backup was made. If both the current vault password and the matching
+recovery code are lost, VariaNotes cannot recover those vault keys. The code
+recovers access through VariaNotes from a complete matching backup. In this
+step, external recovery means keeping the code outside VariaNotes and using it
+with the restored application metadata and vault. This is not a standalone
+external decryption tool; validating full VariaNotes-free content recovery
+remains part of the M31 security review and release gate.
 Explicitly disabling authentication is rejected while any registered vault has
 encryption metadata or `.age` ciphertext, including content in Trash, and also
 fails when a registered vault cannot be inspected.
@@ -127,7 +165,9 @@ Changing `local`/`disabled` invalidates sessions, one-time artifacts, and
 throttling state atomically and resets setup completion after the encryption
 guard passes. Operator-only password and MFA recovery commands require
 filesystem/container administration. Password recovery changes authentication
-metadata only; it never moves, encrypts, deletes, or rewrites notebook files.
+metadata only when performed by an operator without the recovery code. Code-based
+recovery also replaces vault-key envelopes in application metadata. Neither
+recovery path moves, encrypts, deletes, or rewrites notebook files.
 
 ## Authentication implementation history
 

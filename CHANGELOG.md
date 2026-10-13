@@ -8,6 +8,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- Added one-time, 256-bit vault-key recovery codes with confirmation before
+  activation and journaled multi-vault password recovery. Successful recovery
+  rotates the code and vault-key envelopes, changes the local password, revokes
+  sessions, and leaves encryption locked.
 - Added M31P07 password coordination for vault-key envelopes, with a durable
   auth database journal and restart rollback/forward recovery. Password reset
   leaves vault envelopes unchanged and marks encryption passwords separate for

@@ -28,6 +28,7 @@ type Config struct {
 	TrustedProxies      []netip.Prefix
 	AllowMFAKeyRecovery bool
 	PasswordCoordinator PasswordChangeCoordinator
+	RecoveryCoordinator RecoveryCodeCoordinator
 }
 
 // PasswordChangeCoordinator prepares and applies password-encrypted vault-key
@@ -38,6 +39,17 @@ type PasswordChangeCoordinator interface {
 	ApplyPasswordChange(ctx context.Context, plan []byte) error
 	RollbackPasswordChange(ctx context.Context, plan []byte) error
 	HasProtectedContent(ctx context.Context) (bool, error)
+}
+
+// RecoveryCodeCoordinator manages password and recovery-code envelopes for
+// protected vault keys. Plans contain only encrypted envelopes and metadata;
+// recovery codes are never included in a persisted plan.
+type RecoveryCodeCoordinator interface {
+	PrepareRecoveryCode(ctx context.Context, password, recoveryCode string) ([]byte, error)
+	PreparePasswordRecovery(ctx context.Context, recoveryCode, newPassword, newRecoveryCode string) ([]byte, error)
+	VerifyRecoveryPlan(ctx context.Context, plan []byte, password, recoveryCode string) error
+	ApplyRecoveryPlan(ctx context.Context, plan []byte) error
+	RollbackRecoveryPlan(ctx context.Context, plan []byte) error
 }
 
 type EnvironmentLookup func(string) (string, bool)

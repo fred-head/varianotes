@@ -258,6 +258,164 @@ func newHandlerWithKeyManager(logger *slog.Logger, repositoryRoot string, authSe
 			_ = authService.RecordSecurityEvent(r.Context(), "login_mfa", "success", "client="+auth.ClientReference(clientIP))
 			writeJSON(w, http.StatusOK, map[string]any{"authenticated": true, "csrfToken": sessions.ExistingCSRFToken(r.Context())})
 		})
+		mux.HandleFunc("POST /api/encryption/recovery-code", func(w http.ResponseWriter, r *http.Request) {
+			var input struct {
+				CurrentPassword            string `json:"currentPassword"`
+				SeparateEncryptionPassword string `json:"encryptionPassword"`
+				MFACode                    string `json:"mfaCode"`
+			}
+			if !decodeJSONWithLimit(w, r, &input, maxAuthRequestBodySize) {
+				return
+			}
+			clientIP, release, allowed := beginCredentialAttempt(w, r, auth.ThrottleOperationSensitive)
+			if !allowed {
+				return
+			}
+			defer release()
+			enabled, err := authService.MFAEnabled(r.Context())
+			if err != nil {
+				writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "authentication is unavailable"})
+				return
+			}
+			if enabled && authService.VerifySecondFactor(r.Context(), input.MFACode) != nil {
+				if !recordCredentialFailure(w, r, auth.ThrottleOperationSensitive, clientIP) {
+					return
+				}
+				writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "authentication failed", "code": "invalid_credentials"})
+				return
+			}
+			challenge, code, err := authService.BeginEncryptionRecoveryCode(r.Context(), input.CurrentPassword, input.SeparateEncryptionPassword, sessions.CurrentHash(r.Context()))
+			if err != nil {
+				if errors.Is(err, auth.ErrAuthentication) {
+					if !recordCredentialFailure(w, r, auth.ThrottleOperationSensitive, clientIP) {
+						return
+					}
+					writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "authentication failed", "code": "invalid_credentials"})
+					return
+				}
+				logger.Error("prepare encryption recovery code failed", "error", err)
+				writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "recovery code could not be prepared"})
+				return
+			}
+			writeJSON(w, http.StatusOK, map[string]string{"challengeId": challenge, "recoveryCode": code})
+		})
+		mux.HandleFunc("POST /api/encryption/recovery-code/confirm", func(w http.ResponseWriter, r *http.Request) {
+			var input struct {
+				ChallengeID  string `json:"challengeId"`
+				RecoveryCode string `json:"recoveryCode"`
+				Confirmed    bool   `json:"confirmed"`
+			}
+			if !decodeJSONWithLimit(w, r, &input, maxAuthRequestBodySize) {
+				return
+			}
+			clientIP, release, allowed := beginCredentialAttempt(w, r, auth.ThrottleOperationSensitive)
+			if !allowed {
+				return
+			}
+			defer release()
+			if err := authService.ConfirmEncryptionRecoveryCode(r.Context(), input.ChallengeID, input.RecoveryCode, input.Confirmed, sessions.CurrentHash(r.Context())); err != nil {
+				if errors.Is(err, auth.ErrRecoveryRequired) || errors.Is(err, auth.ErrRecoveryPending) {
+					_ = keyManager.LockAll(encryption.LockReasonSession)
+				}
+				if errors.Is(err, auth.ErrInvalidRecoveryCode) {
+					if !recordCredentialFailure(w, r, auth.ThrottleOperationSensitive, clientIP) {
+						return
+					}
+					writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "recovery code confirmation failed", "code": "invalid_recovery_code"})
+					return
+				}
+				if errors.Is(err, auth.ErrRecoveryNotConfirmed) || errors.Is(err, auth.ErrRecoveryChallengeExpired) {
+					writeJSON(w, http.StatusBadRequest, map[string]string{"error": "recovery code confirmation is required"})
+					return
+				}
+				logger.Error("confirm encryption recovery code failed", "error", err)
+				writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "recovery code could not be activated"})
+				return
+			}
+			_ = loginThrottle.SuccessOperation(r.Context(), auth.ThrottleOperationSensitive, clientIP)
+			writeJSON(w, http.StatusOK, map[string]bool{"recoveryCodeActive": true})
+		})
+		mux.HandleFunc("POST /api/auth/recovery/prepare", func(w http.ResponseWriter, r *http.Request) {
+			var input struct {
+				RecoveryCode string `json:"recoveryCode"`
+				NewPassword  string `json:"newPassword"`
+			}
+			if !decodeJSONWithLimit(w, r, &input, maxAuthRequestBodySize) {
+				return
+			}
+			state, err := authService.State(r.Context())
+			if err != nil || state.Mode != auth.ModeLocal || !state.SetupCompleted {
+				writeJSON(w, http.StatusConflict, map[string]string{"error": "password recovery is unavailable"})
+				return
+			}
+			clientIP, release, allowed := beginCredentialAttempt(w, r, auth.ThrottleOperationSensitive)
+			if !allowed {
+				return
+			}
+			defer release()
+			if err := auth.ValidatePassword(input.NewPassword); err != nil {
+				writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+				return
+			}
+			challenge, code, err := authService.BeginPasswordRecovery(r.Context(), input.RecoveryCode, input.NewPassword)
+			if err != nil {
+				if errors.Is(err, auth.ErrInvalidRecoveryCode) {
+					if !recordCredentialFailure(w, r, auth.ThrottleOperationSensitive, clientIP) {
+						return
+					}
+					writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "authentication failed", "code": "invalid_recovery_code"})
+					return
+				}
+				if errors.Is(err, auth.ErrPasswordTooShort) || errors.Is(err, auth.ErrPasswordTooLarge) || errors.Is(err, auth.ErrInvalidPassword) || errors.Is(err, auth.ErrPasswordTooWeak) {
+					writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+					return
+				}
+				logger.Error("prepare password recovery failed", "error", err)
+				writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "password recovery could not be prepared"})
+				return
+			}
+			writeJSON(w, http.StatusOK, map[string]string{"challengeId": challenge, "recoveryCode": code})
+		})
+		mux.HandleFunc("POST /api/auth/recovery/confirm", func(w http.ResponseWriter, r *http.Request) {
+			var input struct {
+				ChallengeID  string `json:"challengeId"`
+				NewPassword  string `json:"newPassword"`
+				RecoveryCode string `json:"recoveryCode"`
+				Confirmed    bool   `json:"confirmed"`
+			}
+			if !decodeJSONWithLimit(w, r, &input, maxAuthRequestBodySize) {
+				return
+			}
+			clientIP, release, allowed := beginCredentialAttempt(w, r, auth.ThrottleOperationSensitive)
+			if !allowed {
+				return
+			}
+			defer release()
+			if err := authService.ConfirmPasswordRecovery(r.Context(), input.ChallengeID, input.NewPassword, input.RecoveryCode, input.Confirmed); err != nil {
+				if errors.Is(err, auth.ErrRecoveryRequired) || errors.Is(err, auth.ErrRecoveryPending) {
+					_ = keyManager.LockAll(encryption.LockReasonSession)
+				}
+				switch {
+				case errors.Is(err, auth.ErrInvalidRecoveryCode):
+					if !recordCredentialFailure(w, r, auth.ThrottleOperationSensitive, clientIP) {
+						return
+					}
+					writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "password recovery confirmation failed", "code": "invalid_recovery_code"})
+				case errors.Is(err, auth.ErrPasswordTooShort), errors.Is(err, auth.ErrPasswordTooLarge), errors.Is(err, auth.ErrInvalidPassword), errors.Is(err, auth.ErrPasswordTooWeak):
+					writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+				case errors.Is(err, auth.ErrRecoveryNotConfirmed), errors.Is(err, auth.ErrRecoveryChallengeExpired):
+					writeJSON(w, http.StatusBadRequest, map[string]string{"error": "password recovery confirmation is required"})
+				default:
+					logger.Error("confirm password recovery failed", "error", err)
+					writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "password recovery could not be completed"})
+				}
+				return
+			}
+			_ = keyManager.LockAll(encryption.LockReasonSession)
+			_ = sessions.Logout(r.Context())
+			_ = loginThrottle.SuccessOperation(r.Context(), auth.ThrottleOperationSensitive, clientIP)
+			writeJSON(w, http.StatusOK, map[string]bool{"passwordRecovered": true, "authenticated": false})
+		})
 		mux.HandleFunc("POST /api/auth/logout", func(w http.ResponseWriter, r *http.Request) {
 			_ = keyManager.LockAll(encryption.LockReasonLogout)
 			if err := sessions.Logout(r.Context()); err != nil {
@@ -431,7 +589,7 @@ func newHandlerWithKeyManager(logger *slog.Logger, repositoryRoot string, authSe
 				writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "authentication failed", "code": "invalid_credentials"})
 			case errors.Is(err, auth.ErrPasswordTooShort), errors.Is(err, auth.ErrPasswordTooLarge), errors.Is(err, auth.ErrInvalidPassword), errors.Is(err, auth.ErrPasswordTooWeak):
 				writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
-			case errors.Is(err, auth.ErrPasswordChangeRecovery), errors.Is(err, auth.ErrPasswordChangePending):
+			case errors.Is(err, auth.ErrPasswordChangeRecovery), errors.Is(err, auth.ErrPasswordChangePending), errors.Is(err, auth.ErrRecoveryRequired), errors.Is(err, auth.ErrRecoveryPending):
 				_ = keyManager.LockAll(encryption.LockReasonSession)
 				logger.Error("password change requires recovery")
 				writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "password change requires recovery; restart VariaNotes before continuing"})
@@ -1378,6 +1536,7 @@ func authenticationBoundary(authService *auth.Service, sessions *auth.Sessions, 
 			(readOnlyMethod && r.URL.Path == "/api/health") ||
 			(readOnlyMethod && r.URL.Path == "/api/auth/status") ||
 			(r.Method == http.MethodPost && r.URL.Path == "/api/auth/setup") ||
+			(r.Method == http.MethodPost && (r.URL.Path == "/api/auth/recovery/prepare" || r.URL.Path == "/api/auth/recovery/confirm")) ||
 			(r.Method == http.MethodPost && (r.URL.Path == "/api/auth/login" || r.URL.Path == "/api/auth/login/mfa"))
 		if public {
 			next.ServeHTTP(w, r)
@@ -1415,7 +1574,7 @@ func csrfProtection(authService *auth.Service, sessions *auth.Sessions, identity
 			next.ServeHTTP(w, r)
 			return
 		}
-		if (r.URL.Path == "/api/auth/login" || r.URL.Path == "/api/auth/login/mfa" || r.URL.Path == "/api/auth/setup") && !sessions.Authenticated(r.Context()) {
+		if (r.URL.Path == "/api/auth/login" || r.URL.Path == "/api/auth/login/mfa" || r.URL.Path == "/api/auth/setup" || r.URL.Path == "/api/auth/recovery/prepare" || r.URL.Path == "/api/auth/recovery/confirm") && !sessions.Authenticated(r.Context()) {
 			next.ServeHTTP(w, r)
 			return
 		}

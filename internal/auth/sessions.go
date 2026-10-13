@@ -78,7 +78,9 @@ func (s *Sessions) MFAPending(ctx context.Context) bool {
 }
 
 func (s *Sessions) Login(ctx context.Context, password string, remember bool, client string) error {
-	if err := s.service.VerifyPassword(ctx, password); err != nil {
+	s.service.credentialMu.Lock()
+	defer s.service.credentialMu.Unlock()
+	if err := s.service.verifyPassword(ctx, password); err != nil {
 		return err
 	}
 	enabled, err := s.service.MFAEnabled(ctx)
@@ -102,6 +104,11 @@ func (s *Sessions) Login(ctx context.Context, password string, remember bool, cl
 }
 
 func (s *Sessions) CompleteMFA(ctx context.Context, code string) error {
+	s.service.credentialMu.Lock()
+	defer s.service.credentialMu.Unlock()
+	if err := s.service.ensureNoPendingEncryptionRecovery(ctx); err != nil {
+		return err
+	}
 	if !s.manager.GetBool(ctx, sessionMFAPendingKey) {
 		return ErrMFAInvalid
 	}
@@ -152,8 +159,10 @@ func (s *Sessions) CurrentHash(ctx context.Context) []byte {
 }
 
 func (s *Sessions) ChangePassword(ctx context.Context, currentPassword, newPassword string) error {
+	s.service.credentialMu.Lock()
+	defer s.service.credentialMu.Unlock()
 	currentHash := s.CurrentHash(ctx)
-	if err := s.service.ChangePassword(ctx, currentPassword, newPassword, currentHash); err != nil {
+	if err := s.service.changePassword(ctx, currentPassword, newPassword, currentHash); err != nil {
 		return err
 	}
 	remember := s.manager.GetBool(ctx, "remember")

@@ -217,6 +217,13 @@ func TestLoginSessionPersistsAndCanBeRevoked(t *testing.T) {
 	if missingCSRF.Code != http.StatusForbidden || !strings.Contains(missingCSRF.Body.String(), `"code":"csrf_invalid"`) {
 		t.Fatalf("state-changing authenticated request bypassed CSRF protection: %d %s", missingCSRF.Code, missingCSRF.Body.String())
 	}
+	missingRecoveryCSRFRequest := httptest.NewRequest(http.MethodPost, "/api/encryption/recovery-code", strings.NewReader(`{}`))
+	missingRecoveryCSRFRequest.AddCookie(cookie)
+	missingRecoveryCSRF := httptest.NewRecorder()
+	handler.ServeHTTP(missingRecoveryCSRF, missingRecoveryCSRFRequest)
+	if missingRecoveryCSRF.Code != http.StatusForbidden || !strings.Contains(missingRecoveryCSRF.Body.String(), `"code":"csrf_invalid"`) {
+		t.Fatalf("recovery-code setup bypassed CSRF protection: %d %s", missingRecoveryCSRF.Code, missingRecoveryCSRF.Body.String())
+	}
 
 	_, authenticatedCSRF := authRequestContext(t, handler, cookie)
 	revokeRequest := httptest.NewRequest(http.MethodDelete, "/api/auth/sessions", nil)
@@ -1570,6 +1577,8 @@ func TestEveryApplicationAPIRouteDeniesUnauthenticatedAccess(t *testing.T) {
 	}{
 		{http.MethodPost, "/api/auth/logout"},
 		{http.MethodPost, "/api/encryption/lock"},
+		{http.MethodPost, "/api/encryption/recovery-code"},
+		{http.MethodPost, "/api/encryption/recovery-code/confirm"},
 		{http.MethodPost, "/api/encryption/activity?vaultId=local"},
 		{http.MethodGet, "/api/encryption/lock-events?vaultId=local"},
 		{http.MethodDelete, "/api/auth/session"},
@@ -1672,6 +1681,8 @@ func TestPublicAuthSurfaceDoesNotExposeDeploymentMetadata(t *testing.T) {
 		{http.MethodPost, "/api/auth/login", `{"password":"wrong but deliberately long password","rememberDevice":false}`},
 		{http.MethodPost, "/api/auth/login/mfa", `{"code":"000000"}`},
 		{http.MethodPost, "/api/auth/setup", `{"bootstrapToken":"invalid","password":"another sufficiently long password"}`},
+		{http.MethodPost, "/api/auth/recovery/prepare", `{"recoveryCode":"invalid","newPassword":"another sufficiently long password"}`},
+		{http.MethodPost, "/api/auth/recovery/confirm", `{"challengeId":"invalid","recoveryCode":"invalid","newPassword":"another sufficiently long password","confirmed":true}`},
 	}
 	for _, route := range public {
 		response := httptest.NewRecorder()
