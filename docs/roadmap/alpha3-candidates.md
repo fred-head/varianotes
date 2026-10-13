@@ -603,6 +603,33 @@ requires its listed tests; P17 adds end-to-end and adversarial coverage.
   release; document any remaining finding and confirm it does not weaken the
   agreed security boundary. Obtain reviewer sign-off.
 
+  **P17 status — validation in progress (2026-10-13):** conversion and journal
+  fault/restart boundaries are covered by the P06/P11 tests; protected move
+  rollback and Trash restart reconciliation by the P12/P13 tests. Added focused
+  P17 tests for an uncommitted protected save recovered after restart, export
+  stream failure, corrupt ciphertext rejected before a protected Trash move, and
+  a concurrent lock race across two sessions with pending leases. Existing
+  password-change and recovery tests cover prepared rollback and committed
+  forward recovery; corruption, authenticated envelopes, and shared-asset
+  retention have focused adversarial tests. A complete matching test backup is
+  now restored by `internal/files/externalrestore`, a standalone helper with no
+  VariaNotes imports; it verifies the catalog MAC, unwraps the age password
+  envelope and content-key envelopes, asks the official age CLI to decrypt each
+  protected file, and checks the restored note, binary asset, and ordinary note
+  byte-for-byte. This validates the format and complete backup contents; P18's
+  operator instructions remain out of scope.
+
+  Local validation passed with serial Go package execution and a 1.5-GiB Go
+  memory limit: `go test -p 1 -count=1 ./internal/encryption ./internal/files
+  ./internal/app`, `go test -p 1 -count=1 ./internal/auth ./cmd/varianotes`,
+  the focused lock-race test under `-race`, `go vet -p 1` for the affected Go
+  packages, and `git diff --check`. The independent reviewer sign-off and
+  required PR CI are still pending. No blocking issue was found in this local
+  test/review pass; it is not an independent security approval. P17 remains
+  open until the independent review passes. Swap use remained at its 3.4-GiB
+  baseline throughout these checks. Encryption activation stays gated; P18 is
+  unchanged.
+
 - [ ] **P18 — Operations documentation and release gate**
   *(dependencies: P01–P17; size: S)*
   **Goal/scope:** document setup, recovery, external decryption, backups, visible
