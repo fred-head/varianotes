@@ -1443,7 +1443,40 @@ func newHandlerWithKeyManager(logger *slog.Logger, repositoryRoot string, authSe
 		writeJSON(w, http.StatusOK, map[string]any{"links": links})
 	})
 	mux.HandleFunc("DELETE /api/repository/entry", func(w http.ResponseWriter, r *http.Request) {
-		if _, noteAccess := currentContentContext(); rejectUnimplementedProtectedOperation(w, noteAccess) {
+		repository, noteAccess := currentContentContext()
+		lease, encrypted := beginProtectedNoteLease(w, r, noteAccess, sessions, keyManager)
+		if encrypted {
+			if lease == nil {
+				return
+			}
+			var item files.TrashItem
+			err := lease.UseKey(func(key []byte) error {
+				catalog, loadErr := noteAccess.catalogForKey(key)
+				if loadErr != nil {
+					return loadErr
+				}
+				var moveErr error
+				item, moveErr = repository.MoveToTrashWithCatalog(r.URL.Query().Get("path"), catalog, key, noteAccess.store, noteAccess.journal)
+				return moveErr
+			})
+			if err != nil {
+				lease.Close()
+				if errors.Is(err, encryption.ErrTransactionNeedsRecovery) {
+					noteAccess.needsRecovery()
+				}
+				writeProtectedNoteError(w, err)
+				return
+			}
+			if err := lease.Commit(func() error {
+				if err := presentationStore.deletePath(currentNotebookID(), item.OriginalPath); err != nil {
+					logger.Warn("delete image presentation metadata failed", "error", err)
+				}
+				w.Header().Set("Cache-Control", "no-store, private")
+				writeJSON(w, http.StatusOK, item)
+				return nil
+			}); err != nil {
+				writeProtectedNoteError(w, err)
+			}
 			return
 		}
 		item, err := currentRepository().MoveToTrash(r.URL.Query().Get("path"))
@@ -1456,8 +1489,35 @@ func newHandlerWithKeyManager(logger *slog.Logger, repositoryRoot string, authSe
 		}
 		writeJSON(w, http.StatusOK, item)
 	})
-	mux.HandleFunc("GET /api/repository/trash", func(w http.ResponseWriter, _ *http.Request) {
-		if _, noteAccess := currentContentContext(); rejectUnimplementedProtectedOperation(w, noteAccess) {
+	mux.HandleFunc("GET /api/repository/trash", func(w http.ResponseWriter, r *http.Request) {
+		repository, noteAccess := currentContentContext()
+		lease, encrypted := beginProtectedNoteLease(w, r, noteAccess, sessions, keyManager)
+		if encrypted {
+			if lease == nil {
+				return
+			}
+			var items []files.TrashItem
+			err := lease.UseKey(func(key []byte) error {
+				catalog, loadErr := noteAccess.catalogForKey(key)
+				if loadErr != nil {
+					return loadErr
+				}
+				var listErr error
+				items, listErr = repository.TrashItemsWithCatalog(catalog, key)
+				return listErr
+			})
+			if err != nil {
+				lease.Close()
+				writeProtectedNoteError(w, err)
+				return
+			}
+			if err := lease.Commit(func() error {
+				w.Header().Set("Cache-Control", "no-store, private")
+				writeJSON(w, http.StatusOK, map[string]any{"items": items})
+				return nil
+			}); err != nil {
+				writeProtectedNoteError(w, err)
+			}
 			return
 		}
 		items, err := currentRepository().TrashItems()
@@ -1468,7 +1528,43 @@ func newHandlerWithKeyManager(logger *slog.Logger, repositoryRoot string, authSe
 		writeJSON(w, http.StatusOK, map[string]any{"items": items})
 	})
 	mux.HandleFunc("POST /api/repository/trash/{trashID}/restore", func(w http.ResponseWriter, r *http.Request) {
-		if _, noteAccess := currentContentContext(); rejectUnimplementedProtectedOperation(w, noteAccess) {
+		var input struct {
+			ProtectionChoice string `json:"protectionChoice"`
+		}
+		if r.ContentLength != 0 && !decodeJSON(w, r, &input) {
+			return
+		}
+		repository, noteAccess := currentContentContext()
+		lease, encrypted := beginProtectedNoteLease(w, r, noteAccess, sessions, keyManager)
+		if encrypted {
+			if lease == nil {
+				return
+			}
+			var item files.TrashItem
+			err := lease.UseKey(func(key []byte) error {
+				catalog, loadErr := noteAccess.catalogForKey(key)
+				if loadErr != nil {
+					return loadErr
+				}
+				var restoreErr error
+				item, restoreErr = repository.RestoreTrashItemWithCatalog(r.PathValue("trashID"), input.ProtectionChoice, catalog, key, noteAccess.store, noteAccess.journal)
+				return restoreErr
+			})
+			if err != nil {
+				lease.Close()
+				if errors.Is(err, encryption.ErrTransactionNeedsRecovery) {
+					noteAccess.needsRecovery()
+				}
+				writeProtectedNoteError(w, err)
+				return
+			}
+			if err := lease.Commit(func() error {
+				w.Header().Set("Cache-Control", "no-store, private")
+				writeJSON(w, http.StatusOK, item)
+				return nil
+			}); err != nil {
+				writeProtectedNoteError(w, err)
+			}
 			return
 		}
 		item, err := currentRepository().RestoreTrashItem(r.PathValue("trashID"))
@@ -1479,7 +1575,37 @@ func newHandlerWithKeyManager(logger *slog.Logger, repositoryRoot string, authSe
 		writeJSON(w, http.StatusOK, item)
 	})
 	mux.HandleFunc("DELETE /api/repository/trash/{trashID}", func(w http.ResponseWriter, r *http.Request) {
-		if _, noteAccess := currentContentContext(); rejectUnimplementedProtectedOperation(w, noteAccess) {
+		repository, noteAccess := currentContentContext()
+		lease, encrypted := beginProtectedNoteLease(w, r, noteAccess, sessions, keyManager)
+		if encrypted {
+			if lease == nil {
+				return
+			}
+			var item files.TrashItem
+			err := lease.UseKey(func(key []byte) error {
+				catalog, loadErr := noteAccess.catalogForKey(key)
+				if loadErr != nil {
+					return loadErr
+				}
+				var deleteErr error
+				item, deleteErr = repository.DeleteTrashItemWithCatalog(r.PathValue("trashID"), catalog, key, noteAccess.store, noteAccess.journal)
+				return deleteErr
+			})
+			if err != nil {
+				lease.Close()
+				if errors.Is(err, encryption.ErrTransactionNeedsRecovery) {
+					noteAccess.needsRecovery()
+				}
+				writeProtectedNoteError(w, err)
+				return
+			}
+			if err := lease.Commit(func() error {
+				w.Header().Set("Cache-Control", "no-store, private")
+				writeJSON(w, http.StatusOK, item)
+				return nil
+			}); err != nil {
+				writeProtectedNoteError(w, err)
+			}
 			return
 		}
 		item, err := currentRepository().DeleteTrashItem(r.PathValue("trashID"))
@@ -1993,6 +2119,8 @@ func writeRepositoryError(w http.ResponseWriter, err error) {
 		status, message = http.StatusConflict, err.Error()
 	case errors.Is(err, files.ErrRestoreCollision):
 		status, message = http.StatusConflict, "The original location is already in use. Rename or move the existing item before restoring."
+	case errors.Is(err, files.ErrTrashReferencedAsset):
+		status, message = http.StatusConflict, err.Error()
 	case errors.Is(err, files.ErrInvalidTrashID):
 		status, message = http.StatusBadRequest, "invalid trash item"
 	case errors.Is(err, files.ErrLinkPreviewRequired):

@@ -97,7 +97,7 @@ func (r *Repository) PrepareExistingConversion(ctx context.Context, selectedPath
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	if err := validatePortableEntryPath(selectedPath, false); err != nil {
+	if err := validatePortableEntryPath(selectedPath, false); err != nil && !validTrashConversionSelection(selectedPath) {
 		return nil, err
 	}
 	if len(vaultKey) != encryption.VaultKeySize || catalogStore == nil || journal == nil {
@@ -153,7 +153,7 @@ func (r *Repository) PrepareExistingConversion(ctx context.Context, selectedPath
 		return fail(ErrConversionUnsafe)
 	}
 	for _, item := range trashItems {
-		if conversionPathSelected(item.OriginalPath, selectedPath, selectionIsFolder) {
+		if conversionPathSelected(item.OriginalPath, selectedPath, selectionIsFolder) || selectedPath == trashLogicalRoot(item) {
 			associatedTrash = append(associatedTrash, item)
 		}
 	}
@@ -230,21 +230,35 @@ func (r *Repository) PrepareExistingConversion(ctx context.Context, selectedPath
 			if err := ctx.Err(); err != nil {
 				return fail(err)
 			}
-			logicalPath, _, ok := resolveAssetReference(note.object.LogicalPath, destination)
+			referenceBase := note.object.LogicalPath
+			for _, item := range trashItems {
+				if mapped, ok := trashPathToOriginal(item, note.object.LogicalPath); ok {
+					referenceBase = mapped
+					break
+				}
+			}
+			logicalPath, _, ok := resolveAssetReference(referenceBase, destination)
 			if !ok {
 				continue
 			}
-			if _, exists := inventory.files[logicalPath]; exists {
+			physicalLogicalPath := logicalPath
+			for _, item := range trashItems {
+				if mapped, ok := trashOriginalPathToLogical(item, logicalPath); ok {
+					physicalLogicalPath = mapped
+					break
+				}
+			}
+			if _, exists := inventory.files[physicalLogicalPath]; exists {
 				continue
 			}
-			if object, exists := catalogNote(catalog, logicalPath); exists && object.Protected {
+			if object, exists := catalogNote(catalog, physicalLogicalPath); exists && object.Protected {
 				if err := inventory.addPhysical(ctx, object.PhysicalPath, encryption.CatalogObjectAsset); err != nil {
 					return fail(err)
 				}
 				continue
 			}
-			if _, statErr := r.content.lstat(logicalPath); errors.Is(statErr, os.ErrNotExist) {
-				if _, ageErr := r.content.lstat(logicalPath + ".age"); ageErr == nil {
+			if _, statErr := r.content.lstat(physicalLogicalPath); errors.Is(statErr, os.ErrNotExist) {
+				if _, ageErr := r.content.lstat(physicalLogicalPath + ".age"); ageErr == nil {
 					return fail(ErrConversionCollision)
 				} else if !errors.Is(ageErr, os.ErrNotExist) {
 					return fail(ageErr)
@@ -253,7 +267,7 @@ func (r *Repository) PrepareExistingConversion(ctx context.Context, selectedPath
 			} else if statErr != nil {
 				return fail(statErr)
 			}
-			if err := inventory.addPhysical(ctx, logicalPath, encryption.CatalogObjectAsset); err != nil {
+			if err := inventory.addPhysical(ctx, physicalLogicalPath, encryption.CatalogObjectAsset); err != nil {
 				return fail(err)
 			}
 		}
@@ -264,7 +278,7 @@ func (r *Repository) PrepareExistingConversion(ctx context.Context, selectedPath
 	}
 
 	nextCatalog := cloneCatalog(catalog)
-	if selectionIsFolder && !hasFolderRule(nextCatalog, selectedPath) {
+	if selectionInfo != nil && selectionIsFolder && !hasFolderRule(nextCatalog, selectedPath) {
 		nextCatalog.FolderRules = append(nextCatalog.FolderRules, encryption.FolderProtectionRule{Path: selectedPath})
 	}
 	changes := make([]encryption.CiphertextChange, 0, len(inventory.files)*2)
@@ -328,6 +342,19 @@ func (r *Repository) PrepareExistingConversion(ctx context.Context, selectedPath
 }
 
 func (r *Repository) resolveConversionSelection(selectedPath string, catalog encryption.Catalog, trash []resolvedTrashItem) (os.FileInfo, bool, error) {
+	for _, item := range trash {
+		if selectedPath != trashLogicalRoot(item) {
+			continue
+		}
+		if item.Type == "directory" {
+			info, err := r.content.lstat(item.contentPath)
+			if err != nil {
+				return nil, false, err
+			}
+			return info, true, nil
+		}
+		return nil, false, nil
+	}
 	info, err := r.content.lstat(selectedPath)
 	if err == nil {
 		if info.Mode()&os.ModeSymlink != 0 {
@@ -369,6 +396,11 @@ func (r *Repository) resolveConversionSelection(selectedPath string, catalog enc
 		return nil, false, err
 	}
 	return nil, selectedTrash.Type == "directory", nil
+}
+
+func validTrashConversionSelection(selectedPath string) bool {
+	parts := strings.Split(selectedPath, "/")
+	return len(parts) == 4 && parts[0] == trashDirectoryName && trashIDPattern.MatchString(parts[1]) && parts[2] == trashContentName && parts[3] == "item"
 }
 
 func conversionPathSelected(candidate, selected string, folder bool) bool {
@@ -422,6 +454,12 @@ func (inventory *conversionInventory) scanRoot(ctx context.Context, root, forced
 		}
 		if entry.Info.IsDir() {
 			lowerName := strings.ToLower(entry.Name)
+			if strings.HasSuffix(lowerName, ".assets") {
+				if err := inventory.scanRoot(ctx, entry.Path, string(encryption.CatalogObjectAsset)); err != nil {
+					return err
+				}
+				continue
+			}
 			if lowerName == ".git" || lowerName == ".trash" || lowerName == "node_modules" || pathWithinAssetDirectory(entry.Path) {
 				return errors.Join(ErrConversionUnsafe, fmt.Errorf("unsupported directory %q", entry.Path))
 			}

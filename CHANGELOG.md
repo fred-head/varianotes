@@ -8,6 +8,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- Added M31P13 journaled Trash, restore, and permanent deletion for protected
+  notes, folders, and attachments. Restores apply the same keep-protection or
+  decrypt choice as moves; collisions preserve both copies, shared attachments
+  stay available, and referenced or ambiguous Trash data fails closed. Pending
+  and completed operations reconcile after restart. M31 activation stays gated.
 - Added M31P12 policy-aware note and folder moves with protected link previews,
   automatic encryption when moving into a protected folder, and explicit
   keep-protected or decrypt choices when moving out. Catalog paths and

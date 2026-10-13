@@ -1600,6 +1600,37 @@ func TestProtectedNoteAPIEncryptsFirstCreateAndPreservesConflictDraft(t *testing
 	if movedAssetResponse.Code != http.StatusOK || !bytes.Equal(movedAssetResponse.Body.Bytes(), png) {
 		t.Fatalf("attachment did not follow its moved note: %d %s", movedAssetResponse.Code, movedAssetResponse.Body.String())
 	}
+	trashed := requestJSON(http.MethodDelete, "/api/repository/entry?path=archive%2FRenamed.md", map[string]string{})
+	if trashed.Code != http.StatusOK {
+		t.Fatalf("protected note Trash failed: %d %s", trashed.Code, trashed.Body.String())
+	}
+	var trashItem struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal(trashed.Body.Bytes(), &trashItem); err != nil || trashItem.ID == "" {
+		t.Fatalf("protected Trash ID missing: %#v err=%v", trashItem, err)
+	}
+	trashList := httptest.NewRecorder()
+	trashListRequest := httptest.NewRequest(http.MethodGet, "/api/repository/trash", nil)
+	trashListRequest.AddCookie(cookie)
+	handler.ServeHTTP(trashList, trashListRequest)
+	if trashList.Code != http.StatusOK || !strings.Contains(trashList.Body.String(), `"protected":true`) || !strings.Contains(trashList.Body.String(), `"protectionChoiceRequired":true`) {
+		t.Fatalf("protected Trash metadata missing: %d %s", trashList.Code, trashList.Body.String())
+	}
+	missingChoice := httptest.NewRecorder()
+	missingChoiceRequest := httptest.NewRequest(http.MethodPost, "/api/repository/trash/"+trashItem.ID+"/restore", nil)
+	addAuthRequestContext(missingChoiceRequest, cookie, csrf)
+	handler.ServeHTTP(missingChoice, missingChoiceRequest)
+	if missingChoice.Code != http.StatusConflict {
+		t.Fatalf("protected restore without a choice returned %d: %s", missingChoice.Code, missingChoice.Body.String())
+	}
+	restored := requestJSON(http.MethodPost, "/api/repository/trash/"+trashItem.ID+"/restore", map[string]string{"protectionChoice": "keep"})
+	if restored.Code != http.StatusOK {
+		t.Fatalf("protected keep restore failed: %d %s", restored.Code, restored.Body.String())
+	}
+	if _, err := os.Stat(ciphertextPath); err != nil {
+		t.Fatalf("protected restore did not return ciphertext to its original path: %v", err)
+	}
 	if err := os.WriteFile(ciphertextPath, []byte("corrupt"), 0o600); err != nil {
 		t.Fatal(err)
 	}

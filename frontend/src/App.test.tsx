@@ -495,6 +495,22 @@ describe('App auto-lock integration', () => {
 })
 
 describe('Trash bulk actions', () => {
+  it('asks how to restore protected content and sends the selected protection choice', async () => {
+    const item = { id: '3'.repeat(32), originalPath: 'private/Secret.md', type: 'file' as const, deletedAt: '2026-08-28T12:00:00Z', size: 32, protected: true, protectionChoiceRequired: true }
+    let remaining = [item]
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init) => {
+      const url = String(input)
+      if (url === '/api/repository/trash') return Response.json({ items: remaining })
+      if (url.endsWith('/restore') && init?.method === 'POST') { remaining = []; return Response.json(item) }
+      return Response.json({ error: 'unexpected request' }, { status: 500 })
+    })
+    const view = render(<TrashDialog onChanged={vi.fn(async () => undefined)} onClose={vi.fn()} />)
+    fireEvent.click(await view.findByRole('button', { name: 'Restore' }))
+    expect(view.getByRole('dialog', { name: 'Restore protected content?' })).toBeTruthy()
+    fireEvent.click(view.getByRole('button', { name: 'Decrypt and restore' }))
+    await waitFor(() => expect(fetchMock.mock.calls.some(([, init]) => init?.method === 'POST' && JSON.parse(String(init.body)).protectionChoice === 'decrypt')).toBe(true))
+  })
+
   it('selects all items and permanently deletes the complete selection', async () => {
     const items = [
       { id: '1'.repeat(32), originalPath: 'One.md', type: 'file' as const, deletedAt: '2026-08-28T10:00:00Z', size: 10 },
