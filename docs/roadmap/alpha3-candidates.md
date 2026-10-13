@@ -603,7 +603,7 @@ requires its listed tests; P17 adds end-to-end and adversarial coverage.
   release; document any remaining finding and confirm it does not weaken the
   agreed security boundary. Obtain reviewer sign-off.
 
-  **P17 status — validation in progress (2026-10-13):** conversion and journal
+  **P17 status — validation passed; independent review pending (2026-10-13):** conversion and journal
   fault/restart boundaries are covered by the P06/P11 tests; protected move
   rollback and Trash restart reconciliation by the P12/P13 tests. Added focused
   P17 tests for an uncommitted protected save recovered after restart, export
@@ -622,17 +622,24 @@ requires its listed tests; P17 adds end-to-end and adversarial coverage.
   The first PR CI pass flagged path-based file access and the age subprocess in
   the test helper. The helper now uses root-scoped file operations and streams
   ciphertext/plaintext through opened file handles; the same gosec version
-  passes on that package locally. Full PR CI is being rerun after the fix.
+  passes on that package locally. PR #24's rerun (CI run `38462730099`) passed
+  all required jobs, including frontend/npm security, secret scanning, backend
+  tests and security analysis, the race detector, vulnerability scanning, and
+  the hardened container release gate. All three CodeQL language analyses and
+  the CodeQL check also passed.
   Local validation passed with serial Go package execution and a 1.5-GiB Go
   memory limit: `go test -p 1 -count=1 ./internal/encryption ./internal/files
   ./internal/app`, `go test -p 1 -count=1 ./internal/auth ./cmd/varianotes`,
   the focused lock-race test under `-race`, `go vet -p 1` for the affected Go
   packages, targeted `gosec -quiet ./internal/files/externalrestore`, and
-  `git diff --check`. The independent reviewer sign-off and full required PR CI
-  are still pending. The current local test/review pass has no unresolved
-  finding; it is not an independent security approval. P17 remains open until
-  the independent review passes. Swap use remained at its 3.4-GiB baseline
-  throughout these checks. Encryption activation stays gated; P18 is unchanged.
+  `git diff --check`. The independent reviewer sign-off remains pending: PR #24
+  has no review submissions or requests, and the repository's current
+  collaborator/contributor lists show only the PR author (`fred-head`) and
+  `dependabot[bot]`; neither provides an independent security review. Local
+  review and passing CI do not satisfy that approval requirement. P17 remains
+  open until an independent reviewer signs off. Swap use remained at its
+  3.4-GiB baseline throughout these checks. Encryption activation stays gated;
+  P18 is unchanged.
 
 - [ ] **P18 — Operations documentation and release gate**
   *(dependencies: P01–P17; size: S)*
