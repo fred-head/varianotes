@@ -1,6 +1,7 @@
 package app
 
 import (
+	"bytes"
 	"database/sql"
 	"encoding/base64"
 	"encoding/json"
@@ -1395,25 +1396,52 @@ func newHandlerWithKeyManager(logger *slog.Logger, repositoryRoot string, authSe
 		writeJSON(w, http.StatusOK, item)
 	})
 	mux.HandleFunc("POST /api/repository/assets", func(w http.ResponseWriter, r *http.Request) {
-		if _, noteAccess := currentContentContext(); rejectUnimplementedProtectedOperation(w, noteAccess) {
+		repository, noteAccess := currentContentContext()
+		lease, encrypted := beginProtectedNoteLease(w, r, noteAccess, sessions, keyManager)
+		if encrypted && lease == nil {
 			return
 		}
-		r.Body = http.MaxBytesReader(w, r.Body, maxAssetRequestBodySize)
-		// #nosec G120 -- MaxBytesReader enforces the complete multipart request limit before parsing.
-		if err := r.ParseMultipartForm(maxAssetRequestBodySize); err != nil {
-			writeJSON(w, http.StatusRequestEntityTooLarge, map[string]string{"error": "image upload is too large"})
-			return
-		}
-		if r.MultipartForm != nil {
-			defer r.MultipartForm.RemoveAll()
-		}
-		upload, _, err := r.FormFile("file")
+		content, err := readAssetUpload(w, r)
 		if err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "image file is required"})
+			var maxBytesError *http.MaxBytesError
+			if errors.Is(err, files.ErrAssetTooLarge) || errors.As(err, &maxBytesError) {
+				writeJSON(w, http.StatusRequestEntityTooLarge, map[string]string{"error": "image upload is too large"})
+			} else {
+				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid image upload"})
+			}
 			return
 		}
-		defer upload.Close()
-		asset, err := currentRepository().SaveAsset(r.URL.Query().Get("note"), upload)
+		defer clear(content)
+		note := r.URL.Query().Get("note")
+		if encrypted {
+			var operation *files.PreparedAssetOperation
+			if err := lease.UseKey(func(key []byte) error {
+				catalog, loadErr := noteAccess.catalogForKey(key)
+				if loadErr != nil {
+					return loadErr
+				}
+				var prepareErr error
+				operation, _, prepareErr = repository.PrepareAssetUploadWithCatalog(note, content, catalog, key, noteAccess.store, noteAccess.journal)
+				return prepareErr
+			}); err != nil {
+				lease.Close()
+				writeProtectedNoteError(w, err)
+				return
+			}
+			err := lease.Commit(func() error {
+				return operation.Commit(func(asset files.Asset) error {
+					writeJSON(w, http.StatusCreated, map[string]string{"path": asset.RelativePath})
+					return nil
+				})
+			})
+			if err != nil {
+				operation.Abort()
+				noteAccess.needsRecovery()
+				writeProtectedNoteError(w, err)
+			}
+			return
+		}
+		asset, err := repository.SaveAsset(note, bytes.NewReader(content))
 		if err != nil {
 			writeRepositoryError(w, err)
 			return
@@ -1421,30 +1449,98 @@ func newHandlerWithKeyManager(logger *slog.Logger, repositoryRoot string, authSe
 		writeJSON(w, http.StatusCreated, map[string]string{"path": asset.RelativePath})
 	})
 	mux.HandleFunc("GET /api/repository/asset", func(w http.ResponseWriter, r *http.Request) {
-		if _, noteAccess := currentContentContext(); rejectUnimplementedProtectedOperation(w, noteAccess) {
+		repository, noteAccess := currentContentContext()
+		lease, encrypted := beginProtectedNoteLease(w, r, noteAccess, sessions, keyManager)
+		if encrypted && lease == nil {
 			return
 		}
-		asset, err := currentRepository().ReadAsset(r.URL.Query().Get("note"), r.URL.Query().Get("path"))
+		writeAsset := func(asset files.Asset, cacheControl string) {
+			defer clear(asset.Content)
+			w.Header().Set("Content-Type", asset.ContentType)
+			w.Header().Set("X-Content-Type-Options", "nosniff")
+			w.Header().Set("Cache-Control", cacheControl)
+			w.WriteHeader(http.StatusOK)
+			if r.Method != http.MethodHead {
+				_, _ = w.Write(asset.Content)
+			}
+		}
+		if encrypted {
+			var asset files.Asset
+			if err := lease.UseKey(func(key []byte) error {
+				catalog, loadErr := noteAccess.catalogForKey(key)
+				if loadErr != nil {
+					return loadErr
+				}
+				var readErr error
+				asset, _, readErr = repository.ReadAssetWithCatalog(r.URL.Query().Get("note"), r.URL.Query().Get("path"), catalog, key)
+				return readErr
+			}); err != nil {
+				lease.Close()
+				writeProtectedNoteError(w, err)
+				return
+			}
+			if err := lease.Commit(func() error {
+				writeAsset(asset, "no-store, private")
+				return nil
+			}); err != nil {
+				clear(asset.Content)
+				writeProtectedNoteError(w, err)
+			}
+			return
+		}
+		asset, err := repository.ReadAsset(r.URL.Query().Get("note"), r.URL.Query().Get("path"))
 		if err != nil {
 			writeRepositoryError(w, err)
 			return
 		}
-		w.Header().Set("Content-Type", asset.ContentType)
-		w.Header().Set("X-Content-Type-Options", "nosniff")
-		w.Header().Set("Cache-Control", "no-store")
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write(asset.Content)
+		writeAsset(asset, "no-store")
 	})
 	mux.HandleFunc("GET /api/repository/image-presentations", func(w http.ResponseWriter, r *http.Request) {
-		if _, noteAccess := currentContentContext(); rejectUnimplementedProtectedOperation(w, noteAccess) {
+		repository, noteAccess := currentContentContext()
+		note := r.URL.Query().Get("note")
+		lease, encrypted := beginProtectedNoteLease(w, r, noteAccess, sessions, keyManager)
+		if encrypted && lease == nil {
 			return
 		}
-		note := r.URL.Query().Get("note")
-		if _, err := currentRepository().ReadMarkdown(note); err != nil {
+		load := func() (map[string]imagePresentationSize, error) {
+			presentations, err := presentationStore.list(currentNotebookID(), note)
+			if err != nil {
+				return nil, err
+			}
+			return presentations, nil
+		}
+		if encrypted {
+			var presentations map[string]imagePresentationSize
+			if err := lease.UseKey(func(key []byte) error {
+				catalog, loadErr := noteAccess.catalogForKey(key)
+				if loadErr != nil {
+					return loadErr
+				}
+				if _, _, readErr := repository.ReadMarkdownWithCatalog(note, catalog, key); readErr != nil {
+					return readErr
+				}
+				var listErr error
+				presentations, listErr = load()
+				return listErr
+			}); err != nil {
+				lease.Close()
+				writeProtectedNoteError(w, err)
+				return
+			}
+			if err := lease.Commit(func() error {
+				w.Header().Set("Cache-Control", "no-store, private")
+				writeJSON(w, http.StatusOK, map[string]any{"presentations": presentations})
+				return nil
+			}); err != nil {
+				writeProtectedNoteError(w, err)
+			}
+			return
+		}
+		if _, err := repository.ReadMarkdown(note); err != nil {
 			writeRepositoryError(w, err)
 			return
 		}
-		presentations, err := presentationStore.list(currentNotebookID(), note)
+		presentations, err := load()
 		if err != nil {
 			logger.Warn("read image presentation metadata failed", "error", err)
 			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "image presentation settings are unavailable"})
@@ -1462,24 +1558,66 @@ func newHandlerWithKeyManager(logger *slog.Logger, repositoryRoot string, authSe
 		if !decodeJSON(w, r, &input) {
 			return
 		}
-		if _, noteAccess := currentContentContext(); rejectUnimplementedProtectedOperation(w, noteAccess) {
+		repository, noteAccess := currentContentContext()
+		lease, encrypted := beginProtectedNoteLease(w, r, noteAccess, sessions, keyManager)
+		if encrypted && lease == nil {
 			return
 		}
 		if !input.Size.valid() {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "image size must be small, medium, large, or full"})
 			return
 		}
-		if _, err := currentRepository().ReadAsset(input.Note, input.Image); err != nil {
+		set := func() error {
+			return presentationStore.set(currentNotebookID(), input.Note, input.Image, input.Size, input.PreviousImage)
+		}
+		if encrypted {
+			if err := lease.UseKey(func(key []byte) error {
+				catalog, loadErr := noteAccess.catalogForKey(key)
+				if loadErr != nil {
+					return loadErr
+				}
+				asset, _, readErr := repository.ReadAssetWithCatalog(input.Note, input.Image, catalog, key)
+				clear(asset.Content)
+				if readErr != nil {
+					return readErr
+				}
+				if input.PreviousImage != "" {
+					previous, _, previousErr := repository.ReadAssetWithCatalog(input.Note, input.PreviousImage, catalog, key)
+					clear(previous.Content)
+					if previousErr != nil {
+						return previousErr
+					}
+				}
+				return nil
+			}); err != nil {
+				lease.Close()
+				writeProtectedNoteError(w, err)
+				return
+			}
+			if err := lease.Commit(func() error {
+				if err := set(); err != nil {
+					logger.Warn("write image presentation metadata failed", "error", err)
+					writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "image presentation setting could not be saved"})
+					return nil
+				}
+				writeJSON(w, http.StatusOK, map[string]string{"image": input.Image, "size": string(input.Size)})
+				return nil
+			}); err != nil {
+				writeProtectedNoteError(w, err)
+			}
+			return
+		}
+		if _, err := repository.ReadAsset(input.Note, input.Image); err != nil {
 			writeRepositoryError(w, err)
 			return
 		}
 		if input.PreviousImage != "" {
-			if _, err := currentRepository().ReadAsset(input.Note, input.PreviousImage); err != nil {
+			if _, err := repository.ReadAsset(input.Note, input.PreviousImage); err != nil {
 				writeRepositoryError(w, err)
 				return
 			}
 		}
-		if err := presentationStore.set(currentNotebookID(), input.Note, input.Image, input.Size, input.PreviousImage); err != nil {
+		if err := set(); err != nil {
 			logger.Warn("write image presentation metadata failed", "error", err)
 			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "image presentation setting could not be saved"})
 			return
@@ -1487,15 +1625,48 @@ func newHandlerWithKeyManager(logger *slog.Logger, repositoryRoot string, authSe
 		writeJSON(w, http.StatusOK, map[string]string{"image": input.Image, "size": string(input.Size)})
 	})
 	mux.HandleFunc("DELETE /api/repository/image-presentation", func(w http.ResponseWriter, r *http.Request) {
-		if _, noteAccess := currentContentContext(); rejectUnimplementedProtectedOperation(w, noteAccess) {
+		repository, noteAccess := currentContentContext()
+		lease, encrypted := beginProtectedNoteLease(w, r, noteAccess, sessions, keyManager)
+		if encrypted && lease == nil {
 			return
 		}
 		note, image := r.URL.Query().Get("note"), r.URL.Query().Get("image")
-		if _, err := currentRepository().ReadAsset(note, image); err != nil {
+		remove := func() error { return presentationStore.deleteImage(currentNotebookID(), note, image) }
+		if encrypted {
+			if err := lease.UseKey(func(key []byte) error {
+				catalog, loadErr := noteAccess.catalogForKey(key)
+				if loadErr != nil {
+					return loadErr
+				}
+				asset, _, readErr := repository.ReadAssetWithCatalog(note, image, catalog, key)
+				clear(asset.Content)
+				if readErr != nil {
+					return readErr
+				}
+				return nil
+			}); err != nil {
+				lease.Close()
+				writeProtectedNoteError(w, err)
+				return
+			}
+			if err := lease.Commit(func() error {
+				if err := remove(); err != nil {
+					logger.Warn("delete image presentation metadata failed", "error", err)
+					writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "image presentation setting could not be removed"})
+					return nil
+				}
+				w.WriteHeader(http.StatusNoContent)
+				return nil
+			}); err != nil {
+				writeProtectedNoteError(w, err)
+			}
+			return
+		}
+		if _, err := repository.ReadAsset(note, image); err != nil {
 			writeRepositoryError(w, err)
 			return
 		}
-		if err := presentationStore.deleteImage(currentNotebookID(), note, image); err != nil {
+		if err := remove(); err != nil {
 			logger.Warn("delete image presentation metadata failed", "error", err)
 			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "image presentation setting could not be removed"})
 			return
@@ -1655,6 +1826,43 @@ func newHandlerWithKeyManager(logger *slog.Logger, repositoryRoot string, authSe
 const maxRequestBodySize = (10 << 20) + (64 << 10)
 const maxAssetRequestBodySize = (10 << 20) + (1 << 20)
 const maxAuthRequestBodySize = 4 << 10
+
+func readAssetUpload(w http.ResponseWriter, r *http.Request) ([]byte, error) {
+	r.Body = http.MaxBytesReader(w, r.Body, maxAssetRequestBodySize)
+	reader, err := r.MultipartReader()
+	if err != nil {
+		return nil, err
+	}
+	part, err := reader.NextPart()
+	if err != nil {
+		return nil, err
+	}
+	if part.FormName() != "file" || part.FileName() == "" {
+		_ = part.Close()
+		return nil, errors.New("image file is required")
+	}
+	content, readErr := io.ReadAll(io.LimitReader(part, files.MaxAssetSize+1))
+	closeErr := part.Close()
+	if err := errors.Join(readErr, closeErr); err != nil {
+		clear(content)
+		return nil, err
+	}
+	if int64(len(content)) > files.MaxAssetSize {
+		clear(content)
+		return nil, files.ErrAssetTooLarge
+	}
+	extra, err := reader.NextPart()
+	if err == nil {
+		_ = extra.Close()
+		clear(content)
+		return nil, errors.New("unexpected multipart field")
+	}
+	if !errors.Is(err, io.EOF) {
+		clear(content)
+		return nil, err
+	}
+	return content, nil
+}
 
 func decodeJSON(w http.ResponseWriter, r *http.Request, target any) bool {
 	return decodeJSONWithLimit(w, r, target, maxRequestBodySize)

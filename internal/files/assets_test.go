@@ -47,13 +47,25 @@ func TestSaveAssetRejectsUnsupportedAndOversizedFiles(t *testing.T) {
 	}
 }
 
-func TestReadAssetRejectsWrongOwnershipAndTraversal(t *testing.T) {
+func TestReadAssetSupportsSharedReferencesAndRejectsTraversal(t *testing.T) {
 	root := t.TempDir()
 	mustWrite(t, filepath.Join(root, "Note.md"), "note")
+	mustWrite(t, filepath.Join(root, "Nested", "Shared.md"), "shared")
 	mustWrite(t, filepath.Join(root, "Other.assets", "image.png"), string(testPNG))
 	repository := mustRepository(t, root)
 
-	for _, unsafe := range []string{"Other.assets/image.png", "../image.png", "/image.png", `Note.assets\image.png`} {
+	for _, note := range []string{"Note.md", "Nested/Shared.md"} {
+		assetPath := "Other.assets/image.png"
+		if note == "Nested/Shared.md" {
+			assetPath = "../Other.assets/image.png"
+		}
+		loaded, err := repository.ReadAsset(note, assetPath)
+		if err != nil || !bytes.Equal(loaded.Content, testPNG) {
+			t.Fatalf("shared asset read from %q failed: %#v %v", note, loaded, err)
+		}
+	}
+
+	for _, unsafe := range []string{"../image.png", "/image.png", `Other.assets\image.png`, "..%2Foutside.assets%2Fimage.png", "%2e%2e%2foutside.assets%2fimage.png"} {
 		if _, err := repository.ReadAsset("Note.md", unsafe); !errors.Is(err, ErrInvalidPath) {
 			t.Errorf("expected %q to be rejected, got %v", unsafe, err)
 		}

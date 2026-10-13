@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -165,6 +166,143 @@ func TestProtectedMarkdownCorruptionFailsClosedAndPreservesBytes(t *testing.T) {
 	after, err := os.ReadFile(physicalPath)
 	if err != nil || !bytes.Equal(before, after) {
 		t.Fatalf("corrupt content was changed: err=%v", err)
+	}
+}
+
+func TestProtectedAssetUploadAndSharedReadUseOneCiphertextObject(t *testing.T) {
+	root := t.TempDir()
+	metadata := t.TempDir()
+	if err := os.Mkdir(filepath.Join(root, "private"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	mustWrite(t, filepath.Join(root, "Public.md"), "# Public\n")
+	repository := mustRepository(t, root)
+	key := bytes.Repeat([]byte{0x62}, encryption.VaultKeySize)
+	catalog, err := encryption.NewCatalog()
+	if err != nil {
+		t.Fatal(err)
+	}
+	catalog.FolderRules = []encryption.FolderProtectionRule{{Path: "private"}}
+	store, journal := protectedFixture(t, root, metadata, catalog, key)
+
+	create, _, err := repository.PrepareMarkdownCreateWithCatalog("private/Note.md", catalog, key, store, journal)
+	if err != nil || create.Commit(nil) != nil {
+		t.Fatalf("create protected note: operation=%v err=%v", create, err)
+	}
+	catalog, err = store.Load(key, catalog.VaultID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	upload, protected, err := repository.PrepareAssetUploadWithCatalog("private/Note.md", testPNG, catalog, key, store, journal)
+	if err != nil || !protected {
+		t.Fatalf("prepare protected asset upload: protected=%v err=%v", protected, err)
+	}
+	plainPath := filepath.Join(root, "private", filepath.FromSlash(upload.Asset.RelativePath))
+	ciphertextPath := plainPath + ".age"
+	if _, err := os.Stat(plainPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("plaintext attachment appeared before commit: %v", err)
+	}
+	if err := upload.Commit(nil); err != nil {
+		t.Fatalf("commit protected asset upload: %v", err)
+	}
+	if _, err := os.Stat(plainPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("protected attachment was stored in plaintext: %v", err)
+	}
+	ciphertext, err := os.ReadFile(ciphertextPath)
+	if err != nil || bytes.Contains(ciphertext, testPNG) {
+		t.Fatalf("protected attachment ciphertext missing or contains plaintext: err=%v", err)
+	}
+	catalog, err = store.Load(key, catalog.VaultID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assetLogicalPath := "private/" + upload.Asset.RelativePath
+	assetObject, found := catalogNote(catalog, assetLogicalPath)
+	if !found || assetObject.Kind != encryption.CatalogObjectAsset || !assetObject.Protected {
+		t.Fatalf("protected attachment was not cataloged: %#v found=%v", assetObject, found)
+	}
+
+	privateNote, _, err := repository.ReadMarkdownWithCatalog("private/Note.md", catalog, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeNote, protected, err := repository.PrepareMarkdownWriteWithCatalog(
+		"private/Note.md", privateNote.Content+"\n![shared](Note.assets/"+path.Base(upload.Asset.RelativePath)+")\n", privateNote.Version, catalog, key, store, journal,
+	)
+	if err != nil || !protected {
+		t.Fatalf("reference uploaded shared asset from protected note: protected=%v err=%v", protected, err)
+	}
+	if err := writeNote.Commit(nil); err != nil {
+		t.Fatal(err)
+	}
+	catalog, err = store.Load(key, catalog.VaultID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	publicNote, err := repository.ReadMarkdown("Public.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repository.WriteMarkdown("Public.md", "![shared]("+assetLogicalPath+")\n", publicNote.Version); err != nil {
+		t.Fatal(err)
+	}
+	loaded, protected, err := repository.ReadAssetWithCatalog("Public.md", assetLogicalPath, catalog, key)
+	if err != nil || !protected || !bytes.Equal(loaded.Content, testPNG) {
+		t.Fatalf("shared encrypted attachment read failed: asset=%#v protected=%v err=%v", loaded, protected, err)
+	}
+	clear(loaded.Content)
+	for _, unsafe := range []string{"../outside.assets/image.png", "..%2Foutside.assets%2Fimage.png", "%2e%2e%2foutside.assets%2fimage.png", "https://example.test/image.png"} {
+		if _, _, err := repository.ReadAssetWithCatalog("Public.md", unsafe, catalog, key); !errors.Is(err, ErrInvalidPath) {
+			t.Errorf("protected asset path %q was not rejected: %v", unsafe, err)
+		}
+	}
+	privateNote, _, err = repository.ReadMarkdownWithCatalog("private/Note.md", catalog, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	removeReference, _, err := repository.PrepareMarkdownWriteWithCatalog("private/Note.md", "# Note\n", privateNote.Version, catalog, key, store, journal)
+	if err != nil {
+		t.Fatalf("prepare removal of one shared attachment reference: %v", err)
+	}
+	if err := removeReference.Commit(nil); err != nil {
+		t.Fatal(err)
+	}
+	catalog, err = store.Load(key, catalog.VaultID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stillShared, protected, err := repository.ReadAssetWithCatalog("Public.md", assetLogicalPath, catalog, key)
+	if err != nil || !protected || !bytes.Equal(stillShared.Content, testPNG) {
+		t.Fatalf("attachment stopped working after one of two references was removed: protected=%v err=%v", protected, err)
+	}
+	clear(stillShared.Content)
+	afterReferenceRemoval, err := os.ReadFile(ciphertextPath)
+	if err != nil || !bytes.Equal(afterReferenceRemoval, ciphertext) {
+		t.Fatalf("removing one reference changed or deleted attachment ciphertext: err=%v", err)
+	}
+
+	if err := os.Mkdir(filepath.Join(root, "Shared.assets"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "Shared.assets", "plain.png"), testPNG, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	updatedNote, _, err := repository.ReadMarkdownWithCatalog("private/Note.md", catalog, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeNote, _, err = repository.PrepareMarkdownWriteWithCatalog(
+		"private/Note.md", updatedNote.Content+"\n![not converted](../Shared.assets/plain.png)\n", updatedNote.Version, catalog, key, store, journal,
+	)
+	if err != nil || writeNote.Commit(nil) != nil {
+		t.Fatalf("add reference to pre-conversion shared asset: operation=%v err=%v", writeNote, err)
+	}
+	catalog, err = store.Load(key, catalog.VaultID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := repository.ReadAssetWithCatalog("Public.md", "Shared.assets/plain.png", catalog, key); !errors.Is(err, ErrProtectedObjectMissing) {
+		t.Fatalf("plaintext shared asset referenced by a protected note did not fail closed: %v", err)
 	}
 }
 

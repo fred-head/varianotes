@@ -8,6 +8,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- Added M31P10 catalog-backed image attachments with stable object identities,
+  encrypted first-write uploads, shared Markdown-relative references, and
+  locked-image placeholders. Multipart uploads stay bounded in memory without
+  plaintext temporary files; encrypted reads are session-lease checked and
+  cached only as `no-store` responses. M31 activation remains gated.
 - Added M31P09 policy-aware protected Markdown reads, first-write encrypted
   note creation, and journaled saves with ciphertext-backed conflict versions.
   The wrapped per-file age key is stored in the authenticated catalog. Locked

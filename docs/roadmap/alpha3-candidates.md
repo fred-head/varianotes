@@ -245,8 +245,8 @@ Completion criteria:
 
 ## Milestone 31 - Selective encryption for notes and folders
 
-M31 remains in Alpha 3. This checklist is the implementation plan. **P01–P08
-are complete; P09–P18 remain open.** M31 is not complete until P01–P18 are
+M31 remains in Alpha 3. This checklist is the implementation plan. **P01–P10
+are complete; P11–P18 remain open.** M31 is not complete until P01–P18 are
 complete and the independent security review in P17 has passed. Encryption
 activation must stay disabled in the UI, API, and any operator command until
 the P18 release gate passes.
@@ -454,7 +454,7 @@ requires its listed tests; P17 adds end-to-end and adversarial coverage.
   content routes remain unavailable while locked, and no unlock or activation
   path is exposed before the M31 release gate.
 
-- [ ] **P10 — Shared images and attachments**
+- [x] **P10 — Shared images and attachments**
   *(dependencies: P01–P06, P09; size: L)*
   **Goal/scope:** stable attachment identity and safe reference resolution;
   encrypted upload/read and global protection when any protected rule applies.
@@ -462,6 +462,13 @@ requires its listed tests; P17 adds end-to-end and adversarial coverage.
   references show “Geschützter Anhang”; removing one reference does not decrypt
   or delete a still-used object; encoded/traversal paths and bounded large-file
   streams are covered; multipart upload leaves no plaintext spill files.
+  Implemented catalog-backed attachment objects and journaled first-write
+  encryption, with shared Markdown-relative path resolution and a fail-closed
+  check for plaintext attachments referenced by protected notes. Multipart
+  uploads stream through a bounded reader without temporary files. Locked image
+  requests return no content and the editor shows “Geschützter Anhang”; shared
+  cleanup tests retain an object until every reference is removed. M31
+  activation remains gated by P11–P18 and the independent security review.
 
 - [ ] **P11 — Convert existing notes, folders, and attachments**
   *(dependencies: P04, P06, P09, P10; size: L)*

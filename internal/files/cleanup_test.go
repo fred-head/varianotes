@@ -95,6 +95,34 @@ func TestDeleteUnreferencedAssetsRevalidatesReferences(t *testing.T) {
 	}
 }
 
+func TestSharedAssetCleanupRetainsObjectUntilEveryReferenceIsRemoved(t *testing.T) {
+	root := t.TempDir()
+	mustWrite(t, filepath.Join(root, "Shared.md"), "# Shared\n")
+	mustWrite(t, filepath.Join(root, "First.md"), "![first](Shared.assets/image.png)\n")
+	mustWrite(t, filepath.Join(root, "Second.md"), "![second](Shared.assets/image.png)\n")
+	mustWrite(t, filepath.Join(root, "Shared.assets", "image.png"), string(testPNG))
+	repository := mustRepository(t, root)
+
+	result, err := repository.DeleteUnreferencedAssets([]string{"Shared.assets/image.png"})
+	if err != nil || len(result.Deleted) != 0 || len(result.Failures) != 1 {
+		t.Fatalf("shared attachment with two references was deleted: %#v err=%v", result, err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "First.md"), []byte("# First\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	result, err = repository.DeleteUnreferencedAssets([]string{"Shared.assets/image.png"})
+	if err != nil || len(result.Deleted) != 0 {
+		t.Fatalf("attachment was deleted while its second reference remained: %#v err=%v", result, err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "Second.md"), []byte("# Second\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	result, err = repository.DeleteUnreferencedAssets([]string{"Shared.assets/image.png"})
+	if err != nil || len(result.Deleted) != 1 {
+		t.Fatalf("unreferenced shared attachment was not eligible for cleanup: %#v err=%v", result, err)
+	}
+}
+
 func TestDeleteUnreferencedAssetsRejectsManipulatedPaths(t *testing.T) {
 	root := t.TempDir()
 	mustWrite(t, filepath.Join(root, "Note.md"), "note")
