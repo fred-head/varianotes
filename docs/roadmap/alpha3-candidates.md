@@ -245,8 +245,8 @@ Completion criteria:
 
 ## Milestone 31 - Selective encryption for notes and folders
 
-M31 remains in Alpha 3. This checklist is the implementation plan. **P01–P11
-are complete; P12–P18 remain open.** M31 is not complete until P01–P18 are
+M31 remains in Alpha 3. This checklist is the implementation plan. **P01–P14
+are complete; P15–P18 remain open.** M31 is not complete until P01–P18 are
 complete and the independent security review in P17 has passed. Encryption
 activation must stay disabled in the UI, API, and any operator command until
 the P18 release gate passes.
@@ -516,7 +516,7 @@ requires its listed tests; P17 adds end-to-end and adversarial coverage.
   data blocks permanent deletion. Interrupted staging and post-commit directory
   cleanup reconcile safely; M31 activation remains gated.
 
-- [ ] **P14 — Search, caches, and plaintext leak checks**
+- [x] **P14 — Search, caches, and plaintext leak checks**
   *(dependencies: P05, P09, P10; size: M)*
   **Goal/scope:** search protected content only while unlocked; review derived
   previews, API responses, logs, temporary files, browser storage, and service
@@ -524,6 +524,18 @@ requires its listed tests; P17 adds end-to-end and adversarial coverage.
   **Acceptance/tests:** no persistent plaintext index; lock discards results;
   late responses stay hidden; sentinel content/passwords are absent from logs,
   metadata, temp files, persistent browser storage, and API caches.
+  Implemented catalog-authenticated Markdown search under the repository read
+  lock and per-session key lease. Protected ciphertext digests are verified;
+  corruption fails closed. Search uses a bounded JSON POST body so terms do not
+  appear in request URLs or application request logs. API responses use
+  `no-store`; the service worker precaches only static assets and sends API
+  requests to `NetworkOnly`. Search query and excerpts remain in request or
+  process/browser memory only. A server lock event aborts the request and clears
+  the query/results; generation checks discard late responses. Focused Go,
+  frontend, lint, typecheck, and `go vet` checks passed. Sentinel tests confirm
+  no plaintext search content or password in vault/metadata/temp files or
+  request logs. Browser storage and the protected API cache policy are covered
+  by focused tests. No claim of physical memory erasure is made.
 
 - [ ] **P15 — Reauthenticated plaintext ZIP export**
   *(dependencies: P05, P06, P09–P14; size: L)*

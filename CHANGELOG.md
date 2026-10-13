@@ -8,6 +8,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- Added M31P14 search over protected notes only while a valid session key lease
+  is active. Search requests avoid putting query text in URLs, results use
+  `no-store`, and the browser drops results and ignores late responses after a
+  server lock. Search data is not indexed or persisted; M31 activation stays
+  gated.
 - Added M31P13 journaled Trash, restore, and permanent deletion for protected
   notes, folders, and attachments. Restores apply the same keep-protection or
   decrypt choice as moves; collisions preserve both copies, shared attachments

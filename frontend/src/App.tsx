@@ -140,6 +140,9 @@ export function App({ authMode = 'disabled', runningVersion = 'dev', onLoggedOut
   const [searchResults, setSearchResults] = useState<SearchResult[]>([])
   const [searchLoading, setSearchLoading] = useState(false)
   const [searchError, setSearchError] = useState<string>()
+  const searchController = useRef<AbortController | null>(null)
+  const searchRequestGeneration = useRef(0)
+  const searchVaultUnlocked = useRef(false)
   const activeDraft = useRef<Draft | undefined>(undefined)
   const saveTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined)
   const savePromise = useRef<Promise<FileResponse> | undefined>(undefined)
@@ -149,10 +152,20 @@ export function App({ authMode = 'disabled', runningVersion = 'dev', onLoggedOut
   const autoLockController = useRef<AutoLockController | null>(null)
   const noteHeaderStack = useRef<HTMLDivElement>(null)
   const [noteHeaderHeight, setNoteHeaderHeight] = useState(0)
+  const discardSearchState = useCallback(() => {
+    searchRequestGeneration.current++
+    searchController.current?.abort()
+    searchController.current = null
+    setSearchQuery('')
+    setSearchResults([])
+    setSearchLoading(false)
+    setSearchError(undefined)
+  }, [])
 
   useEffect(() => listenForAuthEvents(() => {
     setReadOnly(true)
-  }, () => undefined), [])
+    discardSearchState()
+  }, discardSearchState), [discardSearchState])
 
   useEffect(() => {
     const handleOnline = () => setBrowserOnline(true)
@@ -178,24 +191,63 @@ export function App({ authMode = 'disabled', runningVersion = 'dev', onLoggedOut
     const query = searchQuery.trim()
     if (!query) return
     const controller = new AbortController()
+    const generation = ++searchRequestGeneration.current
+    searchController.current = controller
     const timer = globalThis.setTimeout(async () => {
       setSearchLoading(true)
       setSearchError(undefined)
+      setSearchResults([])
       try {
-        const response = await apiFetch(`/api/repository/search?q=${encodeURIComponent(query)}`, { signal: controller.signal })
+        const response = await apiFetch('/api/repository/search', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ query }),
+          signal: controller.signal,
+        })
         const data = await responseJSON<{ results: SearchResult[] }>(response)
-        setSearchResults(data.results)
+        if (!controller.signal.aborted && searchRequestGeneration.current === generation) setSearchResults(data.results)
       } catch (error) {
-        if (!controller.signal.aborted) setSearchError(messageFrom(error))
+        if (!controller.signal.aborted && searchRequestGeneration.current === generation) {
+          if (error instanceof APIError && error.status === 423) discardSearchState()
+          else setSearchError(messageFrom(error))
+        }
       } finally {
-        if (!controller.signal.aborted) setSearchLoading(false)
+        if (!controller.signal.aborted && searchRequestGeneration.current === generation) setSearchLoading(false)
       }
     }, 250)
     return () => {
       globalThis.clearTimeout(timer)
       controller.abort()
+      if (searchController.current === controller) searchController.current = null
+      searchRequestGeneration.current = generation + 1
     }
-  }, [activeNotebookID, searchQuery])
+  }, [activeNotebookID, searchQuery, discardSearchState])
+
+  useEffect(() => {
+    if (!activeNotebookID || typeof EventSource === 'undefined') return
+    searchVaultUnlocked.current = false
+    const source = new EventSource(`/api/encryption/lock-events?vaultId=${encodeURIComponent(activeNotebookID)}`)
+    const handleLockEvent = (event: Event) => {
+      try {
+        const update = JSON.parse((event as MessageEvent<string>).data) as { vaultId?: string; locked?: boolean }
+        if (update.vaultId !== activeNotebookID) return
+        if (!update.locked) {
+          searchVaultUnlocked.current = true
+          return
+        }
+        if (!searchVaultUnlocked.current) return
+        searchVaultUnlocked.current = false
+        discardSearchState()
+      } catch {
+        // Ignore malformed lock events; the protected API still fails closed.
+      }
+    }
+    source.addEventListener('encryption-lock', handleLockEvent)
+    return () => {
+      source.removeEventListener('encryption-lock', handleLockEvent)
+      source.close()
+    }
+  }, [activeNotebookID, discardSearchState])
 
   useEffect(() => {
     if (!operationNotice) return
@@ -438,6 +490,7 @@ export function App({ authMode = 'disabled', runningVersion = 'dev', onLoggedOut
     try {
       const response = await apiFetch(`/api/notebooks/${encodeURIComponent(notebook.id)}/activate`, { method: 'POST' })
       await responseJSON<NotebookInfo>(response)
+      discardSearchState()
       activeDraft.current = undefined
       setTabs([])
       setSelectedPath(undefined)
@@ -903,8 +956,8 @@ export function App({ authMode = 'disabled', runningVersion = 'dev', onLoggedOut
         {notebookConfigured !== false && <div className="border-b border-zinc-800 p-3">
           <div className="relative">
             <span aria-hidden="true" className="pointer-events-none absolute top-1/2 left-3 -translate-y-1/2 text-sm text-zinc-500">⌕</span>
-            <input type="search" value={searchQuery} onChange={(event) => { const value = event.target.value; setSearchQuery(value); if (!value.trim()) { setSearchResults([]); setSearchLoading(false); setSearchError(undefined) } }} placeholder="Search this notebook" aria-label="Search this notebook" className="min-h-10 w-full rounded-md border border-zinc-700 bg-zinc-950 py-2 pr-9 pl-9 text-sm text-zinc-200 outline-none placeholder:text-zinc-600 focus:border-amber-500 focus:ring-1 focus:ring-amber-500" />
-            {searchQuery && <button type="button" onClick={() => { setSearchQuery(''); setSearchResults([]); setSearchLoading(false); setSearchError(undefined) }} aria-label="Clear search" className="absolute top-1/2 right-1.5 min-h-8 min-w-8 -translate-y-1/2 rounded text-zinc-500 hover:bg-zinc-800 hover:text-zinc-200">×</button>}
+            <input type="search" value={searchQuery} onChange={(event) => { searchController.current?.abort(); searchController.current = null; searchRequestGeneration.current++; setSearchResults([]); setSearchLoading(false); setSearchError(undefined); setSearchQuery(event.target.value) }} placeholder="Search this notebook" aria-label="Search this notebook" className="min-h-10 w-full rounded-md border border-zinc-700 bg-zinc-950 py-2 pr-9 pl-9 text-sm text-zinc-200 outline-none placeholder:text-zinc-600 focus:border-amber-500 focus:ring-1 focus:ring-amber-500" />
+            {searchQuery && <button type="button" onClick={discardSearchState} aria-label="Clear search" className="absolute top-1/2 right-1.5 min-h-8 min-w-8 -translate-y-1/2 rounded text-zinc-500 hover:bg-zinc-800 hover:text-zinc-200">×</button>}
           </div>
         </div>}
         <div className="max-h-80 overflow-y-auto p-3 lg:max-h-none lg:flex-1">

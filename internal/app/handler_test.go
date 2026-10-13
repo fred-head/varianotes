@@ -860,7 +860,7 @@ func TestRepositoryAPI(t *testing.T) {
 	}
 
 	searchRecorder := httptest.NewRecorder()
-	handler.ServeHTTP(searchRecorder, httptest.NewRequest(http.MethodGet, "/api/repository/search?q=welcome", nil))
+	handler.ServeHTTP(searchRecorder, httptest.NewRequest(http.MethodPost, "/api/repository/search", strings.NewReader(`{"query":"welcome"}`)))
 	if searchRecorder.Code != http.StatusOK || !strings.Contains(searchRecorder.Body.String(), `"type":"file"`) || !strings.Contains(searchRecorder.Body.String(), `"type":"content"`) {
 		t.Fatalf("unexpected search response: %d %s", searchRecorder.Code, searchRecorder.Body.String())
 	}
@@ -1315,7 +1315,11 @@ func TestRepositoryAssetCleanupAPI(t *testing.T) {
 }
 
 func TestProtectedNoteAPIEncryptsFirstCreateAndPreservesConflictDraft(t *testing.T) {
-	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	var logOutput bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logOutput, nil))
+	const passwordSentinel = "auth-password-leak-sentinel-6f7a"
+	const querySentinel = "search-query-leak-sentinel-90cb"
+	const contentSentinel = "protected-content-leak-sentinel-3aa1"
 	root := t.TempDir()
 	metadataRoot := t.TempDir()
 	registryPath := filepath.Join(metadataRoot, "app", "notebooks.json")
@@ -1377,7 +1381,7 @@ func TestProtectedNoteAPIEncryptsFirstCreateAndPreservesConflictDraft(t *testing
 	if err != nil {
 		t.Fatal(err)
 	}
-	setupBody, _ := json.Marshal(map[string]string{"bootstrapToken": bootstrap.Value, "password": "a sufficiently long password"})
+	setupBody, _ := json.Marshal(map[string]string{"bootstrapToken": bootstrap.Value, "password": passwordSentinel})
 	setup := httptest.NewRecorder()
 	handler.ServeHTTP(setup, httptest.NewRequest(http.MethodPost, "/api/auth/setup", bytes.NewReader(setupBody)))
 	if setup.Code != http.StatusOK {
@@ -1406,6 +1410,18 @@ func TestProtectedNoteAPIEncryptsFirstCreateAndPreservesConflictDraft(t *testing
 	created := requestJSON(http.MethodPost, "/api/repository/entries", map[string]string{"path": "private/Note.md", "type": "file"})
 	if created.Code != http.StatusCreated {
 		t.Fatalf("protected note create failed: %d %s", created.Code, created.Body.String())
+	}
+	search := requestJSON(http.MethodPost, "/api/repository/search", map[string]string{"query": "Note"})
+	if search.Code != http.StatusOK || search.Header().Get("Cache-Control") != "no-store, private" || !strings.Contains(search.Body.String(), `"excerpt":"# Note"`) {
+		t.Fatalf("unlocked protected search failed or was cacheable: %d %s", search.Code, search.Body.String())
+	}
+	querySearch := requestJSON(http.MethodPost, "/api/repository/search", map[string]string{"query": querySentinel})
+	if querySearch.Code != http.StatusOK || strings.Contains(querySearch.Body.String(), querySentinel) {
+		t.Fatalf("search query was returned as content or rejected: %d %s", querySearch.Code, querySearch.Body.String())
+	}
+	tooLongSearch := requestJSON(http.MethodPost, "/api/repository/search", map[string]string{"query": strings.Repeat("q", 1025)})
+	if tooLongSearch.Code != http.StatusBadRequest || strings.Contains(tooLongSearch.Body.String(), strings.Repeat("q", 1025)) {
+		t.Fatalf("oversized search query was not rejected safely: %d %s", tooLongSearch.Code, tooLongSearch.Body.String())
 	}
 	plaintextPath := filepath.Join(root, "private", "Note.md")
 	ciphertextPath := plaintextPath + ".age"
@@ -1535,13 +1551,22 @@ func TestProtectedNoteAPIEncryptsFirstCreateAndPreservesConflictDraft(t *testing
 	if serverNote.Code != http.StatusOK || !strings.Contains(serverNote.Body.String(), `"content":"# Note\n"`) {
 		t.Fatalf("stale draft replaced server note: %d %s", serverNote.Code, serverNote.Body.String())
 	}
-	updatedContent := "# Updated\n\n![asset](" + uploaded.Path + ")\n"
+	updatedContent := "# Updated\n\n![asset](" + uploaded.Path + ")\n\n" + contentSentinel + "\n"
 	updated := requestJSON(http.MethodPut, "/api/repository/file?path=private/Note.md", map[string]string{"content": updatedContent, "version": loaded.Version})
 	if updated.Code != http.StatusOK || !strings.Contains(updated.Body.String(), `"content":"# Updated\n\n![asset](`) {
 		t.Fatalf("protected save failed: %d %s", updated.Code, updated.Body.String())
 	}
+	contentSearch := requestJSON(http.MethodPost, "/api/repository/search", map[string]string{"query": contentSentinel})
+	if contentSearch.Code != http.StatusOK || contentSearch.Header().Get("Cache-Control") != "no-store, private" || !strings.Contains(contentSearch.Body.String(), contentSentinel) {
+		t.Fatalf("protected content search failed or was cacheable: %d %s", contentSearch.Code, contentSearch.Body.String())
+	}
+	for _, sentinel := range []string{passwordSentinel, querySentinel, contentSentinel} {
+		if strings.Contains(logOutput.String(), sentinel) {
+			t.Fatalf("request log contains sensitive sentinel %q", sentinel)
+		}
+	}
 	updatedCiphertext, err := os.ReadFile(ciphertextPath)
-	if err != nil || bytes.Contains(updatedCiphertext, []byte("# Updated")) {
+	if err != nil || bytes.Contains(updatedCiphertext, []byte("# Updated")) || bytes.Contains(updatedCiphertext, []byte(contentSentinel)) {
 		t.Fatalf("saved note was not ciphertext: err=%v", err)
 	}
 	if err := manager.LockVault(vaultID, encryption.LockReasonManual); err != nil {
@@ -1553,6 +1578,10 @@ func TestProtectedNoteAPIEncryptsFirstCreateAndPreservesConflictDraft(t *testing
 	handler.ServeHTTP(locked, lockedRequest)
 	if locked.Code != http.StatusLocked || !strings.Contains(locked.Body.String(), `"code":"encryption_locked"`) {
 		t.Fatalf("locked note read returned %d: %s", locked.Code, locked.Body.String())
+	}
+	lockedSearch := requestJSON(http.MethodPost, "/api/repository/search", map[string]string{"query": "Note"})
+	if lockedSearch.Code != http.StatusLocked || strings.Contains(lockedSearch.Body.String(), "# Note") || lockedSearch.Header().Get("Cache-Control") == "" {
+		t.Fatalf("locked search exposed protected content or omitted no-store: %d %s", lockedSearch.Code, lockedSearch.Body.String())
 	}
 	lockedAsset := httptest.NewRecorder()
 	lockedAssetRequest := httptest.NewRequest(http.MethodGet, "/api/repository/asset?"+sharedAssetQuery.Encode(), nil)
@@ -1960,7 +1989,7 @@ func TestEveryApplicationAPIRouteDeniesUnauthenticatedAccess(t *testing.T) {
 		{http.MethodGet, "/api/notebooks/example/health"},
 		{http.MethodDelete, "/api/notebooks/example"},
 		{http.MethodGet, "/api/repository/tree"},
-		{http.MethodGet, "/api/repository/search?q=secret"},
+		{http.MethodPost, "/api/repository/search"},
 		{http.MethodGet, "/api/repository/file?path=Secret.md"},
 		{http.MethodPut, "/api/repository/file"},
 		{http.MethodGet, "/api/repository/history?path=Secret.md"},
