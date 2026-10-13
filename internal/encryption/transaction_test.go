@@ -334,7 +334,7 @@ func newTransactionFixture(t *testing.T, count int) transactionFixture {
 		objectID := fmt.Sprintf("%032x", index+1)
 		logicalPath := fmt.Sprintf("private/note-%d.md", index)
 		physicalPath := logicalPath + ".age"
-		oldCiphertext, _, err := EncryptContent(key, objectID, []byte(fmt.Sprintf("old plaintext %d", index)))
+		oldCiphertext, oldEnvelope, err := EncryptContent(key, objectID, []byte(fmt.Sprintf("old plaintext %d", index)))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -348,11 +348,11 @@ func newTransactionFixture(t *testing.T, count int) transactionFixture {
 		oldBytes[physicalPath] = oldCiphertext
 		oldCatalog.Objects = append(oldCatalog.Objects, CatalogObject{
 			ObjectID: objectID, Kind: CatalogObjectNote, LogicalPath: logicalPath,
-			PhysicalPath: physicalPath, CiphertextHash: CiphertextSHA256(oldCiphertext), Protected: true,
+			PhysicalPath: physicalPath, CiphertextHash: CiphertextSHA256(oldCiphertext), ContentKeyEnvelope: &oldEnvelope, Protected: true,
 		})
 		nextCatalog.Objects = append(nextCatalog.Objects, CatalogObject{
 			ObjectID: objectID, Kind: CatalogObjectNote, LogicalPath: logicalPath,
-			PhysicalPath: physicalPath, CiphertextHash: CiphertextSHA256(newCiphertext), Protected: true,
+			PhysicalPath: physicalPath, CiphertextHash: CiphertextSHA256(newCiphertext), ContentKeyEnvelope: &newEnvelope, Protected: true,
 		})
 		changes = append(changes, CiphertextChange{
 			Path: physicalPath, ObjectID: objectID, Ciphertext: newCiphertext, ContentKeyEnvelope: newEnvelope,

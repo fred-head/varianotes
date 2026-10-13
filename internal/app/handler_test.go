@@ -1285,6 +1285,176 @@ func TestRepositoryAssetCleanupAPI(t *testing.T) {
 	}
 }
 
+func TestProtectedNoteAPIEncryptsFirstCreateAndPreservesConflictDraft(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	root := t.TempDir()
+	metadataRoot := t.TempDir()
+	registryPath := filepath.Join(metadataRoot, "app", "notebooks.json")
+	vaultID := "11111111111111111111111111111111"
+	if err := os.Mkdir(filepath.Join(root, "private"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeNotebookRegistry(registryPath, notebookRegistry{
+		ActiveID: vaultID,
+		Entries:  []notebookRecord{{ID: vaultID, Name: "Protected", LocalPath: root}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("VARIANOTES_NOTEBOOK_METADATA", registryPath)
+	key := bytes.Repeat([]byte{0x39}, encryption.VaultKeySize)
+	catalog, err := encryption.NewCatalog()
+	if err != nil {
+		t.Fatal(err)
+	}
+	catalog.FolderRules = []encryption.FolderProtectionRule{{Path: "private"}}
+	metadataDirectory := vaultEncryptionDirectory(registryPath, vaultID)
+	catalogStore, err := encryption.NewCatalogStore(filepath.Join(metadataDirectory, "catalog.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := catalogStore.Save(catalog, key); err != nil {
+		t.Fatal(err)
+	}
+	envelope, err := encryption.EncryptVaultKey("a sufficiently long password", key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	envelopeStore, err := encryption.NewVaultKeyEnvelopeStore(filepath.Join(metadataDirectory, "key-envelope.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := envelopeStore.Save(envelope); err != nil {
+		t.Fatal(err)
+	}
+	authService, err := auth.Open(t.Context(), auth.Config{Mode: auth.ModeLocal, MetadataPath: filepath.Join(metadataRoot, "auth.db")}, logger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer authService.Close()
+	sessions, err := auth.NewSessions(authService, auth.DefaultSessionOptions(false))
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager := encryption.NewKeyManager()
+	defer manager.Close()
+	handler, err := newHandlerWithKeyManager(logger, "", authService, sessions, manager)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bootstrap, err := authService.CreateBootstrapToken(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	setupBody, _ := json.Marshal(map[string]string{"bootstrapToken": bootstrap.Value, "password": "a sufficiently long password"})
+	setup := httptest.NewRecorder()
+	handler.ServeHTTP(setup, httptest.NewRequest(http.MethodPost, "/api/auth/setup", bytes.NewReader(setupBody)))
+	if setup.Code != http.StatusOK {
+		t.Fatalf("owner setup failed: %d %s", setup.Code, setup.Body.String())
+	}
+	cookie, csrf := authRequestContextFromResponse(t, setup)
+	if cookie == nil {
+		t.Fatal("owner setup did not issue a session")
+	}
+	sessionHash := sha256.Sum256([]byte(cookie.Value))
+	if err := manager.Unlock(vaultID, sessionHash[:], key); err != nil {
+		t.Fatal(err)
+	}
+	requestJSON := func(method, target string, body any) *httptest.ResponseRecorder {
+		t.Helper()
+		encoded, err := json.Marshal(body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		request := httptest.NewRequest(method, target, bytes.NewReader(encoded))
+		addAuthRequestContext(request, cookie, csrf)
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+		return response
+	}
+	created := requestJSON(http.MethodPost, "/api/repository/entries", map[string]string{"path": "private/Note.md", "type": "file"})
+	if created.Code != http.StatusCreated {
+		t.Fatalf("protected note create failed: %d %s", created.Code, created.Body.String())
+	}
+	plaintextPath := filepath.Join(root, "private", "Note.md")
+	ciphertextPath := plaintextPath + ".age"
+	if _, err := os.Stat(plaintextPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("protected note created a plaintext file: %v", err)
+	}
+	ciphertext, err := os.ReadFile(ciphertextPath)
+	if err != nil || bytes.Contains(ciphertext, []byte("# Note")) {
+		t.Fatalf("first note bytes are not ciphertext: err=%v", err)
+	}
+	unsupportedMove := requestJSON(http.MethodPost, "/api/repository/move", map[string]string{"source": "private", "target": "moved"})
+	if unsupportedMove.Code != http.StatusServiceUnavailable {
+		t.Fatalf("move bypassed the unfinished encryption path: %d %s", unsupportedMove.Code, unsupportedMove.Body.String())
+	}
+	if _, err := os.Stat(ciphertextPath); err != nil {
+		t.Fatalf("rejected move changed protected ciphertext: %v", err)
+	}
+	tree := httptest.NewRecorder()
+	treeRequest := httptest.NewRequest(http.MethodGet, "/api/repository/tree", nil)
+	treeRequest.AddCookie(cookie)
+	handler.ServeHTTP(tree, treeRequest)
+	if tree.Code != http.StatusOK || !strings.Contains(tree.Body.String(), `"path":"private/Note.md"`) {
+		t.Fatalf("protected logical note missing from tree: %d %s", tree.Code, tree.Body.String())
+	}
+	read := httptest.NewRecorder()
+	readRequest := httptest.NewRequest(http.MethodGet, "/api/repository/file?path=private/Note.md", nil)
+	readRequest.AddCookie(cookie)
+	handler.ServeHTTP(read, readRequest)
+	if read.Code != http.StatusOK || !strings.Contains(read.Body.String(), `"content":"# Note\n"`) || read.Header().Get("Cache-Control") != "no-store, private" {
+		t.Fatalf("protected note read failed: %d %s", read.Code, read.Body.String())
+	}
+	var loaded struct {
+		Version string `json:"version"`
+	}
+	if err := json.Unmarshal(read.Body.Bytes(), &loaded); err != nil || loaded.Version == "" {
+		t.Fatalf("protected note version missing: %#v err=%v", loaded, err)
+	}
+	stale := requestJSON(http.MethodPut, "/api/repository/file?path=private/Note.md", map[string]string{"content": "stale browser draft", "version": strings.Repeat("0", 64)})
+	if stale.Code != http.StatusConflict {
+		t.Fatalf("stale protected save returned %d: %s", stale.Code, stale.Body.String())
+	}
+	serverNote := httptest.NewRecorder()
+	serverNoteRequest := httptest.NewRequest(http.MethodGet, "/api/repository/file?path=private/Note.md", nil)
+	serverNoteRequest.AddCookie(cookie)
+	handler.ServeHTTP(serverNote, serverNoteRequest)
+	if serverNote.Code != http.StatusOK || !strings.Contains(serverNote.Body.String(), `"content":"# Note\n"`) {
+		t.Fatalf("stale draft replaced server note: %d %s", serverNote.Code, serverNote.Body.String())
+	}
+	updated := requestJSON(http.MethodPut, "/api/repository/file?path=private/Note.md", map[string]string{"content": "# Updated\n", "version": loaded.Version})
+	if updated.Code != http.StatusOK || !strings.Contains(updated.Body.String(), `"content":"# Updated\n"`) {
+		t.Fatalf("protected save failed: %d %s", updated.Code, updated.Body.String())
+	}
+	updatedCiphertext, err := os.ReadFile(ciphertextPath)
+	if err != nil || bytes.Contains(updatedCiphertext, []byte("# Updated")) {
+		t.Fatalf("saved note was not ciphertext: err=%v", err)
+	}
+	if err := manager.LockVault(vaultID, encryption.LockReasonManual); err != nil {
+		t.Fatal(err)
+	}
+	locked := httptest.NewRecorder()
+	lockedRequest := httptest.NewRequest(http.MethodGet, "/api/repository/file?path=private/Note.md", nil)
+	lockedRequest.AddCookie(cookie)
+	handler.ServeHTTP(locked, lockedRequest)
+	if locked.Code != http.StatusLocked || !strings.Contains(locked.Body.String(), `"code":"encryption_locked"`) {
+		t.Fatalf("locked note read returned %d: %s", locked.Code, locked.Body.String())
+	}
+	if err := manager.Unlock(vaultID, sessionHash[:], key); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(ciphertextPath, []byte("corrupt"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	corrupt := httptest.NewRecorder()
+	corruptRequest := httptest.NewRequest(http.MethodGet, "/api/repository/file?path=private/Note.md", nil)
+	corruptRequest.AddCookie(cookie)
+	handler.ServeHTTP(corrupt, corruptRequest)
+	if corrupt.Code != http.StatusInternalServerError || strings.Contains(corrupt.Body.String(), "# Updated") {
+		t.Fatalf("corrupt ciphertext was served: %d %s", corrupt.Code, corrupt.Body.String())
+	}
+}
+
 func TestLocalNotebookCreatesFilesystemVaultAndGitRoutesAreGone(t *testing.T) {
 	base := t.TempDir()
 	notebookBase := filepath.Join(base, "notebooks")

@@ -438,14 +438,21 @@ requires its listed tests; P17 adds end-to-end and adversarial coverage.
   The externally stored code restores access through VariaNotes from a matching
   complete backup; standalone content decryption remains in the P17/P18 gate.
 
-- [ ] **P09 — Encrypted note reads, saves, and conflicts**
+- [x] **P09 — Encrypted note reads, saves, and conflicts**
   *(dependencies: P01–P06; size: M)*
   **Goal/scope:** route protected note reads, creates, saves, and conflict
   resolution through policy-aware encrypted storage.
   **Acceptance/tests:** protected saves and temporary files contain only
   ciphertext; creation in protected folders is encrypted from the first write;
   stale saves preserve draft and server version; corrupt data never opens as
-  Markdown or gets overwritten.
+  Markdown or gets overwritten. Implemented protected note reads, creates,
+  version-checked saves, conflict responses, and logical tree entries through
+  the authenticated catalog and per-session key leases. The per-file age key
+  envelope is authenticated in the catalog; saves and creates use the M31
+  transaction journal. Corrupt or untracked ciphertext fails closed, and
+  ciphertext-backed versions avoid storing plaintext hashes. The protected
+  content routes remain unavailable while locked, and no unlock or activation
+  path is exposed before the M31 release gate.
 
 - [ ] **P10 — Shared images and attachments**
   *(dependencies: P01–P06, P09; size: L)*

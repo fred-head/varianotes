@@ -202,13 +202,28 @@ func TestCatalogDetectsAgePathCollisionsAndPlaintextRuleExceptions(t *testing.T)
 	}
 }
 
+func TestProtectedCatalogObjectRequiresObjectBoundContentKeyEnvelope(t *testing.T) {
+	catalog := catalogFixture(t)
+	catalog.Objects[0].ContentKeyEnvelope = nil
+	if _, err := MarshalCatalog(catalog, bytes.Repeat([]byte{0x42}, VaultKeySize)); !errors.Is(err, ErrInvalidCatalog) {
+		t.Fatalf("missing per-file key envelope error = %v", err)
+	}
+	catalog = catalogFixture(t)
+	wrongObject := *catalog.Objects[0].ContentKeyEnvelope
+	wrongObject.ObjectID = "00000000000000000000000000000002"
+	catalog.Objects[0].ContentKeyEnvelope = &wrongObject
+	if _, err := MarshalCatalog(catalog, bytes.Repeat([]byte{0x42}, VaultKeySize)); !errors.Is(err, ErrInvalidCatalog) {
+		t.Fatalf("misbound per-file key envelope error = %v", err)
+	}
+}
+
 func TestCatalogVerifiesSwappedCiphertextAndContainsMetadataOnly(t *testing.T) {
 	firstCiphertext := []byte("ciphertext for first object")
 	secondCiphertext := []byte("ciphertext for second object")
 	object := CatalogObject{
 		ObjectID: "00000000000000000000000000000001", Kind: CatalogObjectNote,
 		LogicalPath: "private/note.md", PhysicalPath: "private/note.md.age",
-		CiphertextHash: CiphertextSHA256(firstCiphertext), Protected: true,
+		CiphertextHash: CiphertextSHA256(firstCiphertext), ContentKeyEnvelope: testContentKeyEnvelope("00000000000000000000000000000001"), Protected: true,
 	}
 	if err := VerifyCatalogCiphertext(object, firstCiphertext); err != nil {
 		t.Fatalf("matching ciphertext rejected: %v", err)
@@ -269,7 +284,7 @@ func catalogFixture(t *testing.T) Catalog {
 			{
 				ObjectID: "00000000000000000000000000000001", Kind: CatalogObjectNote,
 				LogicalPath: "private/note.md", PhysicalPath: "private/note.md.age",
-				CiphertextHash: CiphertextSHA256([]byte("encrypted note")), Protected: true,
+				CiphertextHash: CiphertextSHA256([]byte("encrypted note")), ContentKeyEnvelope: testContentKeyEnvelope("00000000000000000000000000000001"), Protected: true,
 			},
 			{
 				ObjectID: "00000000000000000000000000000002", Kind: CatalogObjectNote,
@@ -282,4 +297,8 @@ func catalogFixture(t *testing.T) Catalog {
 		t.Fatalf("invalid catalog fixture: %v", err)
 	}
 	return catalog
+}
+
+func testContentKeyEnvelope(objectID string) *ContentKeyEnvelope {
+	return &ContentKeyEnvelope{Version: FormatVersion, ObjectID: objectID, Nonce: make([]byte, 24), Ciphertext: []byte("wrapped test key")}
 }
