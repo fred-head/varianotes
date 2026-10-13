@@ -4,7 +4,7 @@ import { cleanup, fireEvent, render, waitFor } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { AuthGate } from './AuthGate'
 
-afterEach(()=>{cleanup();vi.restoreAllMocks();localStorage.clear();sessionStorage.clear()})
+afterEach(()=>{cleanup();vi.restoreAllMocks();vi.unstubAllGlobals();localStorage.clear();sessionStorage.clear()})
 beforeEach(()=>{Object.defineProperty(window,'matchMedia',{configurable:true,value:vi.fn().mockReturnValue({matches:false,addEventListener:vi.fn(),removeEventListener:vi.fn()})})})
 
 describe('browser authentication lifecycle',()=>{
@@ -69,6 +69,79 @@ describe('browser authentication lifecycle',()=>{
 	expect([...Array(localStorage.length)].map((_,index)=>localStorage.getItem(localStorage.key(index)!)).join(' ')).not.toContain('a sufficiently long password')
 	expect([...Array(sessionStorage.length)].map((_,index)=>sessionStorage.getItem(sessionStorage.key(index)!)).join(' ')).not.toContain('123456')
 	expect(vi.mocked(globalThis.fetch).mock.calls.some(([url])=>String(url)==='/api/auth/login/mfa')).toBe(true)
+  })
+
+  it('uses the sign-in password once to unlock a protected vault without storing it', async () => {
+    class EventSourceStub {
+      constructor() {}
+      addEventListener() {}
+      removeEventListener() {}
+      close() {}
+    }
+    vi.stubGlobal('EventSource', EventSourceStub)
+    let authenticated = false
+    const submittedVaultPasswords: string[] = []
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init) => {
+      const url = String(input)
+      if (url === '/api/auth/status') return Response.json({ mode: 'local', setupRequired: false, authenticated, csrfToken: authenticated ? 'csrf' : '' })
+      if (url === '/api/auth/login') {
+        authenticated = true
+        return Response.json({ authenticated: true, csrfToken: 'csrf' })
+      }
+      if (url === '/api/health') return Response.json({ status: 'ok', version: 'dev' })
+      if (url === '/api/notebook') return Response.json({ name: 'Protected', configured: true })
+      if (url === '/api/notebooks') return Response.json({ activeId: 'protected-vault', notebooks: [{ id: 'protected-vault', name: 'Protected' }] })
+      if (url === '/api/encryption/status') return Response.json({
+        vaultId: 'protected-vault', protected: true, locked: true, generation: 1, recoveryCodeConfigured: true,
+        unlockPasswordMode: 'login', activationEnabled: false, autoLockMinutes: 15, mfaEnabled: false,
+      })
+      if (url === '/api/encryption/unlock') {
+        submittedVaultPasswords.push((JSON.parse(String(init?.body)) as { password: string }).password)
+        return Response.json({ vaultId: 'protected-vault', unlocked: true, generation: 2 })
+      }
+      if (url === '/api/repository/tree') return Response.json({ entries: [] })
+      return Response.json({ error: `unexpected request: ${url}` }, { status: 500 })
+    })
+
+    const view = render(<AuthGate />)
+    const password = 'login password used for unlock'
+    fireEvent.change(await view.findByLabelText('Password'), { target: { value: password } })
+    fireEvent.click(view.getByRole('button', { name: 'Sign in' }))
+    await waitFor(() => expect(submittedVaultPasswords).toEqual([password]))
+    expect(view.getByRole('button', { name: 'Lock vault' })).toBeTruthy()
+    const storedValues = [localStorage, sessionStorage].flatMap((storage) => Array.from({ length: storage.length }, (_, index) => storage.getItem(storage.key(index)!) ?? '')).join(' ')
+    expect(storedValues).not.toContain(password)
+  })
+
+  it('confirms a replacement recovery code without persisting the code or password', async () => {
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init) => {
+      const url = String(input)
+      if (url === '/api/auth/status') return Response.json({ mode: 'local', setupRequired: false, authenticated: false })
+      if (url === '/api/health') return Response.json({ status: 'ok', version: 'dev' })
+      if (url === '/api/auth/recovery/prepare') return Response.json({ challengeId: 'challenge-1', recoveryCode: 'VNRC1-REPLACEMENT-CODE' })
+      if (url === '/api/auth/recovery/confirm') return Response.json({ confirmed: true })
+      return Response.json({ error: `unexpected request: ${url}`, method: init?.method }, { status: 500 })
+    })
+
+    const view = render(<AuthGate />)
+    fireEvent.click(await view.findByRole('button', { name: 'Forgot password? Use a vault recovery code' }))
+    fireEvent.change(view.getByLabelText('Vault recovery code'), { target: { value: 'VNRC1-OLD-RECOVERY-CODE' } })
+    fireEvent.change(view.getByLabelText('New password'), { target: { value: 'a replacement password with enough length' } })
+    fireEvent.change(view.getByLabelText('Confirm new password'), { target: { value: 'a replacement password with enough length' } })
+    fireEvent.click(view.getByRole('button', { name: 'Prepare recovery' }))
+
+    expect(await view.findByText('VNRC1-REPLACEMENT-CODE')).toBeTruthy()
+    fireEvent.change(view.getByLabelText('Re-enter the replacement code'), { target: { value: 'VNRC1-REPLACEMENT-CODE' } })
+    fireEvent.click(view.getByLabelText(/I stored this code separately/))
+    fireEvent.click(view.getByRole('button', { name: 'Confirm recovery' }))
+
+    await waitFor(() => expect(view.getByRole('heading', { name: 'Welcome back' })).toBeTruthy())
+    const storedValues = [localStorage, sessionStorage].flatMap((storage) => Array.from({ length: storage.length }, (_, index) => storage.getItem(storage.key(index)!) ?? '')).join(' ')
+    expect(storedValues).not.toContain('VNRC1-')
+    expect(storedValues).not.toContain('replacement password')
+    const confirmRequest = vi.mocked(globalThis.fetch).mock.calls.find(([url]) => String(url) === '/api/auth/recovery/confirm')
+    expect(confirmRequest).toBeTruthy()
+    expect(String(confirmRequest?.[0])).not.toContain('VNRC1-')
   })
 
   it('returns a mobile standalone window to login when its session expires',async()=>{

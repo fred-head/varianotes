@@ -103,7 +103,7 @@ describe('App auto-lock integration', () => {
     // Changing the setting restarts the same active timer under fake timers.
     fireEvent.click(view.getByRole('button', { name: 'Settings' }))
     await act(async () => {
-      fireEvent.change(view.getByLabelText('Auto-lock notes'), { target: { value: '5' } })
+      fireEvent.change(view.getByLabelText('Make editor read-only after'), { target: { value: '5' } })
       await Promise.resolve()
     })
     fireEvent.click(view.getByRole('button', { name: 'Done' }))
@@ -552,6 +552,146 @@ describe('App auto-lock integration', () => {
     editor.focus()
     await userEvent.type(editor, ' private draft', { skipClick: true })
     await waitFor(() => expect(editor.textContent).toContain('private draft'))
+  })
+
+  it('requires an explicit keep or decrypt choice when moving protected content out', async () => {
+    const fetchMock = vi.mocked(globalThis.fetch)
+    const originalFetch = fetchMock.getMockImplementation()!
+    const moveBodies: Array<Record<string, unknown>> = []
+    fetchMock.mockImplementation(async (input, init) => {
+      const url = String(input)
+      if (url === '/api/repository/tree') return Response.json({ entries: [
+        { name: 'Secret.md', path: 'Secret.md', type: 'file', protected: true },
+        { name: 'archive', path: 'archive', type: 'directory', children: [] },
+      ] })
+      if (url === '/api/repository/move/preview' && init?.method === 'POST') {
+        const body = JSON.parse(String(init.body)) as { source: string; target: string }
+        return Response.json({ ...body, token: 'preview-token', rewrites: [] })
+      }
+      if (url === '/api/repository/move' && init?.method === 'POST') {
+        const body = JSON.parse(String(init.body)) as Record<string, unknown>
+        moveBodies.push(body)
+        if (moveBodies.length === 1) return Response.json({ error: 'protection choice required', code: 'move_protection_choice_required' }, { status: 409 })
+        return Response.json({ path: body.target, rewrites: [] })
+      }
+      return originalFetch(input, init)
+    })
+
+    const view = render(<App />)
+    const secret = await view.findByRole('button', { name: 'Secret' })
+    fireEvent.contextMenu(secret)
+    fireEvent.click(view.getByRole('menuitem', { name: 'Move…' }))
+    const picker = await view.findByRole('dialog', { name: 'Move “Secret.md”' })
+    fireEvent.click(within(picker).getByRole('button', { name: 'archive' }))
+    fireEvent.click(within(picker).getByRole('button', { name: 'Move here' }))
+
+    const choice = await view.findByRole('dialog', { name: 'Choose protection after moving' })
+    expect(choice.textContent).toContain('A shared attachment remains protected while any protected note still references it.')
+    expect(moveBodies[0]).not.toHaveProperty('protectionChoice')
+    fireEvent.click(within(choice).getByRole('button', { name: 'Decrypt and move' }))
+    await waitFor(() => expect(moveBodies).toHaveLength(2))
+    expect(moveBodies[1]).toMatchObject({ source: 'Secret.md', target: 'archive/Secret.md', protectionChoice: 'decrypt' })
+  })
+
+  it('hides protected drafts on lock, keeps them in memory, and follows lock events', async () => {
+    const eventSources: Array<{ listeners: Map<string, EventListener>; emit: (locked: boolean, generation: number) => void }> = []
+    class EventSourceStub {
+      listeners = new Map<string, EventListener>()
+      constructor() { eventSources.push(this) }
+      addEventListener(type: string, listener: EventListener) { this.listeners.set(type, listener) }
+      removeEventListener(type: string) { this.listeners.delete(type) }
+      close() {}
+      emit(locked: boolean, generation: number) {
+        this.listeners.get('encryption-lock')?.(new MessageEvent('encryption-lock', {
+          data: JSON.stringify({ vaultId: 'personal', locked, generation }),
+        }))
+      }
+    }
+    vi.stubGlobal('EventSource', EventSourceStub)
+    const fetchMock = vi.mocked(globalThis.fetch)
+    const originalFetch = fetchMock.getMockImplementation()!
+    let locked = false
+    let generation = 1
+    let statusUnavailable = false
+    fetchMock.mockImplementation(async (input, init) => {
+      const url = String(input)
+      if (url === '/api/encryption/status') {
+        if (statusUnavailable) return Response.json({ error: 'protection status unavailable' }, { status: 503 })
+        return Response.json({
+          vaultId: 'personal', protected: true, locked, generation, recoveryCodeConfigured: true,
+          unlockPasswordMode: 'login', activationEnabled: false, autoLockMinutes: 15, mfaEnabled: false,
+        })
+      }
+      if (url === '/api/repository/tree') return Response.json({ entries: [{ name: 'Secret.md', path: 'Secret.md', type: 'file', protected: true }] })
+      if (url === '/api/repository/file?path=Secret.md' && !init?.method) return Response.json({ path: 'Secret.md', content: '# Protected note', version: 'v1' })
+      if (url.startsWith('/api/encryption/activity?')) return Response.json({ recorded: true })
+      if (url === '/api/encryption/lock' && init?.method === 'POST') {
+        locked = true
+        generation++
+        eventSources[0]?.emit(true, generation)
+        return Response.json({ vaultId: 'personal', locked: true, generation })
+      }
+      if (url === '/api/encryption/unlock' && init?.method === 'POST') {
+        const body = JSON.parse(String(init.body)) as { password: string }
+        if (body.password !== 'correct vault password') return Response.json({ error: 'vault password is incorrect', code: 'invalid_credentials' }, { status: 401 })
+        locked = false
+        generation++
+        eventSources[0]?.emit(false, generation)
+        return Response.json({ vaultId: 'personal', unlocked: true, generation })
+      }
+      return originalFetch(input, init)
+    })
+
+    const authRequired = vi.fn()
+    window.addEventListener('varianotes:auth-required', authRequired)
+    const view = render(<App />)
+    await waitFor(() => expect(eventSources).toHaveLength(1))
+    fireEvent.click(await view.findByRole('button', { name: 'Secret' }))
+    const editor = await view.findByText('Protected note').then((element) => element.closest('.ProseMirror') as HTMLElement)
+    await view.findByRole('toolbar', { name: 'Editor formatting' })
+    expect(editor.getAttribute('contenteditable')).toBe('true')
+    editor.focus()
+    const user = userEvent.setup()
+    await user.type(editor, ' private draft', { skipClick: true })
+    await waitFor(() => expect(editor.textContent).toContain('private draft'))
+    await view.findByText('Changes not saved yet')
+
+    fireEvent.click(view.getByRole('button', { name: 'Lock vault' }))
+    await view.findByRole('heading', { name: 'Protected vault is locked' })
+    expect(view.container.textContent).not.toContain('private draft')
+    expect(view.container.querySelector('.ProseMirror')).toBeNull()
+    const storageSnapshot = [localStorage, sessionStorage].flatMap((storage) => Array.from({ length: storage.length }, (_, index) => `${storage.key(index)}=${storage.getItem(storage.key(index)!)}`)).join(' ')
+    expect(storageSnapshot).not.toContain('private draft')
+
+    fireEvent.click(view.getAllByRole('button', { name: 'Unlock vault' }).at(-1)!)
+    const unlockDialog = await view.findByRole('dialog', { name: 'Unlock protected vault' })
+    const password = within(unlockDialog).getByLabelText('Sign-in password')
+    fireEvent.change(password, { target: { value: 'wrong vault password' } })
+    fireEvent.click(within(unlockDialog).getByRole('button', { name: 'Unlock' }))
+    expect(await view.findByRole('alert')).toBeTruthy()
+    expect(authRequired).not.toHaveBeenCalled()
+    fireEvent.change(password, { target: { value: 'correct vault password' } })
+    fireEvent.click(within(unlockDialog).getByRole('button', { name: 'Unlock' }))
+    await waitFor(() => expect(view.container.querySelector('.ProseMirror')?.textContent).toContain('private draft'))
+    const restoredEditor = view.container.querySelector('.ProseMirror') as HTMLElement
+    expect(restoredEditor.textContent).toContain('Protected note')
+
+    statusUnavailable = true
+    fireEvent(window, new Event('focus'))
+    await view.findByRole('heading', { name: 'Protected vault is locked' })
+    expect(view.container.textContent).not.toContain('private draft')
+    statusUnavailable = false
+    fireEvent.click(view.getAllByRole('button', { name: 'Unlock vault' }).at(-1)!)
+    const retryDialog = await view.findByRole('dialog', { name: 'Unlock protected vault' })
+    fireEvent.change(within(retryDialog).getByLabelText('Sign-in password'), { target: { value: 'correct vault password' } })
+    fireEvent.click(within(retryDialog).getByRole('button', { name: 'Unlock' }))
+    await waitFor(() => expect(view.container.querySelector('.ProseMirror')?.textContent).toContain('private draft'))
+
+    generation++
+    eventSources[0]?.emit(true, generation)
+    await view.findByRole('heading', { name: 'Protected vault is locked' })
+    expect(view.container.textContent).not.toContain('private draft')
+    window.removeEventListener('varianotes:auth-required', authRequired)
   })
 })
 

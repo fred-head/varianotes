@@ -245,8 +245,8 @@ Completion criteria:
 
 ## Milestone 31 - Selective encryption for notes and folders
 
-M31 remains in Alpha 3. This checklist is the implementation plan. **P01–P15
-are complete; P16–P18 remain open.** M31 is not complete until P01–P18 are
+M31 remains in Alpha 3. This checklist is the implementation plan. **P01–P16
+are complete; P17–P18 remain open.** M31 is not complete until P01–P18 are
 complete and the independent security review in P17 has passed. Encryption
 activation must stay disabled in the UI, API, and any operator command until
 the P18 release gate passes.
@@ -565,13 +565,32 @@ requires its listed tests; P17 adds end-to-end and adversarial coverage.
   an active stream at its next bounded read, but cannot retract bytes already
   sent. Exported ZIPs and earlier backups remain plaintext by design.
 
-- [ ] **P16 — Protection, lock, recovery, and export UI**
+- [x] **P16 — Protection, lock, recovery, and export UI**
   *(dependencies: P05, P07–P15; size: M)*
   **Goal/scope:** expose status, protect/unprotect choices, unlock/lock, recovery,
   shared-attachment placeholder, and backup/export warnings.
   **Acceptance/tests:** wording and choices match product decisions; unsaved
   drafts remain browser-memory-only and hidden on lock; tabs follow server state;
   activation stays gated even if UI code merges earlier.
+  Implemented per-vault protection status, login-password or separate-password
+  unlock, manual lock, and server generation-aware lock events across tabs.
+  Protected note contents and attachments are hidden while locked; unsaved drafts
+  remain in the current tab's memory and disappear if that tab closes or reloads.
+  Move-out and Trash-restore flows require an explicit keep-protection or decrypt
+  choice, including the whole subtree for folders and shared-attachment rules.
+  Settings and sign-in recovery flows create or replace one-time recovery codes
+  only after confirmation and support password recovery without rewriting
+  ciphertext. The locked shared-attachment placeholder and plaintext ZIP,
+  earlier-copy, and operator-owned backup warnings are surfaced in the UI.
+  Activation remains disabled in the UI and API; no activation action is exposed.
+  Focused Go tests for `internal/app`, `internal/files`, and `internal/encryption`
+  passed. The App, AuthGate, and API frontend tests passed (40/40) with a single
+  worker and 2-GB Node heap limit; changed-file ESLint, `go vet -p 1` for the
+  affected Go packages, production build, and `git diff --check` passed. Swap
+  use stayed at 3.4 GiB during the focused tests. Drafts are intentionally not
+  recoverable after closing or reloading the browser tab, and physical memory
+  erasure is not claimed. P17's integration fault matrix and independent
+  security review remain required.
 
 - [ ] **P17 — End-to-end fault matrix and independent security review**
   *(dependencies: P01–P16; size: L)*

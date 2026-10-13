@@ -145,6 +145,26 @@ func (m *KeyManager) IsUnlocked(vaultID string, sessionID []byte) bool {
 	return exists && grant.generation == state.generation
 }
 
+// SessionStatus returns the lock state and generation visible to one session.
+// It does not count as user activity and never extends the idle timeout.
+func (m *KeyManager) SessionStatus(vaultID string, sessionID []byte) (bool, uint64, error) {
+	if !validVaultID(vaultID) {
+		return false, 0, ErrInvalidVaultID
+	}
+	session, ok := sessionKey(sessionID)
+	if !ok {
+		return false, 0, ErrSessionRequired
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.expireLocked(time.Now())
+	if m.closed {
+		return false, 0, ErrKeyManagerClosed
+	}
+	state := m.stateLocked(vaultID)
+	return hasGrant(state, session), state.generation, nil
+}
+
 // Touch records explicit foreground activity for a session with a live grant.
 // Ordinary reads, writes, polling, and key use do not call this method.
 func (m *KeyManager) Touch(vaultID string, sessionID []byte) error {

@@ -27,8 +27,15 @@ export async function apiFetch(input: RequestInfo | URL, init: RequestInit = {})
   const pathname = typeof input === 'string' ? input : input instanceof URL ? input.pathname : new URL(input.url, window.location.href).pathname
   const authenticationAttempt = pathname === '/api/auth/login' || pathname === '/api/auth/login/mfa'
   if (response.status === 401 && !authenticationAttempt) {
-    setCSRFToken()
-    window.dispatchEvent(new CustomEvent(authRequiredEvent))
+    let credentialRejected = false
+    try {
+      const body = await response.clone().json() as { code?: string }
+      credentialRejected = body.code === 'invalid_credentials' || body.code === 'invalid_recovery_code' || body.code === 'export_reauthentication_required'
+    } catch { /* A non-JSON 401 still means the browser session expired. */ }
+    if (!credentialRejected) {
+      setCSRFToken()
+      window.dispatchEvent(new CustomEvent(authRequiredEvent))
+    }
   }
   return response
 }

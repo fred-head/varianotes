@@ -116,7 +116,7 @@ func TestProtectedMarkdownCreateSaveConflictAndTree(t *testing.T) {
 	}
 
 	tree, err := repository.TreeWithCatalog(updatedCatalog)
-	if err != nil || len(tree) != 1 || len(tree[0].Children) != 1 || tree[0].Children[0].Path != "private/Note.md" {
+	if err != nil || len(tree) != 1 || !tree[0].Protected || len(tree[0].Children) != 1 || tree[0].Children[0].Path != "private/Note.md" || !tree[0].Children[0].Protected || !tree[0].Children[0].ProtectionInherited {
 		t.Fatalf("protected note missing from logical tree: %#v err=%v", tree, err)
 	}
 }

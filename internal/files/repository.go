@@ -27,10 +27,12 @@ var (
 )
 
 type Node struct {
-	Name     string `json:"name"`
-	Path     string `json:"path"`
-	Type     string `json:"type"`
-	Children []Node `json:"children,omitempty"`
+	Name                 string `json:"name"`
+	Path                 string `json:"path"`
+	Type                 string `json:"type"`
+	Protected            bool   `json:"protected,omitempty"`
+	ProtectionInherited  bool   `json:"protectionInherited,omitempty"`
+	Children             []Node `json:"children,omitempty"`
 }
 
 type Repository struct {

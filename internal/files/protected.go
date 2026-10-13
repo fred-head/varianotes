@@ -314,8 +314,47 @@ func (r *Repository) TreeWithCatalog(catalog encryption.Catalog) ([]Node, error)
 			return nil, err
 		}
 	}
+	markProtectionState(tree, catalog)
 	sortTree(tree)
 	return tree, nil
+}
+
+func markProtectionState(nodes []Node, catalog encryption.Catalog) {
+	protectedObjects := make(map[string]bool, len(catalog.Objects))
+	for _, object := range catalog.Objects {
+		if object.Protected {
+			protectedObjects[object.LogicalPath] = true
+		}
+	}
+	rules := make([]string, 0, len(catalog.FolderRules))
+	for _, rule := range catalog.FolderRules {
+		rules = append(rules, rule.Path)
+	}
+	markTreeProtection(nodes, protectedObjects, rules, "")
+}
+
+func markTreeProtection(nodes []Node, protectedObjects map[string]bool, rules []string, inheritedFrom string) {
+	for index := range nodes {
+		node := &nodes[index]
+		protectedByRule := false
+		directRule := false
+		for _, rule := range rules {
+			if node.Path == rule || strings.HasPrefix(node.Path, rule+"/") {
+				protectedByRule = true
+				if node.Path == rule {
+					directRule = true
+				}
+				break
+			}
+		}
+		node.Protected = protectedByRule || protectedObjects[node.Path]
+		node.ProtectionInherited = protectedByRule && inheritedFrom != ""
+		nextInherited := inheritedFrom
+		if directRule && node.Type == "directory" {
+			nextInherited = node.Path
+		}
+		markTreeProtection(node.Children, protectedObjects, rules, nextInherited)
+	}
 }
 
 func (r *Repository) HasAgeFiles() (bool, error) {
