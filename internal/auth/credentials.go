@@ -237,6 +237,9 @@ func (s *Service) verifyPassword(ctx context.Context, password string) error {
 	if phase != "" {
 		return ErrPasswordChangePending
 	}
+	if err := s.ensureNoPendingEncryptionRecovery(ctx); err != nil {
+		return err
+	}
 	if len(password) > maximumPasswordBytes || !utf8.ValidString(password) {
 		return ErrAuthentication
 	}

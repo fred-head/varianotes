@@ -281,18 +281,21 @@ func (c *vaultPasswordChangeCoordinator) registeredNotebooks() ([]notebookRecord
 }
 
 type vaultProtectionState struct {
-	protected    bool
-	hasCatalog   bool
-	hasEnvelope  bool
-	catalogPath  string
-	envelopePath string
+	protected            bool
+	hasCatalog           bool
+	hasEnvelope          bool
+	hasRecoveryEnvelope  bool
+	catalogPath          string
+	envelopePath         string
+	recoveryEnvelopePath string
 }
 
 func inspectVaultProtection(entry notebookRecord, registryPath string) (vaultProtectionState, error) {
 	metadataDir := vaultEncryptionDirectory(registryPath, entry.ID)
 	state := vaultProtectionState{
-		catalogPath:  filepath.Join(metadataDir, "catalog.json"),
-		envelopePath: filepath.Join(metadataDir, "key-envelope.json"),
+		catalogPath:          filepath.Join(metadataDir, "catalog.json"),
+		envelopePath:         filepath.Join(metadataDir, "key-envelope.json"),
+		recoveryEnvelopePath: filepath.Join(metadataDir, "recovery-key-envelope.json"),
 	}
 	metadataRoot := filepath.Dir(metadataDir)
 	rootInfo, rootErr := os.Lstat(metadataRoot)
@@ -328,7 +331,11 @@ func inspectVaultProtection(entry notebookRecord, registryPath string) (vaultPro
 	if err != nil {
 		return state, err
 	}
-	if state.hasCatalog || state.hasEnvelope {
+	state.hasRecoveryEnvelope, err = regularFileExists(state.recoveryEnvelopePath)
+	if err != nil {
+		return state, err
+	}
+	if state.hasCatalog || state.hasEnvelope || state.hasRecoveryEnvelope {
 		state.protected = true
 		return state, nil
 	}

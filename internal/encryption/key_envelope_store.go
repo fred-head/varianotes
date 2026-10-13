@@ -144,6 +144,39 @@ func (s *VaultKeyEnvelopeStore) Save(envelope VaultKeyEnvelope) error {
 	return nil
 }
 
+// Delete removes an envelope created by a recovery-code transaction and
+// syncs the metadata directory. A missing target is already deleted.
+func (s *VaultKeyEnvelopeStore) Delete() error {
+	if s == nil {
+		return ErrInvalidKeyEnvelopeStore
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := validateKeyEnvelopeDirectory(s.directory); err != nil {
+		return err
+	}
+	root, err := os.OpenRoot(s.directory)
+	if err != nil {
+		return fmt.Errorf("open key-envelope metadata directory: %w", err)
+	}
+	defer root.Close()
+	if err := validateKeyEnvelopeTarget(root, s.name); err != nil {
+		return err
+	}
+	if err := root.Remove(s.name); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return fmt.Errorf("remove vault key envelope: %w", err)
+	}
+	directory, err := root.Open(".")
+	if err != nil {
+		return fmt.Errorf("open key-envelope metadata directory for sync: %w", err)
+	}
+	defer directory.Close()
+	if err := directory.Sync(); err != nil {
+		return fmt.Errorf("sync key-envelope metadata directory: %w", err)
+	}
+	return nil
+}
+
 func validateKeyEnvelopeDirectory(directory string) error {
 	info, err := os.Lstat(directory)
 	if err != nil {

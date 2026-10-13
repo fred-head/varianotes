@@ -245,8 +245,8 @@ Completion criteria:
 
 ## Milestone 31 - Selective encryption for notes and folders
 
-M31 remains in Alpha 3. This checklist is the implementation plan. **P01–P07
-are complete; P08–P18 remain open.** M31 is not complete until P01–P18 are
+M31 remains in Alpha 3. This checklist is the implementation plan. **P01–P08
+are complete; P09–P18 remain open.** M31 is not complete until P01–P18 are
 complete and the independent security review in P17 has passed. Encryption
 activation must stay disabled in the UI, API, and any operator command until
 the P18 release gate passes.
@@ -420,14 +420,23 @@ requires its listed tests; P17 adds end-to-end and adversarial coverage.
   separate password; future OIDC credentials are not part of this API. No note
   or asset bytes are rewritten.
 
-- [ ] **P08 — One-time recovery code**
+- [x] **P08 — One-time recovery code**
   *(dependencies: P03–P07; size: L)*
   **Goal/scope:** code creation, one-time display, user confirmation, password
   loss recovery, replacement, and multi-vault envelope update.
   **Acceptance/tests:** private code is not persisted on server; setup activates
   only after envelopes verify; wrong code changes nothing; interrupted recovery
   does not consume old code early; success changes password and code, revokes
-  sessions, and locks vaults; documented external recovery works.
+  sessions, and locks vaults; documented external recovery works. Implemented
+  as a random 256-bit, one-time displayed code whose age envelopes are staged
+  in memory until confirmation. Confirmed setup and password recovery update
+  every protected vault through an auth-database recovery journal; prepared
+  operations roll back at startup and committed operations finish forward.
+  Password recovery replaces both the local password and code, revokes all
+  sessions, and locks in-memory vault keys. See the recovery details in the
+  [authentication architecture](../security/authentication-architecture.md).
+  The externally stored code restores access through VariaNotes from a matching
+  complete backup; standalone content decryption remains in the P17/P18 gate.
 
 - [ ] **P09 — Encrypted note reads, saves, and conflicts**
   *(dependencies: P01–P06; size: M)*

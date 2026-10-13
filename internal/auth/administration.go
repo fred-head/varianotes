@@ -186,6 +186,9 @@ func (s *Service) replacePassword(ctx context.Context, password string, keepSess
 func (s *Service) RecoverPassword(ctx context.Context, password string) error {
 	s.credentialMu.Lock()
 	defer s.credentialMu.Unlock()
+	if err := s.ensureNoPendingEncryptionRecovery(ctx); err != nil {
+		return err
+	}
 	state, err := s.State(ctx)
 	if err != nil {
 		return err
@@ -202,6 +205,13 @@ func (s *Service) RecoverPassword(ctx context.Context, password string) error {
 func (s *Service) ChangePassword(ctx context.Context, currentPassword, newPassword string, keepSessionHash []byte) error {
 	s.credentialMu.Lock()
 	defer s.credentialMu.Unlock()
+	return s.changePassword(ctx, currentPassword, newPassword, keepSessionHash)
+}
+
+func (s *Service) changePassword(ctx context.Context, currentPassword, newPassword string, keepSessionHash []byte) error {
+	if err := s.ensureNoPendingEncryptionRecovery(ctx); err != nil {
+		return err
+	}
 	if err := s.verifyPassword(ctx, currentPassword); err != nil {
 		return err
 	}
