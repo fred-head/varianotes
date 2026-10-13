@@ -1497,9 +1497,9 @@ func TestProtectedNoteAPIEncryptsFirstCreateAndPreservesConflictDraft(t *testing
 	if _, err := os.Stat(assetCiphertextPath); err != nil {
 		t.Fatalf("removing image presentation metadata changed shared ciphertext: %v", err)
 	}
-	unsupportedMove := requestJSON(http.MethodPost, "/api/repository/move", map[string]string{"source": "private", "target": "moved"})
-	if unsupportedMove.Code != http.StatusServiceUnavailable {
-		t.Fatalf("move bypassed the unfinished encryption path: %d %s", unsupportedMove.Code, unsupportedMove.Body.String())
+	choiceRequiredMove := requestJSON(http.MethodPost, "/api/repository/move", map[string]string{"source": "private", "target": "moved"})
+	if choiceRequiredMove.Code != http.StatusConflict || !strings.Contains(choiceRequiredMove.Body.String(), "keep protection or decrypt") {
+		t.Fatalf("protected move did not require an explicit choice: %d %s", choiceRequiredMove.Code, choiceRequiredMove.Body.String())
 	}
 	if _, err := os.Stat(ciphertextPath); err != nil {
 		t.Fatalf("rejected move changed protected ciphertext: %v", err)
@@ -1535,8 +1535,9 @@ func TestProtectedNoteAPIEncryptsFirstCreateAndPreservesConflictDraft(t *testing
 	if serverNote.Code != http.StatusOK || !strings.Contains(serverNote.Body.String(), `"content":"# Note\n"`) {
 		t.Fatalf("stale draft replaced server note: %d %s", serverNote.Code, serverNote.Body.String())
 	}
-	updated := requestJSON(http.MethodPut, "/api/repository/file?path=private/Note.md", map[string]string{"content": "# Updated\n", "version": loaded.Version})
-	if updated.Code != http.StatusOK || !strings.Contains(updated.Body.String(), `"content":"# Updated\n"`) {
+	updatedContent := "# Updated\n\n![asset](" + uploaded.Path + ")\n"
+	updated := requestJSON(http.MethodPut, "/api/repository/file?path=private/Note.md", map[string]string{"content": updatedContent, "version": loaded.Version})
+	if updated.Code != http.StatusOK || !strings.Contains(updated.Body.String(), `"content":"# Updated\n\n![asset](`) {
 		t.Fatalf("protected save failed: %d %s", updated.Code, updated.Body.String())
 	}
 	updatedCiphertext, err := os.ReadFile(ciphertextPath)
@@ -1563,11 +1564,47 @@ func TestProtectedNoteAPIEncryptsFirstCreateAndPreservesConflictDraft(t *testing
 	if err := manager.Unlock(vaultID, sessionHash[:], key); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.Mkdir(filepath.Join(root, "archive"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	movePreview := requestJSON(http.MethodPost, "/api/repository/move/preview", map[string]string{"source": "private/Note.md", "target": "archive/Renamed.md"})
+	if movePreview.Code != http.StatusOK || movePreview.Header().Get("Cache-Control") != "no-store, private" {
+		t.Fatalf("protected move preview failed: %d %s", movePreview.Code, movePreview.Body.String())
+	}
+	var previewBody struct {
+		Token string `json:"token"`
+	}
+	if err := json.Unmarshal(movePreview.Body.Bytes(), &previewBody); err != nil || previewBody.Token == "" {
+		t.Fatalf("protected move preview token missing: %#v err=%v", previewBody, err)
+	}
+	moved := requestJSON(http.MethodPost, "/api/repository/move", map[string]string{
+		"source": "private/Note.md", "target": "archive/Renamed.md", "rewriteToken": previewBody.Token, "protectionChoice": "keep",
+	})
+	if moved.Code != http.StatusOK || !strings.Contains(moved.Body.String(), `"path":"archive/Renamed.md"`) {
+		t.Fatalf("protected keep move failed: %d %s", moved.Code, moved.Body.String())
+	}
+	ciphertextPath = filepath.Join(root, "archive", "Renamed.md.age")
+	movedRead := httptest.NewRecorder()
+	movedReadRequest := httptest.NewRequest(http.MethodGet, "/api/repository/file?path=archive%2FRenamed.md", nil)
+	movedReadRequest.AddCookie(cookie)
+	handler.ServeHTTP(movedRead, movedReadRequest)
+	if movedRead.Code != http.StatusOK || !strings.Contains(movedRead.Body.String(), `"content":"# Updated\n\n![asset](Renamed.assets/`) {
+		t.Fatalf("moved protected note read failed: %d %s", movedRead.Code, movedRead.Body.String())
+	}
+	movedAssetPath := strings.Replace(uploaded.Path, "Note.assets/", "Renamed.assets/", 1)
+	movedAssetQuery := url.Values{"note": {"archive/Renamed.md"}, "path": {movedAssetPath}}
+	movedAssetRequest := httptest.NewRequest(http.MethodGet, "/api/repository/asset?"+movedAssetQuery.Encode(), nil)
+	movedAssetRequest.AddCookie(cookie)
+	movedAssetResponse := httptest.NewRecorder()
+	handler.ServeHTTP(movedAssetResponse, movedAssetRequest)
+	if movedAssetResponse.Code != http.StatusOK || !bytes.Equal(movedAssetResponse.Body.Bytes(), png) {
+		t.Fatalf("attachment did not follow its moved note: %d %s", movedAssetResponse.Code, movedAssetResponse.Body.String())
+	}
 	if err := os.WriteFile(ciphertextPath, []byte("corrupt"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	corrupt := httptest.NewRecorder()
-	corruptRequest := httptest.NewRequest(http.MethodGet, "/api/repository/file?path=private/Note.md", nil)
+	corruptRequest := httptest.NewRequest(http.MethodGet, "/api/repository/file?path=archive%2FRenamed.md", nil)
 	corruptRequest.AddCookie(cookie)
 	handler.ServeHTTP(corrupt, corruptRequest)
 	if corrupt.Code != http.StatusInternalServerError || strings.Contains(corrupt.Body.String(), "# Updated") {

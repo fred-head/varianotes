@@ -20,8 +20,8 @@ history. For behavior and deployment, see [README](../README.md).
   paths, ciphertext-backed versions, and the transaction journal; ordinary
   notes retain atomic version checks. Protected responses are published through
   per-session key leases so a completed lock hides late results. Operations not
-  yet implemented for encryption, including search, assets, moves, Trash, and
-  ZIP export, fail closed for encrypted vaults.
+  yet implemented for encryption, including search, Trash, and ZIP export, fail
+  closed for encrypted vaults.
 - `internal/encryption/` contains the versioned age and key-envelope primitives
   from M31P03, the authenticated durable catalog from M31P04, the volatile
   per-vault key manager from M31P05, the transaction journal from M31P06, and
@@ -52,7 +52,10 @@ history. For behavior and deployment, see [README](../README.md).
   Markdown, supported attachments, recursively selected folders, and associated
   Trash; it fails closed on collisions, symlinks, hardlinks, and unsupported
   entries, then commits plaintext removal and ciphertext/catalog installation
-  through forward recovery. The application still exposes no user-facing
+  through forward recovery. M31P12 adds catalog-aware note and folder moves,
+  explicit keep/decrypt policy choices, automatic conversion on moves into a
+  protected destination, and journaled encrypted backlink updates. The
+  application still exposes no user-facing
   unlock or activation path; encryption remains gated until all M31 steps and
   the release review pass.
 - Multiple named vaults on one server are registered in application metadata.

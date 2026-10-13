@@ -1279,18 +1279,58 @@ func newHandlerWithKeyManager(logger *slog.Logger, repositoryRoot string, authSe
 	})
 	mux.HandleFunc("POST /api/repository/move", func(w http.ResponseWriter, r *http.Request) {
 		var input struct {
-			Source       string `json:"source"`
-			Target       string `json:"target"`
-			RewriteToken string `json:"rewriteToken"`
+			Source           string `json:"source"`
+			Target           string `json:"target"`
+			RewriteToken     string `json:"rewriteToken"`
+			ProtectionChoice string `json:"protectionChoice"`
 		}
 		if !decodeJSON(w, r, &input) {
 			return
 		}
-		if _, noteAccess := currentContentContext(); rejectUnimplementedProtectedOperation(w, noteAccess) {
+		repository, noteAccess := currentContentContext()
+		lease, encrypted := beginProtectedNoteLease(w, r, noteAccess, sessions, keyManager)
+		if encrypted {
+			if lease == nil {
+				return
+			}
+			var preview files.MoveLinkPreview
+			var bufferedKey []byte
+			if err := lease.UseKey(func(key []byte) error {
+				bufferedKey = append([]byte(nil), key...)
+				return nil
+			}); err != nil {
+				lease.Close()
+				writeProtectedNoteError(w, err)
+				return
+			}
+			defer clear(bufferedKey)
+			err := lease.Commit(func() error {
+				catalog, loadErr := noteAccess.catalogForKey(bufferedKey)
+				if loadErr != nil {
+					return loadErr
+				}
+				var moveErr error
+				preview, moveErr = repository.MoveWithCatalog(input.Source, input.Target, input.RewriteToken, input.ProtectionChoice, catalog, bufferedKey, noteAccess.store, noteAccess.journal)
+				if moveErr != nil {
+					if errors.Is(moveErr, encryption.ErrTransactionNeedsRecovery) {
+						noteAccess.needsRecovery()
+					}
+					return moveErr
+				}
+				if err := presentationStore.move(currentNotebookID(), input.Source, input.Target); err != nil {
+					logger.Warn("move image presentation metadata failed", "error", err)
+				}
+				w.Header().Set("Cache-Control", "no-store, private")
+				writeJSON(w, http.StatusOK, map[string]any{"path": input.Target, "rewrites": preview.Rewrites})
+				return nil
+			})
+			if err != nil {
+				writeProtectedNoteError(w, err)
+			}
 			return
 		}
 		if input.RewriteToken == "" {
-			preview, err := currentRepository().PreviewMoveLinks(input.Source, input.Target)
+			preview, err := repository.PreviewMoveLinks(input.Source, input.Target)
 			if err != nil {
 				writeRepositoryError(w, err)
 				return
@@ -1299,7 +1339,7 @@ func newHandlerWithKeyManager(logger *slog.Logger, repositoryRoot string, authSe
 				writeRepositoryError(w, files.ErrLinkPreviewRequired)
 				return
 			}
-			if err := currentRepository().Move(input.Source, input.Target); err != nil {
+			if err := repository.Move(input.Source, input.Target); err != nil {
 				writeRepositoryError(w, err)
 				return
 			}
@@ -1309,7 +1349,7 @@ func newHandlerWithKeyManager(logger *slog.Logger, repositoryRoot string, authSe
 			writeJSON(w, http.StatusOK, map[string]any{"path": input.Target, "rewrites": []files.LinkRewrite{}})
 			return
 		}
-		preview, err := currentRepository().MoveWithLinkUpdates(input.Source, input.Target, input.RewriteToken)
+		preview, err := repository.MoveWithLinkUpdates(input.Source, input.Target, input.RewriteToken)
 		if err != nil {
 			writeRepositoryError(w, err)
 			return
@@ -1327,10 +1367,37 @@ func newHandlerWithKeyManager(logger *slog.Logger, repositoryRoot string, authSe
 		if !decodeJSON(w, r, &input) {
 			return
 		}
-		if _, noteAccess := currentContentContext(); rejectUnimplementedProtectedOperation(w, noteAccess) {
+		repository, noteAccess := currentContentContext()
+		lease, encrypted := beginProtectedNoteLease(w, r, noteAccess, sessions, keyManager)
+		if encrypted {
+			if lease == nil {
+				return
+			}
+			var preview files.MoveLinkPreview
+			err := lease.UseKey(func(key []byte) error {
+				catalog, loadErr := noteAccess.catalogForKey(key)
+				if loadErr != nil {
+					return loadErr
+				}
+				var previewErr error
+				preview, previewErr = repository.PreviewMoveLinksWithCatalog(input.Source, input.Target, catalog, key)
+				return previewErr
+			})
+			if err != nil {
+				lease.Close()
+				writeProtectedNoteError(w, err)
+				return
+			}
+			if err := lease.Commit(func() error {
+				w.Header().Set("Cache-Control", "no-store, private")
+				writeJSON(w, http.StatusOK, preview)
+				return nil
+			}); err != nil {
+				writeProtectedNoteError(w, err)
+			}
 			return
 		}
-		preview, err := currentRepository().PreviewMoveLinks(input.Source, input.Target)
+		preview, err := repository.PreviewMoveLinks(input.Source, input.Target)
 		if err != nil {
 			writeRepositoryError(w, err)
 			return
@@ -1338,10 +1405,37 @@ func newHandlerWithKeyManager(logger *slog.Logger, repositoryRoot string, authSe
 		writeJSON(w, http.StatusOK, preview)
 	})
 	mux.HandleFunc("GET /api/repository/links", func(w http.ResponseWriter, r *http.Request) {
-		if _, noteAccess := currentContentContext(); rejectUnimplementedProtectedOperation(w, noteAccess) {
+		repository, noteAccess := currentContentContext()
+		lease, encrypted := beginProtectedNoteLease(w, r, noteAccess, sessions, keyManager)
+		if encrypted {
+			if lease == nil {
+				return
+			}
+			var links []files.NoteLink
+			err := lease.UseKey(func(key []byte) error {
+				catalog, loadErr := noteAccess.catalogForKey(key)
+				if loadErr != nil {
+					return loadErr
+				}
+				var linksErr error
+				links, linksErr = repository.NoteLinksWithCatalog(r.URL.Query().Get("path"), catalog, key)
+				return linksErr
+			})
+			if err != nil {
+				lease.Close()
+				writeProtectedNoteError(w, err)
+				return
+			}
+			if err := lease.Commit(func() error {
+				w.Header().Set("Cache-Control", "no-store, private")
+				writeJSON(w, http.StatusOK, map[string]any{"links": links})
+				return nil
+			}); err != nil {
+				writeProtectedNoteError(w, err)
+			}
 			return
 		}
-		links, err := currentRepository().NoteLinks(r.URL.Query().Get("path"))
+		links, err := repository.NoteLinks(r.URL.Query().Get("path"))
 		if err != nil {
 			writeRepositoryError(w, err)
 			return
@@ -1903,6 +1997,12 @@ func writeRepositoryError(w http.ResponseWriter, err error) {
 		status, message = http.StatusBadRequest, "invalid trash item"
 	case errors.Is(err, files.ErrLinkPreviewRequired):
 		status, message = http.StatusConflict, "Review the internal note-link updates before moving this item."
+	case errors.Is(err, files.ErrMoveProtectionChoiceRequired):
+		status, message = http.StatusConflict, err.Error()
+	case errors.Is(err, files.ErrMoveDecryptIntoProtected), errors.Is(err, files.ErrInvalidMoveProtectionChoice):
+		status, message = http.StatusBadRequest, err.Error()
+	case errors.Is(err, files.ErrMoveRollbackFailed):
+		status, message = http.StatusServiceUnavailable, files.ErrMoveRollbackFailed.Error()
 	case errors.Is(err, files.ErrFileTooLarge):
 		status, message = http.StatusRequestEntityTooLarge, err.Error()
 	case errors.Is(err, files.ErrAssetTooLarge):
