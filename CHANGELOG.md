@@ -8,6 +8,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- Added M31P07 password coordination for vault-key envelopes, with a durable
+  auth database journal and restart rollback/forward recovery. Password reset
+  leaves vault envelopes unchanged and marks encryption passwords separate for
+  later login changes. Startup refuses to disable auth while registered vaults
+  contain encryption state or cannot be inspected.
 - Added the M31 transaction journal for authenticated ciphertext and catalog
   updates, with a durable forward commit point, restart recovery, and hidden
   ciphertext staging. Encryption remains inactive pending the M31 release gate.

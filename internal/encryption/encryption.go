@@ -131,6 +131,19 @@ func DecryptVaultKey(password string, envelope VaultKeyEnvelope) ([]byte, error)
 	return plaintext, nil
 }
 
+// RewrapVaultKeyEnvelope changes only the password-protected envelope. The
+// vault key and every encrypted content object remain byte-for-byte unchanged.
+// Callers that have an authenticated catalog should also load it with the
+// returned key before committing the new envelope.
+func RewrapVaultKeyEnvelope(currentPassword, newPassword string, envelope VaultKeyEnvelope) (VaultKeyEnvelope, error) {
+	vaultKey, err := DecryptVaultKey(currentPassword, envelope)
+	if err != nil {
+		return VaultKeyEnvelope{}, err
+	}
+	defer clear(vaultKey)
+	return EncryptVaultKey(newPassword, vaultKey)
+}
+
 // EncryptContent produces a standard age-encrypted file and a separate key
 // envelope. The returned ciphertext can be decrypted by the official age CLI
 // with the unwrapped per-file identity.

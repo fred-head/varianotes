@@ -144,6 +144,57 @@ func (s *CatalogStore) Load(vaultKey []byte, expectedVaultID string) (Catalog, e
 	return ParseCatalog(data, vaultKey, expectedVaultID)
 }
 
+// ReadVaultID returns the untrusted identity field needed to select the
+// expected ID for Load. Callers must still call Load with the vault key; this
+// method alone does not authenticate the catalog.
+func (s *CatalogStore) ReadVaultID() (string, error) {
+	if s == nil {
+		return "", ErrInvalidCatalogStore
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	root, err := os.OpenRoot(s.directory)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return "", errors.Join(ErrCatalogMissing, err)
+		}
+		return "", fmt.Errorf("open encryption metadata directory: %w", err)
+	}
+	defer root.Close()
+	info, err := root.Lstat(s.name)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return "", errors.Join(ErrCatalogMissing, err)
+		}
+		return "", fmt.Errorf("inspect encryption catalog: %w", err)
+	}
+	if !info.Mode().IsRegular() || info.Size() <= 0 || info.Size() > maxCatalogBytes {
+		return "", ErrInvalidCatalogStore
+	}
+	file, err := root.Open(s.name)
+	if err != nil {
+		return "", fmt.Errorf("open encryption catalog: %w", err)
+	}
+	opened, statErr := file.Stat()
+	if statErr != nil || !opened.Mode().IsRegular() || !os.SameFile(info, opened) {
+		_ = file.Close()
+		return "", ErrInvalidCatalogStore
+	}
+	data, readErr := io.ReadAll(io.LimitReader(file, maxCatalogBytes+1))
+	closeErr := file.Close()
+	if err := errors.Join(readErr, closeErr); err != nil {
+		return "", fmt.Errorf("read encryption catalog: %w", err)
+	}
+	var parsed authenticatedCatalog
+	if err := decodeCatalogJSON(data, &parsed); err != nil {
+		return "", err
+	}
+	if parsed.Version != CatalogFormatVersion || !isCatalogID(parsed.VaultID) {
+		return "", ErrInvalidCatalog
+	}
+	return parsed.VaultID, nil
+}
+
 func validateCatalogStoreTarget(root *os.Root, name string) error {
 	info, err := root.Lstat(name)
 	if errors.Is(err, fs.ErrNotExist) {

@@ -431,6 +431,10 @@ func newHandlerWithKeyManager(logger *slog.Logger, repositoryRoot string, authSe
 				writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "authentication failed", "code": "invalid_credentials"})
 			case errors.Is(err, auth.ErrPasswordTooShort), errors.Is(err, auth.ErrPasswordTooLarge), errors.Is(err, auth.ErrInvalidPassword), errors.Is(err, auth.ErrPasswordTooWeak):
 				writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			case errors.Is(err, auth.ErrPasswordChangeRecovery), errors.Is(err, auth.ErrPasswordChangePending):
+				_ = keyManager.LockAll(encryption.LockReasonSession)
+				logger.Error("password change requires recovery")
+				writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "password change requires recovery; restart VariaNotes before continuing"})
 			default:
 				logger.Error("password change failed", "error", err)
 				writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "password change failed"})

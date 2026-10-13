@@ -245,8 +245,8 @@ Completion criteria:
 
 ## Milestone 31 - Selective encryption for notes and folders
 
-M31 remains in Alpha 3. This checklist is the implementation plan. **P01–P06
-are complete; P07–P18 remain open.** M31 is not complete until P01–P18 are
+M31 remains in Alpha 3. This checklist is the implementation plan. **P01–P07
+are complete; P08–P18 remain open.** M31 is not complete until P01–P18 are
 complete and the independent security review in P17 has passed. Encryption
 activation must stay disabled in the UI, API, and any operator command until
 the P18 release gate passes.
@@ -399,7 +399,7 @@ requires its listed tests; P17 adds end-to-end and adversarial coverage.
   transaction primitives are not wired into vault operations; the M31
   activation gate remains closed.
 
-- [ ] **P07 — Password changes and authentication-mode rules**
+- [x] **P07 — Password changes and authentication-mode rules**
   *(dependencies: P03–P06; size: L)*
   **Goal/scope:** coordinate login credential and vault-envelope changes;
   support later separate encryption password; guard login disablement in runtime
@@ -408,7 +408,17 @@ requires its listed tests; P17 adds end-to-end and adversarial coverage.
   interruption across vaults/auth database resumes safely; unavailable
   registered vault blocks partial change; password reset without old password
   preserves ciphertext/envelopes; disable rules include encrypted Trash; OIDC
-  credentials are never keys.
+  credentials are never keys. Implemented as a journaled auth/envelope
+  coordinator: it prepares every registered vault before changing any envelope,
+  commits the auth credential and journal phase atomically, then finishes the
+  envelope updates. Startup rolls a prepared change back or completes a
+  committed change before serving requests. Recovery without the old password
+  changes auth state only and records a separate encryption-password binding,
+  so later login changes leave those envelopes alone. Disabling auth scans every
+  registered vault and blocks on encryption metadata, `.age` files including
+  Trash, or an unavailable vault. The envelope rewrap primitive accepts a
+  separate password; future OIDC credentials are not part of this API. No note
+  or asset bytes are rewritten.
 
 - [ ] **P08 — One-time recovery code**
   *(dependencies: P03–P07; size: L)*

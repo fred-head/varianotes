@@ -1,6 +1,7 @@
 package auth
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net/netip"
@@ -26,6 +27,17 @@ type Config struct {
 	CookieSecure        bool
 	TrustedProxies      []netip.Prefix
 	AllowMFAKeyRecovery bool
+	PasswordCoordinator PasswordChangeCoordinator
+}
+
+// PasswordChangeCoordinator prepares and applies password-encrypted vault-key
+// envelopes. The auth service journals the returned plan beside the
+// credential transition and calls Apply or Rollback during recovery.
+type PasswordChangeCoordinator interface {
+	PreparePasswordChange(ctx context.Context, currentPassword, newPassword string) ([]byte, error)
+	ApplyPasswordChange(ctx context.Context, plan []byte) error
+	RollbackPasswordChange(ctx context.Context, plan []byte) error
+	HasProtectedContent(ctx context.Context) (bool, error)
 }
 
 type EnvironmentLookup func(string) (string, bool)

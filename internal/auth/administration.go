@@ -10,6 +10,12 @@ import (
 	"time"
 )
 
+var (
+	ErrAuthenticationDisableBlocked = errors.New("authentication cannot be disabled while protected vault content exists")
+	ErrPasswordChangePending        = errors.New("password change recovery is pending")
+	ErrPasswordChangeRecovery       = errors.New("password change requires recovery")
+)
+
 type SessionSettings struct {
 	IdleHours     int `json:"idleHours"`
 	LifetimeHours int `json:"lifetimeHours"`
@@ -124,7 +130,7 @@ func (s *Service) RevokeOtherSessions(ctx context.Context, currentHash []byte) e
 	return err
 }
 
-func (s *Service) replacePassword(ctx context.Context, password string, keepSessionHash []byte, recovery bool) error {
+func (s *Service) replacePassword(ctx context.Context, password string, keepSessionHash []byte, recovery, coordinated bool) error {
 	if err := ValidatePassword(password); err != nil {
 		return err
 	}
@@ -160,6 +166,20 @@ func (s *Service) replacePassword(ctx context.Context, password string, keepSess
 	if _, err := tx.ExecContext(ctx, `INSERT INTO auth_security_events(event_type, occurred_at, outcome, details) VALUES (?, ?, 'success', '')`, event, now.Format(time.RFC3339Nano)); err != nil {
 		return err
 	}
+	if coordinated {
+		result, err := tx.ExecContext(ctx, `UPDATE auth_password_change_journal SET phase='committed' WHERE id=1 AND phase='prepared'`)
+		if err != nil {
+			return err
+		}
+		if count, _ := result.RowsAffected(); count != 1 {
+			return ErrPasswordChangePending
+		}
+	}
+	if recovery {
+		if _, err := tx.ExecContext(ctx, `UPDATE auth_configuration SET encryption_password_separate=1, updated_at=? WHERE id=1`, now.Format(time.RFC3339Nano)); err != nil {
+			return err
+		}
+	}
 	return tx.Commit()
 }
 
@@ -173,14 +193,130 @@ func (s *Service) RecoverPassword(ctx context.Context, password string) error {
 	if state.Mode != ModeLocal || !state.SetupCompleted {
 		return ErrSetupUnavailable
 	}
-	return s.replacePassword(ctx, password, nil, true)
+	if _, _, err := s.pendingPasswordChange(ctx); err != nil {
+		return err
+	}
+	return s.replacePassword(ctx, password, nil, true, false)
 }
 
 func (s *Service) ChangePassword(ctx context.Context, currentPassword, newPassword string, keepSessionHash []byte) error {
 	s.credentialMu.Lock()
 	defer s.credentialMu.Unlock()
-	if err := s.VerifyPassword(ctx, currentPassword); err != nil {
+	if err := s.verifyPassword(ctx, currentPassword); err != nil {
 		return err
 	}
-	return s.replacePassword(ctx, newPassword, keepSessionHash, false)
+	if err := ValidatePassword(newPassword); err != nil {
+		return err
+	}
+	separate, err := s.EncryptionPasswordSeparate(ctx)
+	if err != nil {
+		return err
+	}
+	if separate {
+		return s.replacePassword(ctx, newPassword, keepSessionHash, false, false)
+	}
+	coordinator := s.config.PasswordCoordinator
+	if coordinator == nil {
+		return s.replacePassword(ctx, newPassword, keepSessionHash, false, false)
+	}
+	plan, err := coordinator.PreparePasswordChange(ctx, currentPassword, newPassword)
+	if err != nil {
+		return err
+	}
+	if err := s.savePendingPasswordChange(ctx, "prepared", plan); err != nil {
+		return fmt.Errorf("journal password change: %w", err)
+	}
+	if err := coordinator.ApplyPasswordChange(ctx, plan); err != nil {
+		rollbackErr := coordinator.RollbackPasswordChange(ctx, plan)
+		if rollbackErr == nil {
+			rollbackErr = s.clearPendingPasswordChange(ctx)
+		}
+		if rollbackErr != nil {
+			return errors.Join(ErrPasswordChangeRecovery, err, rollbackErr)
+		}
+		return err
+	}
+	if err := s.replacePassword(ctx, newPassword, keepSessionHash, false, true); err != nil {
+		phase, pendingPlan, journalErr := s.pendingPasswordChange(ctx)
+		if journalErr != nil {
+			return errors.Join(ErrPasswordChangeRecovery, err, journalErr)
+		}
+		if phase == "committed" {
+			return s.finishCommittedPasswordChange(ctx, coordinator, pendingPlan)
+		}
+		if phase != "prepared" {
+			return errors.Join(ErrPasswordChangeRecovery, err)
+		}
+		rollbackErr := coordinator.RollbackPasswordChange(ctx, plan)
+		if rollbackErr == nil {
+			rollbackErr = s.clearPendingPasswordChange(ctx)
+		}
+		if rollbackErr != nil {
+			return errors.Join(ErrPasswordChangeRecovery, err, rollbackErr, journalErr)
+		}
+		return err
+	}
+	return s.finishCommittedPasswordChange(ctx, coordinator, plan)
+}
+
+func (s *Service) finishCommittedPasswordChange(ctx context.Context, coordinator PasswordChangeCoordinator, plan []byte) error {
+	if err := coordinator.ApplyPasswordChange(ctx, plan); err != nil {
+		return errors.Join(ErrPasswordChangeRecovery, err)
+	}
+	if err := s.clearPendingPasswordChange(ctx); err != nil {
+		return errors.Join(ErrPasswordChangeRecovery, err)
+	}
+	return nil
+}
+
+func (s *Service) savePendingPasswordChange(ctx context.Context, phase string, plan []byte) error {
+	if phase != "prepared" || len(plan) == 0 || len(plan) > 32<<20 {
+		return ErrPasswordChangePending
+	}
+	_, err := s.db.ExecContext(ctx, `INSERT INTO auth_password_change_journal(id, phase, plan, created_at) VALUES (1, ?, ?, ?)`, phase, plan, time.Now().UTC().Format(time.RFC3339Nano))
+	return err
+}
+
+func (s *Service) pendingPasswordChange(ctx context.Context) (string, []byte, error) {
+	var phase string
+	var plan []byte
+	err := s.db.QueryRowContext(ctx, `SELECT phase, plan FROM auth_password_change_journal WHERE id=1`).Scan(&phase, &plan)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil, nil
+	}
+	if err != nil {
+		return "", nil, err
+	}
+	if (phase != "prepared" && phase != "committed") || len(plan) == 0 || len(plan) > 32<<20 {
+		return "", nil, ErrPasswordChangeRecovery
+	}
+	return phase, plan, nil
+}
+
+func (s *Service) clearPendingPasswordChange(ctx context.Context) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM auth_password_change_journal WHERE id=1`)
+	return err
+}
+
+func (s *Service) recoverPasswordChange(ctx context.Context) error {
+	phase, plan, err := s.pendingPasswordChange(ctx)
+	if err != nil || phase == "" {
+		return err
+	}
+	coordinator := s.config.PasswordCoordinator
+	if coordinator == nil {
+		return ErrPasswordChangeRecovery
+	}
+	if phase == "prepared" {
+		err = coordinator.RollbackPasswordChange(ctx, plan)
+	} else {
+		err = coordinator.ApplyPasswordChange(ctx, plan)
+	}
+	if err != nil {
+		return errors.Join(ErrPasswordChangeRecovery, err)
+	}
+	if err := s.clearPendingPasswordChange(ctx); err != nil {
+		return errors.Join(ErrPasswordChangeRecovery, err)
+	}
+	return nil
 }
