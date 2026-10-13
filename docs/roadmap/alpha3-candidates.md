@@ -502,7 +502,7 @@ requires its listed tests; P17 adds end-to-end and adversarial coverage.
   destinations, and explicit keep/decrypt behavior when leaving protection.
   The API remains behind the M31 activation gate.
 
-- [ ] **P13 — Trash and restore**
+- [x] **P13 — Trash and restore**
   *(dependencies: P06, P10–P12; size: M)*
   **Goal/scope:** retain encryption/policy across Trash, restore, and permanent
   delete; respect shared references.
@@ -510,7 +510,11 @@ requires its listed tests; P17 adds end-to-end and adversarial coverage.
   protected destination encrypts; restore out requires the same keep/decrypt
   decision as a move; collisions preserve both copies; abort/restart is
   recoverable; unknown references cause retention or blocked deletion, not data
-  loss.
+  loss. Protected Trash stores ciphertext through journaled transactions,
+  restores enforce destination policy and collision checks, shared attachments
+  stay at their logical paths while referenced, and ambiguous or referenced
+  data blocks permanent deletion. Interrupted staging and post-commit directory
+  cleanup reconcile safely; M31 activation remains gated.
 
 - [ ] **P14 — Search, caches, and plaintext leak checks**
   *(dependencies: P05, P09, P10; size: M)*

@@ -30,11 +30,13 @@ var (
 )
 
 type TrashItem struct {
-	ID           string `json:"id"`
-	OriginalPath string `json:"originalPath"`
-	Type         string `json:"type"`
-	DeletedAt    string `json:"deletedAt"`
-	Size         int64  `json:"size"`
+	ID                       string `json:"id"`
+	OriginalPath             string `json:"originalPath"`
+	Type                     string `json:"type"`
+	DeletedAt                string `json:"deletedAt"`
+	Size                     int64  `json:"size"`
+	Protected                bool   `json:"protected,omitempty"`
+	ProtectionChoiceRequired bool   `json:"protectionChoiceRequired,omitempty"`
 }
 
 type trashMetadata struct {
@@ -340,7 +342,7 @@ func (r *Repository) loadTrashItem(id string) (resolvedTrashItem, error) {
 	if err != nil {
 		return resolvedTrashItem{}, err
 	}
-	return resolvedTrashItem{TrashItem: TrashItem{ID: id, OriginalPath: metadata.OriginalPath, Type: metadata.Type, DeletedAt: metadata.DeletedAt, Size: size}, root: itemRoot, contentPath: contentPath, assetsPath: assetsPath, assetsExist: assetsExist, encrypted: encrypted}, nil
+	return resolvedTrashItem{TrashItem: TrashItem{ID: id, OriginalPath: metadata.OriginalPath, Type: metadata.Type, DeletedAt: metadata.DeletedAt, Size: size, Protected: encrypted}, root: itemRoot, contentPath: contentPath, assetsPath: assetsPath, assetsExist: assetsExist, encrypted: encrypted}, nil
 }
 
 func (r *Repository) trashPathHasCiphertext(relative string) (bool, error) {
