@@ -161,6 +161,40 @@ function clearExternalImagePlaceholder(wrapper: HTMLElement, image: HTMLImageEle
   image.style.display = ''
 }
 
+function clearProtectedAttachmentPlaceholder(wrapper: HTMLElement, image: HTMLImageElement): void {
+  delete wrapper.dataset.varianotesProtectedAttachmentSource
+  wrapper.querySelector('.varianotes-protected-attachment-placeholder')?.remove()
+  image.style.display = ''
+}
+
+function watchProtectedAttachmentErrors(image: HTMLImageElement): void {
+  if (image.dataset.varianotesProtectedAttachmentErrorHandler === 'true') return
+  image.dataset.varianotesProtectedAttachmentErrorHandler = 'true'
+  image.addEventListener('error', () => {
+    const source = image.getAttribute('src')
+    if (!source) return
+    let assetURL: URL
+    try { assetURL = new URL(source, globalThis.location?.href ?? 'http://localhost') } catch { return }
+    if (assetURL.pathname !== '/api/repository/asset') return
+    void fetch(source, { method: 'HEAD', credentials: 'same-origin' }).then((response) => {
+      if (response.status !== 423) return
+      const wrapper = image.closest<HTMLElement>('.milkdown-image-inline')
+      if (!wrapper) return
+      wrapper.dataset.varianotesProtectedAttachmentSource = source
+      image.style.display = 'none'
+      let placeholder = wrapper.querySelector<HTMLSpanElement>('.varianotes-protected-attachment-placeholder')
+      if (!placeholder) {
+        placeholder = document.createElement('span')
+        placeholder.className = 'varianotes-protected-attachment-placeholder'
+        placeholder.setAttribute('role', 'img')
+        placeholder.setAttribute('aria-label', 'Geschützter Anhang')
+        placeholder.textContent = 'Geschützter Anhang'
+        wrapper.append(placeholder)
+      }
+    }).catch(() => undefined)
+  })
+}
+
 function documentOutline(document: Node): OutlineHeading[] {
   const headings: OutlineHeading[] = []
   document.descendants((node, position) => {
@@ -623,6 +657,10 @@ function MilkdownEditor({ documentKey, notePath, markdown, readOnly, onChange, n
       for (const image of images) {
         const wrapper = image.closest<HTMLElement>('.milkdown-image-inline')
         const currentSource = image.getAttribute('src')
+        if (wrapper?.dataset.varianotesProtectedAttachmentSource && wrapper.dataset.varianotesProtectedAttachmentSource !== currentSource) {
+          clearProtectedAttachmentPlaceholder(wrapper, image)
+        }
+        watchProtectedAttachmentErrors(image)
         const placeholderSource = externalSourceFromPlaceholderURL(currentSource)
         const storedExternalSource = wrapper?.dataset.varianotesExternalImageSource
         const externalSource = placeholderSource ?? (currentSource && isExternalImageSource(currentSource) ? currentSource : undefined) ?? (currentSource === storedExternalSource ? storedExternalSource : undefined)

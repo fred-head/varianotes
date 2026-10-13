@@ -6,12 +6,16 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"path"
 	"strings"
 )
 
-const maxAssetSize = 10 << 20
+// MaxAssetSize bounds a single uploaded or read image attachment.
+const MaxAssetSize = 10 << 20
+
+const maxAssetSize = MaxAssetSize
 
 var (
 	ErrUnsupportedMedia = errors.New("unsupported image type")
@@ -95,20 +99,11 @@ func (r *Repository) SaveAsset(noteRelative string, source io.Reader) (Asset, er
 }
 
 func (r *Repository) ReadAsset(noteRelative, assetRelative string) (Asset, error) {
-	notePath, _, err := r.resolveMarkdown(noteRelative)
+	notePath, err := r.resolveAssetPath(noteRelative, assetRelative)
 	if err != nil {
 		return Asset{}, err
 	}
-	expectedDirectoryName := noteBase(notePath) + ".assets"
-	if hasControlCharacter(assetRelative) || path.IsAbs(assetRelative) || path.Clean(assetRelative) != assetRelative || strings.Contains(assetRelative, `\`) {
-		return Asset{}, ErrInvalidPath
-	}
-	parts := strings.Split(assetRelative, "/")
-	if len(parts) != 2 || parts[0] != expectedDirectoryName || parts[1] == "" || parts[1] == "." || parts[1] == ".." {
-		return Asset{}, ErrInvalidPath
-	}
-
-	assetsDirectory := path.Join(path.Dir(notePath), expectedDirectoryName)
+	assetsDirectory := path.Dir(notePath)
 	exists, err := validateOwnedAssets(r.content, assetsDirectory)
 	if err != nil {
 		return Asset{}, err
@@ -116,8 +111,7 @@ func (r *Repository) ReadAsset(noteRelative, assetRelative string) (Asset, error
 	if !exists {
 		return Asset{}, os.ErrNotExist
 	}
-	target := path.Join(assetsDirectory, parts[1])
-	content, err := r.content.Read(target, maxAssetSize)
+	content, err := r.content.Read(notePath, maxAssetSize)
 	if errors.Is(err, ErrFileTooLarge) {
 		return Asset{}, ErrInvalidPath
 	}
@@ -129,4 +123,46 @@ func (r *Repository) ReadAsset(noteRelative, assetRelative string) (Asset, error
 		return Asset{}, ErrUnsupportedMedia
 	}
 	return Asset{RelativePath: assetRelative, ContentType: contentType, Content: content.Bytes}, nil
+}
+
+// resolveAssetPath turns a Markdown-relative image destination into one stable
+// vault path. Attachments can be shared by notes in different directories, but
+// must remain ordinary files directly inside a *.assets directory.
+func (r *Repository) resolveAssetPath(noteRelative, assetRelative string) (string, error) {
+	notePath, _, err := r.resolveMarkdown(noteRelative)
+	if err != nil {
+		return "", err
+	}
+	if assetRelative == "" || hasControlCharacter(assetRelative) || strings.Contains(assetRelative, `\`) {
+		return "", ErrInvalidPath
+	}
+	parsed, err := url.Parse(assetRelative)
+	if err != nil || parsed.IsAbs() || parsed.Scheme != "" || parsed.Host != "" || parsed.RawQuery != "" || parsed.Fragment != "" {
+		return "", ErrInvalidPath
+	}
+	decoded, err := url.PathUnescape(parsed.EscapedPath())
+	if err != nil || decoded == "" || path.IsAbs(decoded) || strings.Contains(decoded, `\`) || hasControlCharacter(decoded) {
+		return "", ErrInvalidPath
+	}
+	resolved := path.Clean(path.Join(path.Dir(notePath), decoded))
+	if resolved == "." || resolved == ".." || strings.HasPrefix(resolved, "../") || !validAssetLogicalPath(resolved) {
+		return "", ErrInvalidPath
+	}
+	return resolved, nil
+}
+
+func validAssetLogicalPath(relative string) bool {
+	if relative == "" || hasControlCharacter(relative) || path.IsAbs(relative) || path.Clean(relative) != relative || strings.Contains(relative, `\`) {
+		return false
+	}
+	parts := strings.Split(relative, "/")
+	if len(parts) < 2 || !strings.HasSuffix(strings.ToLower(parts[len(parts)-2]), ".assets") {
+		return false
+	}
+	for _, part := range parts {
+		if part == "" || part == "." || part == ".." {
+			return false
+		}
+	}
+	return supportedCleanupExtension(parts[len(parts)-1])
 }

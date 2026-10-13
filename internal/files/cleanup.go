@@ -216,19 +216,16 @@ func markdownDestinations(content string) []string {
 }
 
 func resolveAssetReference(noteRelative, destination string) (string, string, bool) {
-	decoded, err := url.PathUnescape(strings.TrimSpace(destination))
-	if err != nil {
+	parsed, err := url.Parse(strings.TrimSpace(destination))
+	if err != nil || parsed.IsAbs() || parsed.Scheme != "" || parsed.Host != "" {
 		return "", "", false
 	}
-	if index := strings.IndexAny(decoded, "?#"); index >= 0 {
-		decoded = decoded[:index]
-	}
-	decoded = strings.ReplaceAll(decoded, `\`, "/")
-	if decoded == "" || path.IsAbs(decoded) || strings.Contains(decoded, "://") {
+	decoded, err := url.PathUnescape(parsed.EscapedPath())
+	if err != nil || decoded == "" || strings.Contains(decoded, `\`) || hasControlCharacter(decoded) || path.IsAbs(decoded) {
 		return "", "", false
 	}
 	resolved := path.Clean(path.Join(path.Dir(noteRelative), decoded))
-	if resolved == ".." || strings.HasPrefix(resolved, "../") || !strings.Contains(path.Dir(resolved), ".assets") || !supportedCleanupExtension(resolved) {
+	if resolved == ".." || strings.HasPrefix(resolved, "../") || !validAssetLogicalPath(resolved) {
 		return "", "", false
 	}
 	return resolved, path.Base(resolved), true

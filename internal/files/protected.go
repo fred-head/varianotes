@@ -2,9 +2,13 @@ package files
 
 import (
 	"bytes"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io/fs"
+	"net/http"
+	"net/url"
 	"os"
 	"path"
 	"sort"
@@ -62,7 +66,10 @@ func (r *Repository) ReadMarkdownWithCatalog(relative string, catalog encryption
 	}
 	r.content.mu.RLock()
 	defer r.content.mu.RUnlock()
+	return r.readMarkdownWithCatalogLocked(relative, catalog, vaultKey)
+}
 
+func (r *Repository) readMarkdownWithCatalogLocked(relative string, catalog encryption.Catalog, vaultKey []byte) (Markdown, bool, error) {
 	object, found := catalogNote(catalog, relative)
 	protectedByRule, err := catalog.IsPathProtected(relative)
 	if err != nil {
@@ -328,12 +335,16 @@ func (r *Repository) HasAgeFiles() (bool, error) {
 }
 
 func (r *Repository) readProtectedBytes(object encryption.CatalogObject, vaultKey []byte) ([]byte, error) {
+	return r.readProtectedBytesLimit(object, vaultKey, maxMarkdownSize, maxMarkdownCiphertextSize)
+}
+
+func (r *Repository) readProtectedBytesLimit(object encryption.CatalogObject, vaultKey []byte, maximumPlaintext, maximumCiphertext int64) ([]byte, error) {
 	if _, err := r.content.lstat(object.LogicalPath); err == nil {
 		return nil, ErrProtectedContentCorrupt
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return nil, err
 	}
-	stored, err := r.content.read(object.PhysicalPath, maxMarkdownCiphertextSize)
+	stored, err := r.content.read(object.PhysicalPath, maximumCiphertext)
 	if err != nil {
 		return nil, protectedContentError(err)
 	}
@@ -347,11 +358,319 @@ func (r *Repository) readProtectedBytes(object encryption.CatalogObject, vaultKe
 	if err != nil {
 		return nil, errors.Join(ErrProtectedContentCorrupt, err)
 	}
-	if len(plaintext) > maxMarkdownSize {
+	if int64(len(plaintext)) > maximumPlaintext {
 		clear(plaintext)
 		return nil, ErrFileTooLarge
 	}
 	return plaintext, nil
+}
+
+// PreparedAssetOperation stages an asset upload while holding the repository
+// mutation lock. Commit publishes either an ordinary single-file write or a
+// journaled ciphertext/catalog update; Abort leaves no live asset behind.
+type PreparedAssetOperation struct {
+	Asset   Asset
+	commit  func() error
+	abort   func()
+	release func()
+	done    bool
+}
+
+func (operation *PreparedAssetOperation) Commit(publish func(Asset) error) error {
+	if operation == nil || operation.done || operation.commit == nil {
+		return errors.New("invalid prepared asset operation")
+	}
+	operation.done = true
+	defer operation.release()
+	if err := operation.commit(); err != nil {
+		return err
+	}
+	if publish != nil {
+		return publish(operation.Asset)
+	}
+	return nil
+}
+
+func (operation *PreparedAssetOperation) Abort() {
+	if operation == nil || operation.done {
+		return
+	}
+	operation.done = true
+	if operation.abort != nil {
+		operation.abort()
+	}
+	operation.release()
+}
+
+// PrepareAssetUploadWithCatalog creates a stable attachment object and applies
+// note, path-rule, and shared-reference protection before its first durable
+// byte. Protected uploads enter the same ciphertext transaction as their
+// authenticated catalog entry.
+func (r *Repository) PrepareAssetUploadWithCatalog(noteRelative string, content []byte, catalog encryption.Catalog, vaultKey []byte, catalogStore *encryption.CatalogStore, journal *encryption.TransactionJournal) (*PreparedAssetOperation, bool, error) {
+	if err := r.validateRelative(noteRelative, true); err != nil {
+		return nil, false, err
+	}
+	if int64(len(content)) > maxAssetSize {
+		return nil, false, ErrAssetTooLarge
+	}
+	contentType := http.DetectContentType(content)
+	if _, supported := imageExtensions[contentType]; !supported {
+		return nil, false, ErrUnsupportedMedia
+	}
+	r.content.mu.Lock()
+	unlock := true
+	defer func() {
+		if unlock {
+			r.content.mu.Unlock()
+		}
+	}()
+	if err := ensureCurrentCatalog(catalogStore, catalog, vaultKey); err != nil {
+		return nil, false, err
+	}
+	_, protectedNote, err := r.readMarkdownWithCatalogLocked(noteRelative, catalog, vaultKey)
+	if err != nil {
+		return nil, protectedNote, err
+	}
+	assetsDirectory := noteAssetsPath(noteRelative)
+	exists, err := validateOwnedAssets(r.content, assetsDirectory)
+	if err != nil {
+		return nil, protectedNote, err
+	}
+	createdDirectory := false
+	rollbackDirectory := func() {
+		if !createdDirectory {
+			return
+		}
+		entries, readErr := r.content.readDir(assetsDirectory)
+		if readErr == nil && len(entries) == 0 {
+			_ = r.content.removeAll(assetsDirectory)
+			_ = r.content.syncDir(path.Dir(assetsDirectory))
+		}
+	}
+	if !exists {
+		if err := r.content.mkdir(assetsDirectory, 0o755); err != nil {
+			if !errors.Is(err, os.ErrExist) {
+				return nil, protectedNote, err
+			}
+		} else {
+			createdDirectory = true
+		}
+		if _, err := validateOwnedAssets(r.content, assetsDirectory); err != nil {
+			rollbackDirectory()
+			return nil, protectedNote, err
+		}
+	}
+	identifier := make([]byte, 16)
+	if _, err := rand.Read(identifier); err != nil {
+		rollbackDirectory()
+		return nil, protectedNote, err
+	}
+	filename := hex.EncodeToString(identifier) + imageExtensions[contentType]
+	logicalPath := path.Join(assetsDirectory, filename)
+	relativePath := path.Join(noteBase(noteRelative)+".assets", filename)
+	if _, err := r.content.lstat(logicalPath); err == nil {
+		rollbackDirectory()
+		return nil, protectedNote, ErrAlreadyExists
+	} else if !errors.Is(err, os.ErrNotExist) {
+		rollbackDirectory()
+		return nil, protectedNote, err
+	}
+	if _, err := r.content.lstat(logicalPath + ".age"); err == nil {
+		rollbackDirectory()
+		return nil, true, ErrProtectedObjectMissing
+	} else if !errors.Is(err, os.ErrNotExist) {
+		rollbackDirectory()
+		return nil, protectedNote, err
+	}
+	protectedByRule, err := catalog.IsPathProtected(logicalPath)
+	if err != nil {
+		rollbackDirectory()
+		return nil, protectedNote, err
+	}
+	protected := protectedNote || protectedByRule
+	asset := Asset{RelativePath: relativePath, ContentType: contentType}
+	if !protected {
+		unlock = false
+		return &PreparedAssetOperation{
+			Asset: asset,
+			commit: func() error {
+				if err := r.content.writeNew(logicalPath, content, 0o644); err != nil {
+					rollbackDirectory()
+					return err
+				}
+				return r.content.syncDir(assetsDirectory)
+			},
+			abort:   rollbackDirectory,
+			release: r.content.mu.Unlock,
+		}, false, nil
+	}
+	objectID, err := encryption.NewCatalogObjectID()
+	if err != nil {
+		rollbackDirectory()
+		return nil, true, err
+	}
+	ciphertext, envelope, err := encryption.EncryptContent(vaultKey, objectID, content)
+	if err != nil {
+		rollbackDirectory()
+		return nil, true, err
+	}
+	nextCatalog := cloneCatalog(catalog)
+	nextCatalog.Objects = append(nextCatalog.Objects, encryption.CatalogObject{
+		ObjectID: objectID, Kind: encryption.CatalogObjectAsset, LogicalPath: logicalPath,
+		PhysicalPath: logicalPath + ".age", CiphertextHash: encryption.CiphertextSHA256(ciphertext),
+		ContentKeyEnvelope: cloneContentKeyEnvelope(&envelope), Protected: true,
+	})
+	transaction, err := journal.Prepare([]encryption.CiphertextChange{{
+		Path: logicalPath + ".age", ObjectID: objectID, Ciphertext: ciphertext, ContentKeyEnvelope: envelope,
+	}}, nextCatalog, vaultKey)
+	if err != nil {
+		rollbackDirectory()
+		return nil, true, err
+	}
+	unlock = false
+	return &PreparedAssetOperation{Asset: asset, commit: transaction.Commit, release: r.content.mu.Unlock}, true, nil
+}
+
+// ReadAssetWithCatalog resolves shared Markdown-relative references and
+// decrypts only authenticated asset objects. A plaintext asset referenced by a
+// protected note fails closed until its P11 conversion has completed.
+func (r *Repository) ReadAssetWithCatalog(noteRelative, assetRelative string, catalog encryption.Catalog, vaultKey []byte) (Asset, bool, error) {
+	if err := r.validateRelative(noteRelative, true); err != nil {
+		return Asset{}, false, err
+	}
+	r.content.mu.RLock()
+	defer r.content.mu.RUnlock()
+	_, protectedNote, err := r.readMarkdownWithCatalogLocked(noteRelative, catalog, vaultKey)
+	if err != nil {
+		return Asset{}, protectedNote, err
+	}
+	logicalPath, err := r.resolveCatalogAssetPath(noteRelative, assetRelative)
+	if err != nil {
+		return Asset{}, protectedNote, err
+	}
+	object, found := catalogNote(catalog, logicalPath)
+	if found {
+		if object.Kind != encryption.CatalogObjectAsset {
+			return Asset{}, false, ErrProtectedObjectMissing
+		}
+		if object.Protected {
+			plaintext, err := r.readProtectedBytesLimit(object, vaultKey, maxAssetSize, maxAssetSize+(1<<20))
+			if err != nil {
+				return Asset{}, true, err
+			}
+			defer clear(plaintext)
+			contentType, err := supportedImageType(plaintext)
+			if err != nil {
+				return Asset{}, true, err
+			}
+			return Asset{RelativePath: assetRelative, ContentType: contentType, Content: append([]byte(nil), plaintext...)}, true, nil
+		}
+		if _, err := r.content.lstat(logicalPath + ".age"); err == nil {
+			return Asset{}, false, ErrProtectedObjectMissing
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return Asset{}, false, err
+		}
+	}
+	protectedByRule, err := catalog.IsPathProtected(logicalPath)
+	if err != nil {
+		return Asset{}, false, err
+	}
+	if protectedByRule || protectedNote {
+		return Asset{}, true, ErrProtectedObjectMissing
+	}
+	protectedReference, err := r.protectedNoteReferencesAssetLocked(logicalPath, catalog, vaultKey)
+	if err != nil {
+		return Asset{}, false, err
+	}
+	if protectedReference {
+		return Asset{}, true, ErrProtectedObjectMissing
+	}
+	if !found {
+		if _, err := r.content.lstat(logicalPath + ".age"); err == nil {
+			return Asset{}, true, ErrProtectedObjectMissing
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return Asset{}, false, err
+		}
+	}
+	stored, err := r.content.read(logicalPath, maxAssetSize)
+	if err != nil {
+		return Asset{}, false, err
+	}
+	contentType, err := supportedImageType(stored.Bytes)
+	if err != nil {
+		return Asset{}, false, err
+	}
+	return Asset{RelativePath: assetRelative, ContentType: contentType, Content: stored.Bytes}, false, nil
+}
+
+func (r *Repository) resolveCatalogAssetPath(noteRelative, assetRelative string) (string, error) {
+	if hasControlCharacter(noteRelative) || path.IsAbs(noteRelative) || path.Clean(noteRelative) != noteRelative || strings.Contains(noteRelative, `\`) {
+		return "", ErrInvalidPath
+	}
+	if err := r.validateRelative(noteRelative, true); err != nil {
+		return "", err
+	}
+	if assetRelative == "" || hasControlCharacter(assetRelative) || strings.Contains(assetRelative, `\`) {
+		return "", ErrInvalidPath
+	}
+	parsed, err := url.Parse(assetRelative)
+	if err != nil || parsed.IsAbs() || parsed.Scheme != "" || parsed.Host != "" || parsed.RawQuery != "" || parsed.Fragment != "" {
+		return "", ErrInvalidPath
+	}
+	decoded, err := url.PathUnescape(parsed.EscapedPath())
+	if err != nil || decoded == "" || path.IsAbs(decoded) || strings.Contains(decoded, `\`) || hasControlCharacter(decoded) {
+		return "", ErrInvalidPath
+	}
+	resolved := path.Clean(path.Join(path.Dir(noteRelative), decoded))
+	if resolved == "." || resolved == ".." || strings.HasPrefix(resolved, "../") || !validAssetLogicalPath(resolved) {
+		return "", ErrInvalidPath
+	}
+	return resolved, nil
+}
+
+func (r *Repository) protectedNoteReferencesAssetLocked(assetPath string, catalog encryption.Catalog, vaultKey []byte) (bool, error) {
+	notePaths := make(map[string]struct{})
+	for _, object := range catalog.Objects {
+		if object.Kind == encryption.CatalogObjectNote {
+			notePaths[object.LogicalPath] = struct{}{}
+		}
+	}
+	entries, err := r.content.walkEntries(func(entry contentEntry) bool {
+		return entry.Info.IsDir() && (ignoredCleanupPath(entry.Path) || strings.HasSuffix(strings.ToLower(entry.Name), ".assets"))
+	})
+	if err != nil {
+		return false, err
+	}
+	for _, entry := range entries {
+		if entry.Info.Mode()&os.ModeSymlink != 0 || !entry.Info.Mode().IsRegular() || !strings.EqualFold(path.Ext(entry.Name), ".md") || ignoredCleanupPath(entry.Path) {
+			continue
+		}
+		notePaths[entry.Path] = struct{}{}
+	}
+	for notePath := range notePaths {
+		markdown, protected, err := r.readMarkdownWithCatalogLocked(notePath, catalog, vaultKey)
+		if err != nil {
+			return false, err
+		}
+		if !protected {
+			continue
+		}
+		for _, destination := range markdownDestinations(markdown.Content) {
+			resolved, _, ok := resolveAssetReference(notePath, destination)
+			if ok && resolved == assetPath {
+				return true, nil
+			}
+		}
+	}
+	return false, nil
+}
+
+func supportedImageType(content []byte) (string, error) {
+	contentType := http.DetectContentType(content)
+	if _, supported := imageExtensions[contentType]; !supported {
+		return "", ErrUnsupportedMedia
+	}
+	return contentType, nil
 }
 
 func catalogNote(catalog encryption.Catalog, logicalPath string) (encryption.CatalogObject, bool) {

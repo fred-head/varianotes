@@ -1252,6 +1252,35 @@ func TestRepositoryAssetAPI(t *testing.T) {
 	}
 }
 
+func TestAssetMultipartReaderDoesNotCreatePlaintextTempFiles(t *testing.T) {
+	temporary := t.TempDir()
+	t.Setenv("TMPDIR", temporary)
+	content := append([]byte("\x89PNG\r\n\x1a\n"), bytes.Repeat([]byte{0x5a}, 2<<20)...)
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	part, err := writer.CreateFormFile("file", "large.png")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := part.Write(content); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest(http.MethodPost, "/api/repository/assets?note=Note.md", &body)
+	request.Header.Set("Content-Type", writer.FormDataContentType())
+	parsed, err := readAssetUpload(httptest.NewRecorder(), request)
+	if err != nil || !bytes.Equal(parsed, content) {
+		t.Fatalf("read bounded multipart upload: bytes=%d err=%v", len(parsed), err)
+	}
+	clear(parsed)
+	entries, err := os.ReadDir(temporary)
+	if err != nil || len(entries) != 0 {
+		t.Fatalf("multipart reader left plaintext temporary files: entries=%v err=%v", entries, err)
+	}
+}
+
 func TestRepositoryAssetCleanupAPI(t *testing.T) {
 	root := t.TempDir()
 	if err := os.WriteFile(filepath.Join(root, "Note.md"), []byte("# Note"), 0o644); err != nil {
@@ -1292,6 +1321,9 @@ func TestProtectedNoteAPIEncryptsFirstCreateAndPreservesConflictDraft(t *testing
 	registryPath := filepath.Join(metadataRoot, "app", "notebooks.json")
 	vaultID := "11111111111111111111111111111111"
 	if err := os.Mkdir(filepath.Join(root, "private"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "Public.md"), []byte("# Public\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if err := writeNotebookRegistry(registryPath, notebookRegistry{
@@ -1384,6 +1416,87 @@ func TestProtectedNoteAPIEncryptsFirstCreateAndPreservesConflictDraft(t *testing
 	if err != nil || bytes.Contains(ciphertext, []byte("# Note")) {
 		t.Fatalf("first note bytes are not ciphertext: err=%v", err)
 	}
+
+	png := append([]byte("\x89PNG\r\n\x1a\n"), bytes.Repeat([]byte{0x4a}, 32)...)
+	var uploadBody bytes.Buffer
+	writer := multipart.NewWriter(&uploadBody)
+	part, err := writer.CreateFormFile("file", "shared.png")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := part.Write(png); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	assetUpload := httptest.NewRequest(http.MethodPost, "/api/repository/assets?note=private%2FNote.md", &uploadBody)
+	assetUpload.Header.Set("Content-Type", writer.FormDataContentType())
+	addAuthRequestContext(assetUpload, cookie, csrf)
+	assetUploadResponse := httptest.NewRecorder()
+	handler.ServeHTTP(assetUploadResponse, assetUpload)
+	if assetUploadResponse.Code != http.StatusCreated {
+		t.Fatalf("protected asset upload failed: %d %s", assetUploadResponse.Code, assetUploadResponse.Body.String())
+	}
+	var uploaded struct {
+		Path string `json:"path"`
+	}
+	if err := json.Unmarshal(assetUploadResponse.Body.Bytes(), &uploaded); err != nil || uploaded.Path == "" {
+		t.Fatalf("protected asset path missing: %#v err=%v", uploaded, err)
+	}
+	assetPlainPath := filepath.Join(root, "private", filepath.FromSlash(uploaded.Path))
+	assetCiphertextPath := assetPlainPath + ".age"
+	if _, err := os.Stat(assetPlainPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("protected attachment appeared in plaintext: %v", err)
+	}
+	assetCiphertext, err := os.ReadFile(assetCiphertextPath)
+	if err != nil || bytes.Contains(assetCiphertext, png) {
+		t.Fatalf("protected attachment was not stored as ciphertext: err=%v", err)
+	}
+	assetCatalog, err := catalogStore.Load(key, catalog.VaultID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var assetObject encryption.CatalogObject
+	found := false
+	for _, object := range assetCatalog.Objects {
+		if object.LogicalPath == "private/"+uploaded.Path {
+			assetObject, found = object, true
+			break
+		}
+	}
+	if !found || assetObject.Kind != encryption.CatalogObjectAsset || !assetObject.Protected {
+		t.Fatalf("protected attachment missing from authenticated catalog: %#v found=%v", assetObject, found)
+	}
+	presentationSet := requestJSON(http.MethodPut, "/api/repository/image-presentation", map[string]any{
+		"note": "private/Note.md", "image": uploaded.Path, "size": "medium",
+	})
+	if presentationSet.Code != http.StatusOK {
+		t.Fatalf("protected image presentation update failed: %d %s", presentationSet.Code, presentationSet.Body.String())
+	}
+	presentationList := httptest.NewRecorder()
+	presentationListRequest := httptest.NewRequest(http.MethodGet, "/api/repository/image-presentations?note=private%2FNote.md", nil)
+	presentationListRequest.AddCookie(cookie)
+	handler.ServeHTTP(presentationList, presentationListRequest)
+	if presentationList.Code != http.StatusOK || !strings.Contains(presentationList.Body.String(), `"Note.assets/`) || !strings.Contains(presentationList.Body.String(), `"medium"`) {
+		t.Fatalf("protected image presentation list failed: %d %s", presentationList.Code, presentationList.Body.String())
+	}
+	sharedAssetQuery := url.Values{"note": {"Public.md"}, "path": {"private/" + uploaded.Path}}
+	sharedAssetRequest := httptest.NewRequest(http.MethodGet, "/api/repository/asset?"+sharedAssetQuery.Encode(), nil)
+	sharedAssetRequest.AddCookie(cookie)
+	sharedAssetResponse := httptest.NewRecorder()
+	handler.ServeHTTP(sharedAssetResponse, sharedAssetRequest)
+	if sharedAssetResponse.Code != http.StatusOK || sharedAssetResponse.Header().Get("Content-Type") != "image/png" || !bytes.Equal(sharedAssetResponse.Body.Bytes(), png) || sharedAssetResponse.Header().Get("Cache-Control") != "no-store, private" {
+		t.Fatalf("shared encrypted attachment read failed: %d %s", sharedAssetResponse.Code, sharedAssetResponse.Body.String())
+	}
+	presentationDeleteQuery := url.Values{"note": {"private/Note.md"}, "image": {uploaded.Path}}
+	presentationDelete := requestJSON(http.MethodDelete, "/api/repository/image-presentation?"+presentationDeleteQuery.Encode(), map[string]string{})
+	if presentationDelete.Code != http.StatusNoContent {
+		t.Fatalf("protected image presentation removal failed: %d %s", presentationDelete.Code, presentationDelete.Body.String())
+	}
+	if _, err := os.Stat(assetCiphertextPath); err != nil {
+		t.Fatalf("removing image presentation metadata changed shared ciphertext: %v", err)
+	}
 	unsupportedMove := requestJSON(http.MethodPost, "/api/repository/move", map[string]string{"source": "private", "target": "moved"})
 	if unsupportedMove.Code != http.StatusServiceUnavailable {
 		t.Fatalf("move bypassed the unfinished encryption path: %d %s", unsupportedMove.Code, unsupportedMove.Body.String())
@@ -1439,6 +1552,13 @@ func TestProtectedNoteAPIEncryptsFirstCreateAndPreservesConflictDraft(t *testing
 	handler.ServeHTTP(locked, lockedRequest)
 	if locked.Code != http.StatusLocked || !strings.Contains(locked.Body.String(), `"code":"encryption_locked"`) {
 		t.Fatalf("locked note read returned %d: %s", locked.Code, locked.Body.String())
+	}
+	lockedAsset := httptest.NewRecorder()
+	lockedAssetRequest := httptest.NewRequest(http.MethodGet, "/api/repository/asset?"+sharedAssetQuery.Encode(), nil)
+	lockedAssetRequest.AddCookie(cookie)
+	handler.ServeHTTP(lockedAsset, lockedAssetRequest)
+	if lockedAsset.Code != http.StatusLocked || !strings.Contains(lockedAsset.Body.String(), `"code":"encryption_locked"`) || bytes.Contains(lockedAsset.Body.Bytes(), png) {
+		t.Fatalf("locked shared attachment leaked content or returned the wrong status: %d %s", lockedAsset.Code, lockedAsset.Body.String())
 	}
 	if err := manager.Unlock(vaultID, sessionHash[:], key); err != nil {
 		t.Fatal(err)

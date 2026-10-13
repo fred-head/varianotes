@@ -1062,6 +1062,24 @@ describe('MarkdownEditor read-only mode', () => {
     expect(fetchSpy.mock.calls.some(([, options]) => options && (options as RequestInit).method === 'POST')).toBe(false)
   })
 
+  it('shows the protected attachment placeholder while the vault is locked', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockImplementation(async (_input, init) => {
+      if ((init as RequestInit | undefined)?.method === 'HEAD') return new Response(null, { status: 423 })
+      return Response.json({ presentations: {} })
+    })
+    const view = render(<MarkdownEditor documentKey="locked-attachment" notePath="Note.md" markdown="![Secret](Note.assets/secret.png)" readOnly onChange={vi.fn()} />)
+    const image = await waitFor(() => {
+      const element = view.container.querySelector<HTMLImageElement>('.milkdown-image-inline img')
+      expect(element).toBeTruthy()
+      return element!
+    })
+
+    fireEvent.error(image)
+    expect(await view.findByRole('img', { name: 'Geschützter Anhang' })).toBeTruthy()
+    expect(image.style.display).toBe('none')
+    expect(fetchMock.mock.calls.some(([, init]) => (init as RequestInit | undefined)?.method === 'HEAD')).toBe(true)
+  })
+
   it('preserves external Markdown images and loads them only after an explicit action', async () => {
     const source = '## Diagram\n\n![Architecture](https://images.example.test/architecture.png)\n\nThe rest of the pasted note stays available.'
     Object.defineProperty(navigator, 'clipboard', { configurable: true, value: { readText: vi.fn().mockResolvedValue(source) } })
