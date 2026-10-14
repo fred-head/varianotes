@@ -182,8 +182,8 @@ outage or suspended-browser process test. CI/full-scope AI review remain gates.
   security assertions remain enabled; the focused normal/race test passed.
   The correction was merged into each open R branch without rewriting history.
 - Fresh AI source-review session `01a13a59-9c7c-7073-9792-1f97f8818894`
-  inspects the complete baseline-to-candidate difference in the unchanged
-  isolated `f29ecf3` checkout and the three-line test addition. It executes no
+  inspected the complete baseline-to-candidate difference in the unchanged
+  isolated `f29ecf3` checkout and the three-line test addition. It executed no
   tests; implementer validation is not counted as the reviewer's own evidence.
   It is an AI review, not P17's independent expert sign-off.
 

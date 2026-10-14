@@ -134,4 +134,3 @@ Zum Abschluss verifiziert: HEAD weiterhin **`f29ecf3d4d5a3788565a5216aa8ff8e2eda
   A further repair must cover shared vault transaction ownership, authoritative
   Trash reconciliation, and coordinated online CLI revocation without silently
   restricting the documented operator workflow. B4 also remains open.
-

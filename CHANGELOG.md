@@ -9,12 +9,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ### Fixed
 
 - M31 recovery repeats commit, content, catalog and key-envelope durability
-  barriers before completing interrupted work. Protected Trash journals its
+  barriers before completing interrupted work. Serial protected Trash paths journal their
   destination directories and preserves durable restore metadata across
-  interrupted finalization. Further security review remains required.
+  interrupted finalization. Concurrent recovery/reconciliation findings remain
+  open; further security review remains required.
 
-- M31 pending unlock requests cannot restore grants after manual lock, logout
-  or session revocation.
+- M31 pending unlock requests are fenced against HTTP manual lock, logout
+  and session revocation. Online CLI revocation coordination remains open.
 
 - M31 protected views hide plaintext on lock-channel or connection failures
   and enforce a local display deadline when lock events stop arriving.
