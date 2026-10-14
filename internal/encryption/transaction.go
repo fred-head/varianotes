@@ -703,6 +703,12 @@ func (j *TransactionJournal) applyCommitted(root *os.Root, record transactionRec
 	// digest, which makes recovery idempotent after a partial prior attempt.
 	for _, entry := range record.Changes {
 		if err := validateTransactionTarget(root, entry.Path); err != nil {
+			// Directory cleanup can already have removed a deleted source's
+			// parents before a later journal cleanup failure. Absence completes
+			// that delete; symlinks and other validation failures still block.
+			if entry.Delete && errors.Is(err, fs.ErrNotExist) {
+				continue
+			}
 			return err
 		}
 		if entry.Delete {
@@ -760,6 +766,9 @@ func (j *TransactionJournal) applyCommitted(root *os.Root, record transactionRec
 	for _, entry := range record.Changes {
 		if entry.Delete {
 			if err := validateTransactionTarget(root, entry.Path); err != nil {
+				if errors.Is(err, fs.ErrNotExist) {
+					continue
+				}
 				return err
 			}
 			if info, err := root.Lstat(filepath.FromSlash(entry.Path)); err == nil {

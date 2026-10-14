@@ -99,9 +99,10 @@ before serving affected content; do not roll back a durable forward decision.
 Regressions:
 - `TestMovePreparedRestartPreservesSourceAndOrdinaryBacklink` (keep/decrypt)
 - `TestDecryptRestorePreparedRestartKeepsOnlyTrashCiphertext`
-- `TestPlaintextPublicationAndDirectoriesRecoverAtEveryBoundary` (nine fault
+- `TestPlaintextPublicationAndDirectoriesRecoverAtEveryBoundary` (eleven fault
   phases; idempotent restart, source/catalog retention before commit, exact
-  plaintext only after commit, no residual stages)
+  plaintext only after commit, no residual stages, including cleanup failures
+  after source directories are already removed)
 - `TestPlaintextPublicationRejectsRecursiveProtectionBeforeStaging`
 - `TestCommittedPlaintextPublicationRetainsExternalCollision`
 
