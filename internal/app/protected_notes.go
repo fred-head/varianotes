@@ -76,17 +76,18 @@ func (access *protectedNoteAccess) catalogForKey(vaultKey []byte) (encryption.Ca
 	}
 	access.mu.Lock()
 	defer access.mu.Unlock()
+	expectedID := registeredCatalogID(access.vaultID)
+	// Check the registration before allowing recovery to mutate any live files.
+	if _, err := access.store.Load(vaultKey, expectedID); err != nil {
+		return encryption.Catalog{}, err
+	}
 	if !access.recovered {
-		if err := access.journal.Recover(vaultKey); err != nil {
+		if err := access.journal.RecoverForVault(vaultKey, expectedID); err != nil {
 			return encryption.Catalog{}, fmt.Errorf("recover encrypted note storage: %w", err)
 		}
 		access.recovered = true
 	}
-	vaultID, err := access.store.ReadVaultID()
-	if err != nil {
-		return encryption.Catalog{}, err
-	}
-	return access.store.Load(vaultKey, vaultID)
+	return access.store.Load(vaultKey, expectedID)
 }
 
 func (access *protectedNoteAccess) needsRecovery() {

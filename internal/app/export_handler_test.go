@@ -242,6 +242,7 @@ func newExportHarness(t *testing.T, includeProtected bool) protectedExportHarnes
 		t.Fatal(err)
 	}
 	var asset []byte
+	catalog.VaultID = registeredCatalogID(vaultID)
 	if includeProtected {
 		noteID, err := encryption.NewCatalogObjectID()
 		if err != nil {

@@ -48,8 +48,31 @@ Regression: `TestExportRejectsUntrackedProtectedDescendantsBeforeFirstByte`.
 - Persistent Go caches and disk-backed temporary directories; two Go workers,
   one package at a time, and a 1536 MiB Go memory target. No load stress tests.
 
+## F10 — Registered vault identity
+
+Confirmed: swapping a complete foreign ciphertext/catalog/password-envelope
+package between two registrations with the same owner password was accepted
+after restart. The regression failed against the original implementation.
+Application catalog checks now use a domain-separated identity derived from
+the independently configured notebook registration, including password-change
+and recovery verification. Journal recovery checks that identity before any
+cleanup or publication.
+
+Regressions: `TestRegisteredVaultRejectsCompleteForeignPackageAfterRestart`
+checks content access, password change and recovery setup;
+`TestRegisteredTransactionRecoveryRejectsForeignIdentityBeforeMutation` checks
+prepared and committed journals, preserved bytes, and valid recovery.
+
+Compatibility: activation has never shipped. Old unbound M31 fixtures are
+rejected without rewriting keys, catalogs or ciphertext. They remain
+decryptable externally with the original envelope. There is deliberately no
+automatic enrollment of an existing identity; a future trusted import would
+need explicit operator verification. Replacing the registration itself or
+rolling back a complete snapshot of the same registration is outside this
+cross-vault binding; it requires independently trusted anti-rollback state.
+
 ## Still open
 
-F10, F3–F6, F8, and F9 await code verification and remediation. A fresh full M31
+F3–F6, F8, and F9 await code verification and remediation. A fresh full M31
 review is required after all confirmed findings are fixed. No merge or security
 approval for P17 is claimed here.

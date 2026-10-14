@@ -86,10 +86,7 @@ func (c *vaultPasswordChangeCoordinator) PreparePasswordChange(ctx context.Conte
 		if err != nil {
 			return nil, fmt.Errorf("unlock registered vault %q: %w", entry.ID, err)
 		}
-		catalogID, idErr := catalogStore.ReadVaultID()
-		if idErr == nil {
-			_, idErr = catalogStore.Load(vaultKey, catalogID)
-		}
+		_, idErr := catalogStore.Load(vaultKey, registeredCatalogID(entry.ID))
 		newEnvelope, wrapErr := encryption.EncryptVaultKey(newPassword, vaultKey)
 		clear(vaultKey)
 		if idErr != nil {
@@ -350,6 +347,15 @@ func inspectVaultProtection(entry notebookRecord, registryPath string) (vaultPro
 func vaultEncryptionDirectory(registryPath, notebookID string) string {
 	digest := sha256.Sum256([]byte(notebookID))
 	return filepath.Join(filepath.Dir(registryPath), "encryption", hex.EncodeToString(digest[:]))
+}
+
+// registeredCatalogID binds authenticated vault metadata to its independently
+// configured registration. Never derive the expected identity from the catalog
+// being checked, or enroll an existing catalog automatically. Unbound pre-release
+// fixtures remain decryptable externally but must fail closed in the app.
+func registeredCatalogID(notebookID string) string {
+	digest := sha256.Sum256([]byte("varianotes/registered-vault-catalog/v1\x00" + notebookID))
+	return hex.EncodeToString(digest[:16])
 }
 
 func validateRegisteredVault(entry notebookRecord) error {
