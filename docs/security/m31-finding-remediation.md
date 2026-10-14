@@ -73,7 +73,7 @@ cross-vault binding; it requires independently trusted anti-rollback state.
 
 ## Still open
 
-F8 and F9 await code verification and remediation. A fresh full M31
+F9 awaits code verification and remediation. A fresh full M31
 review is required after all confirmed findings are fixed. No merge or security
 approval for P17 is claimed here.
 
@@ -171,3 +171,27 @@ Lock completion waits for an active durable commit or response write; existing
 server write timeouts still bound network writes. Physical key erasure and
 already delivered plaintext revocation are not claimed. Fresh independent
 review must verify this ordering across the complete M31 scope.
+
+## F8 — Derived dialogs and late content responses after lock
+
+Confirmed: the original UI left conflict plaintext visible after a lock and
+installed a delayed conflict or note response after lock/unlock. These three
+regressions failed against the original code; backlink previews had the same
+unguarded control flow. Lock events, manual lock, failed protection status,
+session changes and notebook switches now discard derived dialogs and advance
+an in-memory view epoch. Content responses require the same registration,
+lock generation and epoch. Conflict, note, save and move flows check that fence
+after asynchronous boundaries; conflict and backlink dialogs also require an
+unlocked view when rendered. A late save acknowledgement cannot mark the hidden
+draft saved. The unsaved editor draft remains only in tab memory and is shown
+again after unlock; discarded comparisons can be fetched again on retry.
+
+Regression file: `frontend/src/App.lock-security.test.tsx` covers eight cases:
+visible/late conflicts, visible/late backlink previews, delayed note loading,
+late conflict resolution, late save acknowledgement and switching away/back to
+the same registration. The existing real-editor tests still cover manual lock,
+status failure, lock events, draft retention and browser-storage exclusion.
+Validation: serial full frontend suite and focused additional regressions;
+frontend lint/build. Browser memory erasure or revocation of previously viewed
+plaintext is not claimed; the requirement is to hide protected content and
+reject stale responses while preserving the unsaved draft.
