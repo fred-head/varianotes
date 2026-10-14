@@ -30,6 +30,7 @@ var (
 type PreparedMarkdownOperation struct {
 	Markdown Markdown
 	commit   func() error
+	abort    func() error
 	release  func()
 	done     bool
 }
@@ -49,12 +50,16 @@ func (operation *PreparedMarkdownOperation) Commit(publish func(Markdown) error)
 	return nil
 }
 
-func (operation *PreparedMarkdownOperation) Abort() {
+func (operation *PreparedMarkdownOperation) Abort() error {
 	if operation == nil || operation.done {
-		return
+		return nil
 	}
 	operation.done = true
-	operation.release()
+	defer operation.release()
+	if operation.abort != nil {
+		return operation.abort()
+	}
+	return nil
 }
 
 // ReadMarkdownWithCatalog resolves a note through authenticated catalog policy.
@@ -188,7 +193,7 @@ func (r *Repository) PrepareMarkdownWriteWithCatalog(relative, content, expected
 		unlock = false
 		return &PreparedMarkdownOperation{
 			Markdown: Markdown{Content: content, Version: nextObject.CiphertextHash},
-			commit:   transaction.Commit, release: r.content.mu.Unlock,
+			commit:   transaction.Commit, abort: transaction.Abort, release: r.content.mu.Unlock,
 		}, true, nil
 	}
 	if found {
@@ -298,7 +303,7 @@ func (r *Repository) PrepareMarkdownCreateWithCatalog(relative string, catalog e
 	unlock = false
 	return &PreparedMarkdownOperation{
 		Markdown: Markdown{Content: string(initialContent), Version: encryption.CiphertextSHA256(ciphertext)},
-		commit:   transaction.Commit, release: r.content.mu.Unlock,
+		commit:   transaction.Commit, abort: transaction.Abort, release: r.content.mu.Unlock,
 	}, true, nil
 }
 
@@ -570,7 +575,10 @@ func (r *Repository) PrepareAssetUploadWithCatalog(noteRelative string, content 
 		return nil, true, err
 	}
 	unlock = false
-	return &PreparedAssetOperation{Asset: asset, commit: transaction.Commit, release: r.content.mu.Unlock}, true, nil
+	return &PreparedAssetOperation{
+		Asset: asset, commit: transaction.Commit,
+		abort: func() { _ = transaction.Abort() }, release: r.content.mu.Unlock,
+	}, true, nil
 }
 
 // ReadAssetWithCatalog resolves shared Markdown-relative references and

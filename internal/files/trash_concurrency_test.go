@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/fred-head/varianotes/internal/encryption"
 )
@@ -44,6 +45,17 @@ func TestTrashReconciliationWithStaleCatalogPreservesRestoreMapping(t *testing.T
 				}
 				return nil
 			}
+			snapshotReady, reconcile := make(chan struct{}), make(chan struct{})
+			listed := make(chan error, 1)
+			go func() {
+				oldSnapshot := stale
+				close(snapshotReady)
+				<-reconcile
+				_, err := repository.TrashItemsWithCatalog(oldSnapshot, key, faultJournal)
+				listed <- err
+			}()
+			<-snapshotReady
+			t.Cleanup(func() { close(reconcile) })
 			if _, err := repository.MoveToTrashWithCatalog("private", stale, key, store, faultJournal); !errors.Is(err, injected) {
 				t.Fatalf("fault boundary not reached: %v", err)
 			}
@@ -69,7 +81,15 @@ func TestTrashReconciliationWithStaleCatalogPreservesRestoreMapping(t *testing.T
 			}
 			// B now runs with the snapshot taken before A. A repeated recovery
 			// failure must keep the mapping, even though the live catalog is old.
-			_, _ = repository.TrashItemsWithCatalog(stale, key)
+			reconcile <- struct{}{}
+			select {
+			case err := <-listed:
+				if !errors.Is(err, injected) {
+					t.Errorf("reconciliation skipped the interrupted recovery/finalization barrier: %v", err)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("stale listing stalled")
+			}
 			retained, err := os.ReadFile(pending)
 			if err != nil || !bytes.Equal(retained, mapping) {
 				t.Errorf("B2: stale reconciliation deleted OriginalPath: %v", err)
@@ -87,7 +107,7 @@ func TestTrashReconciliationWithStaleCatalogPreservesRestoreMapping(t *testing.T
 			if err != nil {
 				t.Fatal(err)
 			}
-			items, err := restarted.TrashItemsWithCatalog(latest, key)
+			items, err := restarted.TrashItemsWithCatalog(latest, key, journal)
 			if err != nil || len(items) != 1 || items[0].OriginalPath != "private" {
 				t.Fatalf("B2: restart lost usable restore mapping: %#v %v", items, err)
 			}
@@ -107,5 +127,43 @@ func TestTrashReconciliationWithStaleCatalogPreservesRestoreMapping(t *testing.T
 				t.Fatalf("restore lost exact content: %#v %v", note, err)
 			}
 		})
+	}
+}
+
+func TestTrashReconciliationRetainsAmbiguousPendingPayload(t *testing.T) {
+	repository, _, journal, catalog, key, _ := trashDurabilityFixture(t)
+	id := "abababababababababababababababab"
+	pending := ".trash/.pending-" + id
+	target := ".trash/" + id + "/content/item/retained.age"
+	if err := os.MkdirAll(filepath.Join(repository.root, filepath.FromSlash(pending)), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(filepath.Join(repository.root, filepath.FromSlash(target))), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := repository.writeTrashMetadata(pending, trashMetadata{
+		OriginalPath: "private", Type: "directory", DeletedAt: time.Now().UTC().Format(time.RFC3339),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	data := []byte("unknown payload must retain its mapping")
+	if err := os.WriteFile(filepath.Join(repository.root, filepath.FromSlash(target)), data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	mapping := filepath.Join(repository.root, filepath.FromSlash(pending), trashMetadataName)
+	before, err := os.ReadFile(mapping)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repository.TrashItemsWithCatalog(catalog, key, journal); !errors.Is(err, encryption.ErrTransactionNeedsRecovery) {
+		t.Fatalf("ambiguous pending payload was not retained: %v", err)
+	}
+	after, err := os.ReadFile(mapping)
+	if err != nil || !bytes.Equal(before, after) {
+		t.Fatalf("ambiguous OriginalPath lost: %v", err)
+	}
+	after, err = os.ReadFile(filepath.Join(repository.root, filepath.FromSlash(target)))
+	if err != nil || !bytes.Equal(data, after) {
+		t.Fatalf("ambiguous payload lost: %v", err)
 	}
 }

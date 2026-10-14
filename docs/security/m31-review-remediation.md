@@ -8,8 +8,10 @@ reviewer sign-off. PR #24 remains open, activation disabled, P18 unchanged.
 
 **Fresh follow-up outcome: blocked.** The completed
 [full-scope AI source review](m31-r-followup-ai-review.md) reports three high
-blockers (B1–B3) and a medium durability finding (B4). R2 remains open at stale
-catalog reconciliation and R4 at documented online CLI revocation. The serial
+blockers (B1–B3) and a medium durability finding (B4). A separate
+[B1/B2 correction candidate](m31-b1-b2-remediation.md) dynamically reproduces
+and addresses concurrent recovery and stale catalog reconciliation. B3/B4
+remain open, including R4's documented online CLI revocation. The serial
 R1/R2 barriers, R3 replay and R5 display fences are correction candidates,
 not overall recovery/safety guarantees. No correction PR has merged.
 
@@ -68,9 +70,10 @@ Trash/lock/concurrency race tests passed. These exercise process interruption
 and failed barriers, not actual storage power loss. CI/full-scope AI review
 remain outstanding.
 
-**Remaining R2 boundary:** B2 in the follow-up AI review identifies pending
+**Follow-up R2 boundary:** B2 in the follow-up AI review identifies pending
 restore-mapping deletion based on a stale/partially committed catalog. The
-durability tests above do not cover that competing GET/commit interleaving.
+serial durability tests above do not cover that competing GET/commit
+interleaving; the separate [B1/B2 candidate](m31-b1-b2-remediation.md) does.
 
 ## R3 — matching envelope replay
 

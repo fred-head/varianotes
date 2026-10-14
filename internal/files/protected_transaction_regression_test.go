@@ -112,7 +112,7 @@ func TestDecryptRestorePreparedRestartKeepsOnlyTrashCiphertext(t *testing.T) {
 		t.Fatalf("prepared restart left plaintext: %v", err)
 	}
 	repository = mustRepository(t, root)
-	items, err := repository.TrashItemsWithCatalog(catalog, key)
+	items, err := repository.TrashItemsWithCatalog(catalog, key, journal)
 	if err != nil || len(items) != 1 || !items[0].Protected {
 		t.Fatalf("restart lost protected Trash: %#v %v", items, err)
 	}

@@ -21,7 +21,7 @@ const internalTransactionStagePrefix = ".vnotes-txn-"
 // coordination with other repository mutations.
 type contentStore struct {
 	root string
-	mu   sync.RWMutex
+	mu   *sync.RWMutex
 	// Private fault seam for filesystem interruption regressions.
 	fault func(phase, relative string) error
 }

@@ -270,6 +270,8 @@ func (r *Repository) moveWithCatalogPrepared(source, target, expectedToken, prot
 	}
 	if err == nil {
 		err = transaction.Commit()
+	} else if transaction != nil {
+		err = errors.Join(err, transaction.Abort())
 	}
 	if err != nil {
 		return MoveLinkPreview{}, err

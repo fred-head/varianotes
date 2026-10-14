@@ -23,7 +23,8 @@ func (r *Repository) MoveToTrashWithCatalog(relative string, catalog encryption.
 	if err := r.validateRelative(relative, false); err != nil {
 		return TrashItem{}, err
 	}
-	if err := r.reconcileProtectedTrash(catalog); err != nil {
+	catalog, err := r.reconcileProtectedTrash(catalog, vaultKey, journal)
+	if err != nil {
 		return TrashItem{}, err
 	}
 	protected, _, err := selectionProtection(relative, catalog, r.content)
@@ -236,28 +237,38 @@ func (r *Repository) MoveToTrashWithCatalog(relative string, catalog encryption.
 	return resolved.TrashItem, nil
 }
 
-// TrashItemsWithCatalog completes or discards an interrupted protected Trash
-// staging operation after the encryption journal has recovered.
-func (r *Repository) TrashItemsWithCatalog(catalog encryption.Catalog, vaultKey []byte) ([]TrashItem, error) {
-	if len(vaultKey) != encryption.VaultKeySize {
+// TrashItemsWithCatalog recovers and reloads the current catalog before any
+// reconciliation. The supplied snapshot establishes identity, never a commit
+// decision. Trash, content, journal and catalog stay coordinated throughout.
+func (r *Repository) TrashItemsWithCatalog(catalog encryption.Catalog, vaultKey []byte, journal *encryption.TransactionJournal) ([]TrashItem, error) {
+	if !journal.CoordinatesVault(r.root) || len(vaultKey) != encryption.VaultKeySize {
 		return nil, encryption.ErrInvalidTransaction
 	}
 	r.trashMu.Lock()
 	defer r.trashMu.Unlock()
-	r.content.mu.Lock()
-	defer r.content.mu.Unlock()
-	if err := r.reconcilePendingTrash(catalog); err != nil {
-		return nil, err
-	}
-	return r.trashItemsLocked(&catalog)
+	var items []TrashItem
+	err := journal.WithRecoveredCatalog(vaultKey, catalog.VaultID, func(current encryption.Catalog) error {
+		if err := r.reconcilePendingTrash(current); err != nil {
+			return err
+		}
+		var err error
+		items, err = r.trashItemsLocked(&current)
+		return err
+	})
+	return items, err
 }
 
-func (r *Repository) reconcileProtectedTrash(catalog encryption.Catalog) error {
+func (r *Repository) reconcileProtectedTrash(catalog encryption.Catalog, vaultKey []byte, journal *encryption.TransactionJournal) (encryption.Catalog, error) {
+	if !journal.CoordinatesVault(r.root) {
+		return encryption.Catalog{}, encryption.ErrInvalidTransaction
+	}
 	r.trashMu.Lock()
 	defer r.trashMu.Unlock()
-	r.content.mu.Lock()
-	defer r.content.mu.Unlock()
-	return r.reconcilePendingTrash(catalog)
+	err := journal.WithRecoveredCatalog(vaultKey, catalog.VaultID, func(current encryption.Catalog) error {
+		catalog = current
+		return r.reconcilePendingTrash(current)
+	})
+	return catalog, err
 }
 
 func (r *Repository) trashItemsLocked(catalog *encryption.Catalog) ([]TrashItem, error) {
@@ -303,7 +314,8 @@ func (r *Repository) trashItemsLocked(catalog *encryption.Catalog) ([]TrashItem,
 // RestoreTrashItemWithCatalog restores protected Trash content while applying
 // the same explicit keep/decrypt decision used by protected moves.
 func (r *Repository) RestoreTrashItemWithCatalog(id, protectionChoice string, catalog encryption.Catalog, vaultKey []byte, store *encryption.CatalogStore, journal *encryption.TransactionJournal) (TrashItem, error) {
-	if err := r.reconcileProtectedTrash(catalog); err != nil {
+	catalog, err := r.reconcileProtectedTrash(catalog, vaultKey, journal)
+	if err != nil {
 		return TrashItem{}, err
 	}
 	item, err := r.loadTrashItem(id)
@@ -505,6 +517,8 @@ func (r *Repository) RestoreTrashItemWithCatalog(id, protectionChoice string, ca
 	clear(metadata.Bytes)
 	if err == nil {
 		err = tx.Commit()
+	} else if tx != nil {
+		err = errors.Join(err, tx.Abort())
 	}
 	for _, change := range changes {
 		clear(change.Ciphertext)
@@ -519,7 +533,8 @@ func (r *Repository) RestoreTrashItemWithCatalog(id, protectionChoice string, ca
 // DeleteTrashItemWithCatalog permanently removes protected Trash through the
 // encryption journal. Referenced attachments block deletion before mutation.
 func (r *Repository) DeleteTrashItemWithCatalog(id string, catalog encryption.Catalog, vaultKey []byte, store *encryption.CatalogStore, journal *encryption.TransactionJournal) (TrashItem, error) {
-	if err := r.reconcileProtectedTrash(catalog); err != nil {
+	catalog, err := r.reconcileProtectedTrash(catalog, vaultKey, journal)
+	if err != nil {
 		return TrashItem{}, err
 	}
 	item, err := r.loadTrashItem(id)
@@ -1021,6 +1036,17 @@ func (r *Repository) reconcilePendingTrash(catalog encryption.Catalog) error {
 				r.removeEmptyDirectories(noteAssetsPath(value.OriginalPath))
 			}
 		} else {
+			// A payload with no matching catalog entry is ambiguous (for
+			// example an interrupted commit). Never discard its restore map.
+			contents, err := r.content.entriesUnder(root)
+			if err != nil && !errors.Is(err, fs.ErrNotExist) {
+				return err
+			}
+			for _, content := range contents {
+				if !content.Info.IsDir() || content.Info.Mode()&os.ModeSymlink != 0 {
+					return encryption.ErrTransactionNeedsRecovery
+				}
+			}
 			if err := r.content.removeAll(pending); err != nil {
 				return err
 			}

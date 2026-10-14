@@ -54,9 +54,7 @@ func TestTransactionPrepareStagesCiphertextWithoutChangingLiveState(t *testing.T
 
 func TestTransactionRestartDiscardsPreparedState(t *testing.T) {
 	fixture := newTransactionFixture(t, 1)
-	if _, err := fixture.journal.Prepare(fixture.changes, fixture.nextCatalog, fixture.key); err != nil {
-		t.Fatalf("prepare transaction: %v", err)
-	}
+	runTransactionProcessExit(t, fixture, "prepared")
 	restarted, err := NewTransactionJournal(fixture.vaultRoot, fixture.catalogStore)
 	if err != nil {
 		t.Fatal(err)
@@ -110,6 +108,14 @@ func TestRegisteredTransactionRecoveryRejectsForeignIdentityBeforeMutation(t *te
 			}
 			assertTransactionFiles(t, fixture, fixture.oldBytes)
 			assertTransactionCatalog(t, fixture, fixture.oldCatalog)
+			if state == "prepared" {
+				if err := restarted.RecoverForVault(fixture.key, fixture.oldCatalog.VaultID); !errors.Is(err, ErrTransactionPending) {
+					t.Fatalf("live owner not preserved: %v", err)
+				}
+				if err := tx.Abort(); err != nil {
+					t.Fatal(err)
+				}
+			}
 			if err := restarted.RecoverForVault(fixture.key, fixture.oldCatalog.VaultID); err != nil {
 				t.Fatal(err)
 			}
@@ -304,9 +310,7 @@ func TestConversionTransactionRecoversForwardAfterCommitPoint(t *testing.T) {
 
 func TestConversionTransactionRestartBeforeCommitPreservesSource(t *testing.T) {
 	fixture := newPlaintextConversionFixture(t, []byte("restart before commit"))
-	if _, err := fixture.journal.Prepare(fixture.changes, fixture.nextCatalog, fixture.key); err != nil {
-		t.Fatalf("prepare conversion: %v", err)
-	}
+	runTransactionProcessExit(t, fixture, "prepared")
 	restarted, err := NewTransactionJournal(fixture.vaultRoot, fixture.catalogStore)
 	if err != nil {
 		t.Fatal(err)

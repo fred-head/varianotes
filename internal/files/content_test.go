@@ -19,7 +19,7 @@ func TestContentStorePreservesOpaqueBytesAndChecksVersions(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(root, "attachments", "payload.bin"), payload, 0o640); err != nil {
 		t.Fatal(err)
 	}
-	store := &contentStore{root: root}
+	store := &contentStore{root: root, mu: &sync.RWMutex{}}
 
 	loaded, err := store.Read("attachments/payload.bin", 32)
 	if err != nil {
@@ -70,7 +70,7 @@ func TestContentStoreRejectsUnsafePathsAndSizes(t *testing.T) {
 		t.Fatal(err)
 	}
 	symlinkErr := os.Symlink(outside, filepath.Join(root, "escape.bin"))
-	store := &contentStore{root: root}
+	store := &contentStore{root: root, mu: &sync.RWMutex{}}
 
 	unsafePaths := []string{"../secret.bin", "folder"}
 	if symlinkErr == nil {
@@ -112,7 +112,7 @@ func TestContentStoreHidesTransactionStagingFiles(t *testing.T) {
 	if err := os.WriteFile(stagePath, []byte("staged ciphertext"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	store := &contentStore{root: root}
+	store := &contentStore{root: root, mu: &sync.RWMutex{}}
 	entries, err := store.ReadDir("private")
 	if err != nil {
 		t.Fatal(err)
@@ -140,7 +140,7 @@ func TestContentStoreConcurrentWritesHaveOneWinner(t *testing.T) {
 	if err := os.WriteFile(path, []byte("before"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	store := &contentStore{root: root}
+	store := &contentStore{root: root, mu: &sync.RWMutex{}}
 	loaded, err := store.Read("note.bin", 64)
 	if err != nil {
 		t.Fatal(err)

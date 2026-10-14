@@ -17,6 +17,8 @@ import (
 	"sort"
 	"strings"
 	"sync"
+
+	"github.com/fred-head/varianotes/internal/vaultsync"
 )
 
 const (
@@ -64,13 +66,14 @@ type CiphertextChange struct {
 // staged catalog live beside the catalog in server-owned application metadata.
 // Only one backend writer per vault is supported.
 type TransactionJournal struct {
-	vaultRoot string
-	catalog   *CatalogStore
-	name      string
-	mu        sync.Mutex
-	fault     func(string) error
-	parent    *TransactionJournal
-	guard     func(func() error) error
+	vaultRoot    string
+	catalog      *CatalogStore
+	name         string
+	mu           *sync.Mutex
+	coordination *vaultsync.Coordinator
+	fault        func(string) error
+	parent       *TransactionJournal
+	guard        func(func() error) error
 }
 
 type transactionRecord struct {
@@ -114,6 +117,7 @@ type transactionPayload struct {
 // PreparedTransaction is a durable prepare record plus ciphertext staging.
 // The original target fingerprints are held only in memory; a restart before
 // Commit discards the prepared transaction and leaves originals untouched.
+// Callers must Commit or Abort it to release its live vault ownership.
 type PreparedTransaction struct {
 	journal      *TransactionJournal
 	record       transactionRecord
@@ -145,7 +149,8 @@ func (j *TransactionJournal) GuardMutation(work func() error) error {
 	return work()
 }
 
-// NewTransactionJournal binds a journal to one vault root and its catalog.
+// NewTransactionJournal binds a journal to one vault root and its catalog,
+// joining the process-lifetime coordination used by every instance of that root.
 func NewTransactionJournal(vaultDirectory string, catalog *CatalogStore, options ...TransactionJournalOptions) (*TransactionJournal, error) {
 	if catalog == nil || vaultDirectory == "" {
 		return nil, ErrInvalidTransaction
@@ -161,6 +166,10 @@ func NewTransactionJournal(vaultDirectory string, catalog *CatalogStore, options
 	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
 		return nil, ErrInvalidTransaction
 	}
+	absolute, err = filepath.EvalSymlinks(absolute)
+	if err != nil {
+		return nil, fmt.Errorf("resolve transaction vault root symlinks: %w", err)
+	}
 	relativeMetadata, err := filepath.Rel(filepath.Clean(absolute), catalog.directory)
 	if err != nil {
 		return nil, ErrInvalidTransaction
@@ -168,10 +177,13 @@ func NewTransactionJournal(vaultDirectory string, catalog *CatalogStore, options
 	if relativeMetadata == "." || (relativeMetadata != ".." && !strings.HasPrefix(relativeMetadata, ".."+string(filepath.Separator))) {
 		return nil, ErrInvalidTransaction
 	}
+	coordination := vaultsync.ForRoot(filepath.Clean(absolute))
 	journal := &TransactionJournal{
-		vaultRoot: filepath.Clean(absolute),
-		catalog:   catalog,
-		name:      "." + catalog.name + ".transaction.json",
+		vaultRoot:    filepath.Clean(absolute),
+		catalog:      catalog,
+		name:         "." + catalog.name + ".transaction.json",
+		mu:           &coordination.Journal,
+		coordination: coordination,
 	}
 	if len(options) > 1 {
 		return nil, ErrInvalidTransaction
@@ -186,6 +198,15 @@ func NewTransactionJournal(vaultDirectory string, catalog *CatalogStore, options
 // interruption tests. Production callers leave it unset.
 type TransactionJournalOptions struct {
 	Fault func(phase string) error
+}
+
+// CoordinatesVault lets repository callbacks verify that the shared filesystem
+// lock belongs to their canonical root, including commit-guard wrappers.
+func (j *TransactionJournal) CoordinatesVault(canonicalRoot string) bool {
+	if j != nil && j.parent != nil {
+		return j.parent.CoordinatesVault(canonicalRoot)
+	}
+	return j != nil && j.vaultRoot == canonicalRoot
 }
 
 // Prepare validates and fingerprints current targets, writes a durable
@@ -231,6 +252,9 @@ func (j *TransactionJournal) prepareFilesystem(ctx context.Context, changes []Ci
 	}
 	j.mu.Lock()
 	defer j.mu.Unlock()
+	if j.coordination.ActiveTransaction != "" {
+		return nil, ErrTransactionPending
+	}
 	priorCatalog, err := j.currentCatalogDigest()
 	if err != nil {
 		return nil, err
@@ -407,6 +431,7 @@ func (j *TransactionJournal) prepareFilesystem(ctx context.Context, changes []Ci
 	if err := ctx.Err(); err != nil {
 		return nil, j.abortPrepared(tx, err)
 	}
+	j.coordination.ActiveTransaction = tx.record.ID
 	return tx, nil
 }
 
@@ -441,6 +466,7 @@ func (tx *PreparedTransaction) CommitContext(ctx context.Context) error {
 	j := tx.journal
 	j.mu.Lock()
 	defer j.mu.Unlock()
+	defer tx.releaseOwnership()
 	root, err := os.OpenRoot(j.vaultRoot)
 	if err != nil {
 		return fmt.Errorf("open transaction vault root: %w", err)
@@ -513,6 +539,7 @@ func (tx *PreparedTransaction) Abort() error {
 	j := tx.journal
 	j.mu.Lock()
 	defer j.mu.Unlock()
+	defer tx.releaseOwnership()
 	record, err := j.loadRecord(tx.key)
 	if errors.Is(err, fs.ErrNotExist) {
 		return nil
@@ -526,8 +553,16 @@ func (tx *PreparedTransaction) Abort() error {
 	return tx.journal.cleanupRecord(record)
 }
 
-// Recover discards a prepared transaction because its live targets are still
-// the old state. A committed transaction is verified and completed forward.
+// Called under the shared journal lock, even when storage cleanup fails. Such
+// work is then orphaned and recoverable; it must not retain a live owner.
+func (tx *PreparedTransaction) releaseOwnership() {
+	if tx.journal.coordination.ActiveTransaction == tx.record.ID {
+		tx.journal.coordination.ActiveTransaction = ""
+	}
+}
+
+// Recover rejects live transactions and discards orphaned prepared work because
+// its targets are still the old state. Committed work is completed forward.
 // Callers must run it before serving affected content after a restart.
 func (j *TransactionJournal) Recover(vaultKey []byte) error {
 	return j.recoverForVault(vaultKey, "")
@@ -544,11 +579,78 @@ func (j *TransactionJournal) RecoverForVault(vaultKey []byte, expectedVaultID st
 }
 
 func (j *TransactionJournal) recoverForVault(vaultKey []byte, expectedVaultID string) error {
-	if j == nil || len(vaultKey) != VaultKeySize {
+	if j != nil && j.parent != nil {
+		return j.parent.recoverForVault(vaultKey, expectedVaultID)
+	}
+	return j.withRecoveryLock(vaultKey, expectedVaultID, func() error {
+		return j.recoverLocked(vaultKey, expectedVaultID)
+	})
+}
+
+// WithRecoveredCatalog authenticates the registered identity, recovers orphaned
+// work and loads the authoritative catalog under the shared vault lock. The
+// callback may inspect/reconcile files using its already-locked helpers; it
+// must not acquire Content or Journal again or prepare a transaction.
+func (j *TransactionJournal) WithRecoveredCatalog(vaultKey []byte, expectedVaultID string, work func(Catalog) error) error {
+	if !isCatalogID(expectedVaultID) || work == nil {
 		return ErrInvalidTransaction
 	}
+	if j != nil && j.parent != nil {
+		return j.parent.WithRecoveredCatalog(vaultKey, expectedVaultID, work)
+	}
+	return j.withRecoveryLock(vaultKey, expectedVaultID, func() error {
+		// Check registration before recovery can mutate live files.
+		if _, err := j.catalog.Load(vaultKey, expectedVaultID); err != nil {
+			return err
+		}
+		if err := j.recoverLocked(vaultKey, expectedVaultID); err != nil {
+			return err
+		}
+		catalog, err := j.catalog.Load(vaultKey, expectedVaultID)
+		if err != nil {
+			return err
+		}
+		return work(catalog)
+	})
+}
+
+func (j *TransactionJournal) withRecoveryLock(vaultKey []byte, expectedVaultID string, work func() error) error {
+	if j == nil || j.coordination == nil || len(vaultKey) != VaultKeySize {
+		return ErrInvalidTransaction
+	}
+	// Fail promptly for active prepared work: its owner may hold Content until
+	// a later commit/abort, including while a request waits for authorization.
+	j.mu.Lock()
+	err := j.checkRecoveryOwnership(vaultKey, expectedVaultID)
+	j.mu.Unlock()
+	if err != nil {
+		return err
+	}
+	j.coordination.Content.Lock()
+	defer j.coordination.Content.Unlock()
 	j.mu.Lock()
 	defer j.mu.Unlock()
+	if err := j.checkRecoveryOwnership(vaultKey, expectedVaultID); err != nil {
+		return err
+	}
+	return work()
+}
+
+func (j *TransactionJournal) checkRecoveryOwnership(vaultKey []byte, expectedVaultID string) error {
+	if j.coordination.ActiveTransaction == "" {
+		return nil
+	}
+	record, err := j.loadRecord(vaultKey)
+	if err != nil {
+		return err
+	}
+	if expectedVaultID != "" && record.VaultID != expectedVaultID {
+		return ErrCatalogAuthentication
+	}
+	return ErrTransactionPending
+}
+
+func (j *TransactionJournal) recoverLocked(vaultKey []byte, expectedVaultID string) error {
 	record, err := j.loadRecord(vaultKey)
 	if errors.Is(err, fs.ErrNotExist) {
 		return j.cleanupOrphanJournalStages()
