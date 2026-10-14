@@ -325,13 +325,11 @@ func (c *vaultRecoveryCoordinator) applyRecoveryPlan(ctx context.Context, encode
 		if err != nil || !state.hasCatalog || !state.hasEnvelope {
 			return errors.Join(fmt.Errorf("registered vault %q encryption metadata is unavailable", entry.ID), err)
 		}
-		catalogBytes, err := readRegularFile(state.catalogPath, 16<<20)
-		if err != nil {
-			return fmt.Errorf("read registered vault %q catalog: %w", entry.ID, err)
-		}
-		digest := sha256.Sum256(catalogBytes)
-		if hex.EncodeToString(digest[:]) != update.CatalogSHA256 {
-			return fmt.Errorf("registered vault %q catalog changed during encryption recovery", entry.ID)
+		// VerifyRecoveryPlan still rejects stale confirmation snapshots. After
+		// its last verification, legitimate saves remain compatible with this
+		// unchanged data key. Durable replay must use the old/new envelope pair.
+		if err := checkRegisteredCatalogIdentity(state.catalogPath, entry.ID); err != nil {
+			return err
 		}
 		if plan.Operation == "password" {
 			if err := applyRecoveryEnvelope(state.envelopePath, update.OldPasswordEnvelope, update.NewPasswordEnvelope, true, true, forward); err != nil {

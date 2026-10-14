@@ -8,6 +8,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- M31 password and recovery journal replay permits concurrent content saves
+  with the unchanged data key, preserving ciphertext and preventing legitimate
+  catalog changes from permanently blocking authentication startup.
+
 - M31 moves, ordinary backlink updates, and explicit decrypt restores stage
   encrypted data before the durable journal decision. Directory plans and
   plaintext publication now recover after interruption; unexpected target
