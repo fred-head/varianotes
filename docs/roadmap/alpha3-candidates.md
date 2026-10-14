@@ -614,8 +614,21 @@ requires its listed tests; P17 adds end-to-end and adversarial coverage.
   responses and discards plaintext dialogs while preserving hidden drafts.
   F9 now shares bounded credential work and persistent failure throttling with
   vault unlock, including restart and concurrency regressions. Follow-up PR
-  gates and a fresh independent review remain open. PR #24 must not merge while
+  gates remain open. PR #24 must not merge while
   confirmed release blockers remain. Activation stays disabled.
+
+  **Fresh AI review — blocked (2026-10-14):** a separate AI session reviewed the
+  complete pre-P01-to-P17 candidate `060e636..dc59d0c`, including all F1–F10
+  corrections, in an unchanged isolated checkout. Its 38 selected existing Go
+  tests passed. The source review found R1–R5: missing durable recovery barriers
+  for the commit marker, Trash structure and existing envelopes; late Unlock
+  after lock/revocation; and plaintext remaining visible after lock-channel
+  failure. The implementer confirmed the control-flow gaps; those negative
+  flows were not dynamically reproduced. See
+  [`../security/m31-fresh-ai-review.md`](../security/m31-fresh-ai-review.md).
+  All five findings remain open. PRs #30/#31 are held open; PR #24 is not merged.
+  This AI report provides no independent reviewer sign-off. P17 remains open;
+  productive activation is disabled and P18 is unchanged.
 
 - [ ] **P18 — Operations documentation and release gate**
   *(dependencies: P01–P17; size: S)*

@@ -73,9 +73,13 @@ cross-vault binding; it requires independently trusted anti-rollback state.
 
 ## Still open
 
-Code corrections for F1–F10 have regression evidence. Follow-up PR merge gates
-and a fresh full M31 review remain pending. No merge or security approval for
-P17 is claimed here.
+The original F1–F10 flows have corrections and regression evidence. The fresh
+full P01–P17 AI review of `dc59d0c` found five further blocking variants, R1–R5,
+including recovery durability, late unlock and UI lock-channel failure. They
+remain open; see [the reviewer report](m31-fresh-ai-review.md). The implementer
+confirmed the cited control-flow gaps; the negative power-loss/race flows were
+not dynamically reproduced. Follow-up PRs #30/#31 remain open, and PR #24 must
+not merge. No independent reviewer sign-off or security approval is claimed.
 
 ## F3 — Durable move, backlinks and decrypt restore
 
@@ -220,5 +224,6 @@ Regressions in `internal/app/export_throttle_test.go`:
 Validation: uncached serial auth/app/command suites, focused export cases,
 focused concurrent case with `-race`, and app vet passed. The common throttle
 also limits other password operations; no separate export bypass was introduced.
-Activation remains disabled and P18 unchanged. A fresh review of the entire
-P01–P17 integration is still required.
+Activation remains disabled and P18 unchanged. The fresh review of the entire
+P01–P17 integration is recorded above; its blockers and the required reviewer
+sign-off remain open.
