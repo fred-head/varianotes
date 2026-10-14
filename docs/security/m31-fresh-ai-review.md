@@ -47,4 +47,3 @@ Eigene **38 bestehende Go-Tests**, seriell mit `-p 1 -count=1`: 10 Encryption, 1
 **4. Nicht prüfbare Bereiche und Grenzen**
 
 Alle fünf Negativabläufe sind **statisch hergeleitet, nicht dynamisch reproduziert**. Bestehende erfolgreiche Tests bilden diese konkreten Fehlerfolgen nicht ab. Keine realen Stromverlustversuche, vollständige Race-/Lastsuite oder Browser-/Proxy-Ausfalltests; Frontendquellen und Tests nur gelesen. Frühere Reports, Eltern-Tests und CI zählen nicht als eigene Belege. Konsistenter vollständiger Rollback älterer Vault-Daten, kompromittierter entsperrter Server und P18-Betreiberworkflow bleiben Prüfgrenzen. Keine allgemeine Sicherheits- oder Mergefreigabe.
-
