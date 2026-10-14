@@ -612,7 +612,9 @@ requires its listed tests; P17 adds end-to-end and adversarial coverage.
   committed envelope recovery without rewriting content. F5/F6 add guarded
   commits, manual/idle lock and concurrency regressions. F8 fences late content
   responses and discards plaintext dialogs while preserving hidden drafts.
-  F9 remediation and a fresh independent review remain open. PR #24 must not merge while
+  F9 now shares bounded credential work and persistent failure throttling with
+  vault unlock, including restart and concurrency regressions. Follow-up PR
+  gates and a fresh independent review remain open. PR #24 must not merge while
   confirmed release blockers remain. Activation stays disabled.
 
 - [ ] **P18 — Operations documentation and release gate**

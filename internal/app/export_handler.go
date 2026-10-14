@@ -143,7 +143,9 @@ func handleNotebookExport(w http.ResponseWriter, r *http.Request, logger *slog.L
 	}
 }
 
-func handleNotebookExportReauthentication(w http.ResponseWriter, r *http.Request, metadataPath string, sessions *auth.Sessions, manager *encryption.KeyManager, grants *exportGrantStore) {
+// The route holds the shared credential slot across decoding, derivation and
+// grant issuance. Callbacks persist only actual password rejection/success.
+func handleNotebookExportReauthentication(w http.ResponseWriter, r *http.Request, metadataPath string, sessions *auth.Sessions, manager *encryption.KeyManager, grants *exportGrantStore, credentialRejected func() bool, credentialAccepted func()) {
 	setExportNoStore(w)
 	if sessions == nil {
 		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "authenticated session is required"})
@@ -223,6 +225,9 @@ func handleNotebookExportReauthentication(w http.ResponseWriter, r *http.Request
 	})
 	input.Password = ""
 	if invalidPassword {
+		if !credentialRejected() {
+			return
+		}
 		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "vault password is incorrect", "code": "invalid_credentials"})
 		return
 	}
@@ -234,6 +239,7 @@ func handleNotebookExportReauthentication(w http.ResponseWriter, r *http.Request
 		writeJSON(w, http.StatusConflict, map[string]string{"error": "vault has no protected content", "code": "export_not_protected"})
 		return
 	}
+	credentialAccepted()
 	writeJSON(w, http.StatusOK, map[string]string{"token": issuedToken})
 }
 

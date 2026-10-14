@@ -8,6 +8,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- M31 export password reauthentication now shares the bounded credential slot
+  and persistent failure throttle with vault unlock, including across restarts.
+
 - M31 locks discard conflict and backlink comparisons and reject late content
   responses across lock generations and vault switches. Unsaved drafts stay
   hidden in tab memory and remain available after unlocking.
