@@ -608,6 +608,8 @@ requires its listed tests; P17 adds end-to-end and adversarial coverage.
   [`../security/m31-finding-remediation.md`](../security/m31-finding-remediation.md).
   F1/F2/F7/F10 were reproduced and corrected in follow-up changes; F3's durable
   move/restore correction has restart and fault-boundary regressions. Other findings
+  are tracked individually; F4 now covers concurrent saves during prepared and
+  committed envelope recovery without rewriting content. Remaining findings
   and a fresh independent review remain open. PR #24 must not merge while
   confirmed release blockers remain. Activation stays disabled.
 

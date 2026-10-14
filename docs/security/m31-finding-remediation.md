@@ -73,7 +73,7 @@ cross-vault binding; it requires independently trusted anti-rollback state.
 
 ## Still open
 
-F4–F6, F8, and F9 await code verification and remediation. A fresh full M31
+F5/F6, F8, and F9 await code verification and remediation. A fresh full M31
 review is required after all confirmed findings are fixed. No merge or security
 approval for P17 is claimed here.
 
@@ -111,3 +111,28 @@ and journal cases passed; `go vet -p 1 ./internal/encryption ./internal/files`
 passed. F5/F6 still require lease guarding and lock-order corrections at the
 application boundary. Fresh independent review of the complete format and
 integration remains required.
+
+## F4 — Content save during envelope transition
+
+Confirmed by failing regressions: a second unlocked session saving after the
+first envelope update made both prepared rollback and committed forward
+password-journal replay fail permanently on startup. Password recovery had the
+same failure after its last plan verification.
+
+Apply/rollback now depend on the exact authenticated plan's old/new envelopes
+and independent registration identity, not a mutable whole-catalog checksum.
+Password change and recovery keep the same data key, so legitimate saves are
+compatible with both envelopes. Key/catalog authentication still occurs during
+plan preparation; stale recovery confirmation is still rejected before
+journaling; unknown envelope replacements and foreign registrations fail
+closed. Recovery never rewrites content or the catalog. No data-key mutation
+was introduced and no new content quiescing is necessary for rewrapping that
+unchanged key.
+
+Regressions: `TestPasswordJournalRestartAllowsConcurrentCatalogSave` and
+`TestRecoveryCodeJournalRestartAllowsConcurrentCatalogSave` cover prepared and
+committed restarts across two vaults, an unlocked second writer after first
+envelope update, and byte-identical saved ciphertext after recovery.
+`TestInterruptedPasswordRecoveryRestoresOldCodeBeforeServing` now saves after
+last verification/first update and checks old password and code restoration.
+Serial uncached app/auth/command suites and app vet passed; CI remains the gate.
