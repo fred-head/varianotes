@@ -10,7 +10,7 @@ import (
 )
 
 func TestPlaintextPublicationAndDirectoriesRecoverAtEveryBoundary(t *testing.T) {
-	for _, phase := range []string{"transaction.directory.create", "transaction.content_stage.file_sync", "transaction.commit.before", "transaction.commit.after", "transaction.content.delete", "transaction.plaintext.publish.before", "transaction.plaintext.publish.after_write", "transaction.catalog.rename", "transaction.directory.remove"} {
+	for _, phase := range []string{"transaction.directory.create", "transaction.content_stage.file_sync", "transaction.commit.before", "transaction.commit.after", "transaction.content.delete", "transaction.plaintext.publish.before", "transaction.plaintext.publish.after_write", "transaction.catalog.rename", "transaction.directory.remove", "transaction.cleanup.catalog_sync", "transaction.cleanup.journal_sync"} {
 		t.Run(phase, func(t *testing.T) {
 			fixture := newTransactionFixture(t, 1)
 			old := fixture.oldCatalog.Objects[0]
