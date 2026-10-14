@@ -144,6 +144,9 @@ describe('App auto-lock integration', () => {
     const user = userEvent.setup()
     const view = render(<App />)
     fireEvent.click(await view.findByRole('button', { name: 'Note' }))
+    // Finish opening the first note before requesting another tab. The tree
+    // button can appear before the asynchronous file response is installed.
+    await view.findByRole('tab', { name: 'Note' })
     fireEvent.click(await view.findByRole('button', { name: 'Second' }), { ctrlKey: true })
     await waitFor(() => expect(view.getAllByRole('tab')).toHaveLength(2))
     fireEvent.click(view.getByRole('tab', { name: 'Note' }))
