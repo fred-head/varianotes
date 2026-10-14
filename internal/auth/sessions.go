@@ -115,18 +115,20 @@ func (s *Sessions) WithActiveSession(ctx context.Context, work func() error) err
 		return errors.Join(ErrSessionBarrier, err)
 	}
 	defer tx.Rollback()
-	if _, err := tx.ExecContext(ctx, `UPDATE auth_sessions SET revoked_at=revoked_at WHERE session_id_hash=?`, hash); err != nil {
-		return errors.Join(ErrSessionBarrier, err)
-	}
 	now := time.Now().UTC().Format(time.RFC3339Nano)
-	var active bool
-	if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM auth_sessions
+	var activeHash []byte
+	err = tx.QueryRowContext(ctx, `UPDATE auth_sessions SET revoked_at=revoked_at
 		WHERE session_id_hash=? AND revoked_at IS NULL
 		AND julianday(idle_expires_at)>julianday(?)
-		AND julianday(absolute_expires_at)>julianday(?))`, hash, now, now).Scan(&active); err != nil {
+		AND julianday(absolute_expires_at)>julianday(?)
+		RETURNING session_id_hash`, hash, now, now).Scan(&activeHash)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ErrAuthentication
+	}
+	if err != nil {
 		return errors.Join(ErrSessionBarrier, err)
 	}
-	if !active {
+	if len(activeHash) != sha256.Size {
 		return ErrAuthentication
 	}
 	s.manager.Put(ctx, sessionPublicationBarrierKey, true)
