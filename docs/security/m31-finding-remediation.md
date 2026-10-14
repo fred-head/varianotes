@@ -73,6 +73,41 @@ cross-vault binding; it requires independently trusted anti-rollback state.
 
 ## Still open
 
-F3–F6, F8, and F9 await code verification and remediation. A fresh full M31
+F4–F6, F8, and F9 await code verification and remediation. A fresh full M31
 review is required after all confirmed findings are fixed. No merge or security
 approval for P17 is claimed here.
+
+## F3 — Durable move, backlinks and decrypt restore
+
+Confirmed by control-flow inspection: live renames, ordinary backlink writes,
+and decrypted restore files previously preceded `journal.Prepare`. In-process
+rollback could not cover a process crash. Move now stages destination content
+and source deletions together; ordinary backlinks and explicit decrypt targets
+are staged as ciphertext. Restore uses the same plaintext-publication primitive.
+No content mutation or plaintext publication precedes durable commit. Directory
+creation/removal participates in prepared rollback and committed forward
+recovery. Untracked protected descendants and unsafe/hardlinked entries block
+the move. Unexpected recovery target files are retained and block publication.
+
+Version 2 journal records authenticate plaintext publication envelopes, keyed
+plaintext/previous-target fingerprints and directory plans. Version 1 journals
+remain readable. Plaintext temporaries are created only after a durable,
+explicitly authorized decrypt/ordinary-file commit and are covered by recovery
+cleanup; before commit every stage is ciphertext. Recover committed operations
+before serving affected content; do not roll back a durable forward decision.
+
+Regressions:
+- `TestMovePreparedRestartPreservesSourceAndOrdinaryBacklink` (keep/decrypt)
+- `TestDecryptRestorePreparedRestartKeepsOnlyTrashCiphertext`
+- `TestPlaintextPublicationAndDirectoriesRecoverAtEveryBoundary` (eleven fault
+  phases; idempotent restart, source/catalog retention before commit, exact
+  plaintext only after commit, no residual stages, including cleanup failures
+  after source directories are already removed)
+- `TestPlaintextPublicationRejectsRecursiveProtectionBeforeStaging`
+- `TestCommittedPlaintextPublicationRetainsExternalCollision`
+
+Validation: serial uncached `go test -p 1 -count=1 ./...` and focused filesystem
+and journal cases passed; `go vet -p 1 ./internal/encryption ./internal/files`
+passed. F5/F6 still require lease guarding and lock-order corrections at the
+application boundary. Fresh independent review of the complete format and
+integration remains required.

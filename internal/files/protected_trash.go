@@ -372,7 +372,8 @@ func (r *Repository) RestoreTrashItemWithCatalog(id, protectionChoice string, ca
 		}
 	}
 
-	if err := r.prepareRestoreDirectories(item, sourceRoot, folder); err != nil {
+	createDirectories, removeDirectories, err := r.planRestoreDirectories(item, sourceRoot, folder)
+	if err != nil {
 		return TrashItem{}, err
 	}
 	next := cloneCatalog(catalog)
@@ -381,12 +382,6 @@ func (r *Repository) RestoreTrashItemWithCatalog(id, protectionChoice string, ca
 		selectedIDs[object.ObjectID] = true
 	}
 	changes := make([]encryption.CiphertextChange, 0, len(selected)*2+1)
-	createdPlain := make([]string, 0)
-	rollbackPlain := func() {
-		for index := len(createdPlain) - 1; index >= 0; index-- {
-			_ = r.content.remove(createdPlain[index])
-		}
-	}
 	for index := range next.Objects {
 		object := &next.Objects[index]
 		if !selectedIDs[object.ObjectID] {
@@ -395,76 +390,65 @@ func (r *Repository) RestoreTrashItemWithCatalog(id, protectionChoice string, ca
 		old := *object
 		targetPath, ok := trashPathToOriginal(item, old.LogicalPath)
 		if !ok {
-			rollbackPlain()
 			return TrashItem{}, ErrProtectedObjectMissing
 		}
 		stored, err := r.content.read(old.PhysicalPath, transactionPlaintextLimit(old.Kind)+(1<<20))
 		if err != nil {
-			rollbackPlain()
 			return TrashItem{}, protectedContentError(err)
 		}
 		if err := encryption.VerifyCatalogCiphertext(old, stored.Bytes); err != nil {
 			clear(stored.Bytes)
-			rollbackPlain()
 			return TrashItem{}, errors.Join(ErrProtectedContentCorrupt, err)
 		}
 		decrypt := protectionChoice == MoveProtectionDecrypt && !keepShared[old.ObjectID]
 		if decrypt {
 			if _, err := r.content.lstat(targetPath); err == nil {
 				clear(stored.Bytes)
-				rollbackPlain()
 				return TrashItem{}, ErrRestoreCollision
 			} else if !errors.Is(err, fs.ErrNotExist) {
 				clear(stored.Bytes)
-				rollbackPlain()
 				return TrashItem{}, err
 			}
 			if _, err := r.content.lstat(targetPath + ".age"); err == nil {
 				clear(stored.Bytes)
-				rollbackPlain()
 				return TrashItem{}, ErrRestoreCollision
 			} else if !errors.Is(err, fs.ErrNotExist) {
 				clear(stored.Bytes)
-				rollbackPlain()
 				return TrashItem{}, err
 			}
 			plaintext, decryptErr := encryption.DecryptContent(vaultKey, old.ObjectID, stored.Bytes, *old.ContentKeyEnvelope)
 			clear(stored.Bytes)
 			if decryptErr != nil {
-				rollbackPlain()
 				return TrashItem{}, errors.Join(ErrProtectedContentCorrupt, decryptErr)
 			}
 			if int64(len(plaintext)) > transactionPlaintextLimit(old.Kind) {
 				clear(plaintext)
-				rollbackPlain()
 				return TrashItem{}, ErrFileTooLarge
 			}
 			if old.Kind == encryption.CatalogObjectAsset {
 				if _, typeErr := supportedImageType(plaintext); typeErr != nil {
 					clear(plaintext)
-					rollbackPlain()
 					return TrashItem{}, typeErr
 				}
 			}
-			if err := r.content.writeNew(targetPath, plaintext, 0o644); err != nil {
-				clear(plaintext)
-				rollbackPlain()
-				return TrashItem{}, err
-			}
+			ciphertext, envelope, encryptErr := encryption.EncryptContent(vaultKey, old.ObjectID, plaintext)
 			clear(plaintext)
-			createdPlain = append(createdPlain, targetPath)
-			changes = append(changes, encryption.CiphertextChange{Path: old.PhysicalPath, Delete: true, ExpectedSHA256: old.CiphertextHash})
+			if encryptErr != nil {
+				return TrashItem{}, encryptErr
+			}
+			changes = append(changes,
+				encryption.CiphertextChange{Path: targetPath, ObjectID: old.ObjectID, Ciphertext: ciphertext, ContentKeyEnvelope: envelope, PublishPlaintext: true},
+				encryption.CiphertextChange{Path: old.PhysicalPath, Delete: true, ExpectedSHA256: old.CiphertextHash},
+			)
 			*object = encryption.CatalogObject{}
 			continue
 		}
 		for _, target := range []string{targetPath, targetPath + ".age"} {
 			if _, err := r.content.lstat(target); err == nil {
 				clear(stored.Bytes)
-				rollbackPlain()
 				return TrashItem{}, ErrRestoreCollision
 			} else if !errors.Is(err, fs.ErrNotExist) {
 				clear(stored.Bytes)
-				rollbackPlain()
 				return TrashItem{}, err
 			}
 		}
@@ -501,11 +485,13 @@ func (r *Repository) RestoreTrashItemWithCatalog(id, protectionChoice string, ca
 	next.FolderRules = uniqueFolderRules(next.FolderRules)
 	metadata, err := r.content.read(path.Join(item.root, trashMetadataName), maximumTrashMetadata)
 	if err != nil {
-		rollbackPlain()
 		return TrashItem{}, err
 	}
 	changes = append(changes, encryption.CiphertextChange{Path: path.Join(item.root, trashMetadataName), Delete: true, ExpectedSHA256: encryption.CiphertextSHA256(metadata.Bytes)})
-	tx, err := journal.Prepare(changes, next, vaultKey)
+	tx, err := journal.PrepareFilesystem(changes, next, vaultKey, createDirectories, removeDirectories)
+	if err == nil && r.transactionPrepared != nil {
+		err = r.transactionPrepared()
+	}
 	clear(metadata.Bytes)
 	if err == nil {
 		err = tx.Commit()
@@ -514,17 +500,9 @@ func (r *Repository) RestoreTrashItemWithCatalog(id, protectionChoice string, ca
 		clear(change.Ciphertext)
 	}
 	if err != nil {
-		if !errors.Is(err, encryption.ErrTransactionNeedsRecovery) {
-			rollbackPlain()
-		}
 		return TrashItem{}, err
 	}
-	_ = r.content.removeAll(item.root)
-	if folder {
-		r.removeEmptyDirectories(sourceRoot)
-	} else {
-		r.removeEmptyDirectories(noteAssetsPath(sourceRoot))
-	}
+
 	return item.TrashItem, nil
 }
 
@@ -886,28 +864,6 @@ func (r *Repository) ensureDirectory(relative string) error {
 		return err
 	}
 	return r.content.mkdir(relative, 0o755)
-}
-
-func (r *Repository) prepareRestoreDirectories(item resolvedTrashItem, sourceRoot string, folder bool) error {
-	if folder {
-		if err := r.ensureDirectory(item.OriginalPath); err != nil {
-			return err
-		}
-		return r.ensureMirroredDirectoryTree(sourceRoot, item.OriginalPath)
-	}
-	if err := r.ensureSafeRestoreParent(path.Dir(item.OriginalPath)); err != nil {
-		return err
-	}
-	assets := noteAssetsPath(item.OriginalPath)
-	if item.assetsExist {
-		if err := r.ensureDirectory(assets); err != nil {
-			return err
-		}
-		if err := r.ensureMirroredDirectoryTree(item.assetsPath, assets); err != nil {
-			return err
-		}
-	}
-	return nil
 }
 
 func (r *Repository) checkTrashRestoreCollision(item resolvedTrashItem, selected []encryption.CatalogObject, folder bool, catalog encryption.Catalog) error {
