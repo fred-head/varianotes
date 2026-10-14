@@ -27,12 +27,12 @@ var (
 )
 
 type Node struct {
-	Name                 string `json:"name"`
-	Path                 string `json:"path"`
-	Type                 string `json:"type"`
-	Protected            bool   `json:"protected,omitempty"`
-	ProtectionInherited  bool   `json:"protectionInherited,omitempty"`
-	Children             []Node `json:"children,omitempty"`
+	Name                string `json:"name"`
+	Path                string `json:"path"`
+	Type                string `json:"type"`
+	Protected           bool   `json:"protected,omitempty"`
+	ProtectionInherited bool   `json:"protectionInherited,omitempty"`
+	Children            []Node `json:"children,omitempty"`
 }
 
 type Repository struct {
@@ -40,6 +40,8 @@ type Repository struct {
 	trashMu sync.Mutex
 	moveMu  sync.Mutex
 	content *contentStore
+	// Test-only pause/error boundary before a filesystem transaction commits.
+	transactionPrepared func() error
 }
 
 type Markdown struct {

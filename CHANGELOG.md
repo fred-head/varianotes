@@ -8,6 +8,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- M31 moves, ordinary backlink updates, and explicit decrypt restores stage
+  encrypted data before the durable journal decision. Directory plans and
+  plaintext publication now recover after interruption; unexpected target
+  files are retained instead of overwritten during recovery.
+
 - Bind M31 catalog and journal recovery to the independently registered vault
   identity. Foreign packages and unbound pre-release fixtures fail closed
   without rewriting or deleting encrypted data.
