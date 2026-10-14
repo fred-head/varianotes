@@ -146,7 +146,7 @@ func (j *TransactionJournal) GuardMutation(work func() error) error {
 }
 
 // NewTransactionJournal binds a journal to one vault root and its catalog.
-func NewTransactionJournal(vaultDirectory string, catalog *CatalogStore) (*TransactionJournal, error) {
+func NewTransactionJournal(vaultDirectory string, catalog *CatalogStore, options ...TransactionJournalOptions) (*TransactionJournal, error) {
 	if catalog == nil || vaultDirectory == "" {
 		return nil, ErrInvalidTransaction
 	}
@@ -168,11 +168,24 @@ func NewTransactionJournal(vaultDirectory string, catalog *CatalogStore) (*Trans
 	if relativeMetadata == "." || (relativeMetadata != ".." && !strings.HasPrefix(relativeMetadata, ".."+string(filepath.Separator))) {
 		return nil, ErrInvalidTransaction
 	}
-	return &TransactionJournal{
+	journal := &TransactionJournal{
 		vaultRoot: filepath.Clean(absolute),
 		catalog:   catalog,
 		name:      "." + catalog.name + ".transaction.json",
-	}, nil
+	}
+	if len(options) > 1 {
+		return nil, ErrInvalidTransaction
+	}
+	if len(options) == 1 {
+		journal.fault = options[0].Fault
+	}
+	return journal, nil
+}
+
+// TransactionJournalOptions supplies a filesystem fault seam for deterministic
+// interruption tests. Production callers leave it unset.
+type TransactionJournalOptions struct {
+	Fault func(phase string) error
 }
 
 // Prepare validates and fingerprints current targets, writes a durable
@@ -547,6 +560,9 @@ func (j *TransactionJournal) recoverForVault(vaultKey []byte, expectedVaultID st
 		return ErrCatalogAuthentication
 	}
 	if record.State == "prepared" {
+		if err := j.fail("transaction.recovery.prepared"); err != nil {
+			return err
+		}
 		if err := j.cleanupRecord(record); err != nil {
 			return errors.Join(ErrTransactionNeedsRecovery, err)
 		}

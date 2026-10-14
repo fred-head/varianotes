@@ -403,6 +403,9 @@ func (s *contentStore) Rename(source, target string) error {
 }
 
 func (s *contentStore) rename(source, target string) error {
+	if err := s.fail("file.rename", target); err != nil {
+		return err
+	}
 	root, err := s.openRoot()
 	if err != nil {
 		return err
