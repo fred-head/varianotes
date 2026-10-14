@@ -294,15 +294,15 @@ func TestProtectedAssetUploadAndSharedReadUseOneCiphertextObject(t *testing.T) {
 	writeNote, _, err = repository.PrepareMarkdownWriteWithCatalog(
 		"private/Note.md", updatedNote.Content+"\n![not converted](../Shared.assets/plain.png)\n", updatedNote.Version, catalog, key, store, journal,
 	)
-	if err != nil || writeNote.Commit(nil) != nil {
-		t.Fatalf("add reference to pre-conversion shared asset: operation=%v err=%v", writeNote, err)
+	if !errors.Is(err, ErrProtectedObjectMissing) || writeNote != nil {
+		t.Fatalf("pre-conversion shared asset reference was accepted: operation=%v err=%v", writeNote, err)
 	}
 	catalog, err = store.Load(key, catalog.VaultID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := repository.ReadAssetWithCatalog("Public.md", "Shared.assets/plain.png", catalog, key); !errors.Is(err, ErrProtectedObjectMissing) {
-		t.Fatalf("plaintext shared asset referenced by a protected note did not fail closed: %v", err)
+	if _, _, err := repository.ReadAssetWithCatalog("Public.md", "Shared.assets/plain.png", catalog, key); err != nil {
+		t.Fatalf("rejected save changed the ordinary attachment policy: %v", err)
 	}
 }
 

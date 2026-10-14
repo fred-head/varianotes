@@ -237,7 +237,10 @@ func (r *Repository) PrepareExistingConversion(ctx context.Context, selectedPath
 					break
 				}
 			}
-			logicalPath, _, ok := resolveAssetReference(referenceBase, destination)
+			logicalPath, ok, referenceErr := protectionAttachmentReference(referenceBase, destination)
+			if referenceErr != nil {
+				return fail(referenceErr)
+			}
 			if !ok {
 				continue
 			}
@@ -266,6 +269,9 @@ func (r *Repository) PrepareExistingConversion(ctx context.Context, selectedPath
 				continue
 			} else if statErr != nil {
 				return fail(statErr)
+			}
+			if !validAssetLogicalPath(logicalPath) {
+				return fail(ErrConversionUnsafe)
 			}
 			if err := inventory.addPhysical(ctx, physicalLogicalPath, encryption.CatalogObjectAsset); err != nil {
 				return fail(err)

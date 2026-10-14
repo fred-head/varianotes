@@ -603,6 +603,13 @@ requires its listed tests; P17 adds end-to-end and adversarial coverage.
   release; document any remaining finding and confirm it does not weaken the
   agreed security boundary. Obtain reviewer sign-off.
 
+  **Finding remediation (2026-10-14):** the full P01–P17 AI review identified
+  F1–F10. Follow-up work and regression evidence are tracked in
+  [`../security/m31-finding-remediation.md`](../security/m31-finding-remediation.md).
+  F1/F2/F7 were reproduced and corrected in a follow-up change; other findings
+  and a fresh independent review remain open. PR #24 must not merge while
+  confirmed release blockers remain. Activation stays disabled.
+
 - [ ] **P18 — Operations documentation and release gate**
   *(dependencies: P01–P17; size: S)*
   **Goal/scope:** document setup, recovery, external decryption, backups, visible

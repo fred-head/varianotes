@@ -194,6 +194,13 @@ func (r *Repository) buildArchivePlanWithCatalog(catalog encryption.Catalog, vau
 			}
 			return archivePlan{}, ErrProtectedObjectMissing
 		}
+		protected, policyErr := catalog.IsPathProtected(entry.Path)
+		if policyErr != nil {
+			return archivePlan{}, policyErr
+		}
+		if protected {
+			return archivePlan{}, ErrProtectedObjectMissing
+		}
 		if err := addSize(entry.Info.Size()); err != nil {
 			return archivePlan{}, err
 		}
