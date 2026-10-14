@@ -417,6 +417,20 @@ func (tx *PreparedTransaction) Abort() error {
 // the old state. A committed transaction is verified and completed forward.
 // Callers must run it before serving affected content after a restart.
 func (j *TransactionJournal) Recover(vaultKey []byte) error {
+	return j.recoverForVault(vaultKey, "")
+}
+
+// RecoverForVault also checks the independently registered vault identity
+// before discarding stages or publishing a committed journal. Applications
+// must use this when a journal belongs to a registered vault.
+func (j *TransactionJournal) RecoverForVault(vaultKey []byte, expectedVaultID string) error {
+	if !isCatalogID(expectedVaultID) {
+		return ErrInvalidVaultID
+	}
+	return j.recoverForVault(vaultKey, expectedVaultID)
+}
+
+func (j *TransactionJournal) recoverForVault(vaultKey []byte, expectedVaultID string) error {
 	if j == nil || len(vaultKey) != VaultKeySize {
 		return ErrInvalidTransaction
 	}
@@ -428,6 +442,9 @@ func (j *TransactionJournal) Recover(vaultKey []byte) error {
 	}
 	if err != nil {
 		return err
+	}
+	if expectedVaultID != "" && record.VaultID != expectedVaultID {
+		return ErrCatalogAuthentication
 	}
 	if record.State == "prepared" {
 		if err := j.cleanupRecord(record); err != nil {

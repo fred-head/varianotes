@@ -8,6 +8,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- Bind M31 catalog and journal recovery to the independently registered vault
+  identity. Foreign packages and unbound pre-release fixtures fail closed
+  without rewriting or deleting encrypted data.
+
 - M31 protection preflight rejects existing plaintext attachment references on
   protected saves and unsupported local attachments during conversion. ZIP
   export rejects unregistered plaintext descendants of protected folders before

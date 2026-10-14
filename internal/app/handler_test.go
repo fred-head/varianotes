@@ -1343,6 +1343,7 @@ func TestProtectedNoteAPIEncryptsFirstCreateAndPreservesConflictDraft(t *testing
 		t.Fatal(err)
 	}
 	catalog.FolderRules = []encryption.FolderProtectionRule{{Path: "private"}}
+	catalog.VaultID = registeredCatalogID(vaultID)
 	metadataDirectory := vaultEncryptionDirectory(registryPath, vaultID)
 	catalogStore, err := encryption.NewCatalogStore(filepath.Join(metadataDirectory, "catalog.json"))
 	if err != nil {

@@ -69,6 +69,54 @@ func TestTransactionRestartDiscardsPreparedState(t *testing.T) {
 	assertNoTransactionStages(t, fixture)
 }
 
+func TestRegisteredTransactionRecoveryRejectsForeignIdentityBeforeMutation(t *testing.T) {
+	for _, state := range []string{"prepared", "committed"} {
+		t.Run(state, func(t *testing.T) {
+			fixture := newTransactionFixture(t, 1)
+			tx, err := fixture.journal.Prepare(fixture.changes, fixture.nextCatalog, fixture.key)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if state == "committed" {
+				fixture.journal.fault = func(phase string) error {
+					if phase == "transaction.commit.after" {
+						return errors.New("simulated crash")
+					}
+					return nil
+				}
+				if err := tx.Commit(); !errors.Is(err, ErrTransactionNeedsRecovery) {
+					t.Fatalf("crash boundary: %v", err)
+				}
+			}
+			journalPath := filepath.Join(fixture.catalogStore.directory, fixture.journal.name)
+			before, err := os.ReadFile(journalPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			restarted, err := NewTransactionJournal(fixture.vaultRoot, fixture.catalogStore)
+			if err != nil {
+				t.Fatal(err)
+			}
+			foreignID, err := NewCatalogObjectID()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := restarted.RecoverForVault(fixture.key, foreignID); !errors.Is(err, ErrCatalogAuthentication) {
+				t.Fatalf("foreign journal accepted: %v", err)
+			}
+			after, err := os.ReadFile(journalPath)
+			if err != nil || !bytes.Equal(before, after) {
+				t.Fatalf("foreign recovery changed journal: %v", err)
+			}
+			assertTransactionFiles(t, fixture, fixture.oldBytes)
+			assertTransactionCatalog(t, fixture, fixture.oldCatalog)
+			if err := restarted.RecoverForVault(fixture.key, fixture.oldCatalog.VaultID); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
 func TestTransactionRecoveryCleansOrphanJournalTemporary(t *testing.T) {
 	fixture := newTransactionFixture(t, 1)
 	orphan := filepath.Join(fixture.catalogStore.directory, ".vnotes-journal-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.tmp")

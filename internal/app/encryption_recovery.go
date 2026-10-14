@@ -206,10 +206,7 @@ func (c *vaultRecoveryCoordinator) VerifyRecoveryPlan(ctx context.Context, encod
 			}
 			clear(passwordKey)
 		}
-		catalogID, err := catalogStore.ReadVaultID()
-		if err == nil {
-			_, err = catalogStore.Load(key, catalogID)
-		}
+		_, err = catalogStore.Load(key, registeredCatalogID(entry.ID))
 		clear(key)
 		if err != nil {
 			return fmt.Errorf("verify registered vault %q recovery catalog: %w", entry.ID, err)
@@ -260,10 +257,7 @@ func (c *vaultRecoveryCoordinator) inspectVault(ctx context.Context, entry noteb
 			return nil, nil, nil, false, "", auth.ErrInvalidRecoveryCode
 		}
 	}
-	catalogID, err := catalogStore.ReadVaultID()
-	if err == nil {
-		_, err = catalogStore.Load(key, catalogID)
-	}
+	_, err = catalogStore.Load(key, registeredCatalogID(entry.ID))
 	if err != nil {
 		clear(key)
 		return nil, nil, nil, false, "", fmt.Errorf("verify registered vault %q catalog: %w", entry.ID, err)
