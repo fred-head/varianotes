@@ -6,6 +6,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Fixed
+
+- M31 protection preflight rejects existing plaintext attachment references on
+  protected saves and unsupported local attachments during conversion. ZIP
+  export rejects unregistered plaintext descendants of protected folders before
+  streaming. Encryption activation remains disabled pending the M31 gates.
+
 ### Added
 
 - Added M31P16 protection status, per-session unlock and manual lock, recovery

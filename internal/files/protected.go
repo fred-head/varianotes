@@ -162,6 +162,9 @@ func (r *Repository) PrepareMarkdownWriteWithCatalog(relative, content, expected
 		if expectedVersion == "" || object.CiphertextHash != expectedVersion {
 			return nil, true, ErrConflict
 		}
+		if err := r.validateProtectedReferencesLocked(relative, content, catalog, vaultKey); err != nil {
+			return nil, true, err
+		}
 		ciphertext, envelope, err := encryption.EncryptContent(vaultKey, object.ObjectID, []byte(content))
 		if err != nil {
 			return nil, true, err
