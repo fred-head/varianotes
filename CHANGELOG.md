@@ -8,6 +8,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- M31 Move/Trash commits recheck the session and lock generation before changing
+  live content. Manual and idle locks reject prepared late mutations; content
+  preparation and publication now use a consistent lock order without holding
+  the key-manager state mutex during filesystem or network work.
+
 - M31 password and recovery journal replay permits concurrent content saves
   with the unchanged data key, preserving ciphertext and preventing legitimate
   catalog changes from permanently blocking authentication startup.

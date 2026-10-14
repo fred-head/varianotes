@@ -31,7 +31,7 @@ func (r *Repository) MoveToTrashWithCatalog(relative string, catalog encryption.
 		return TrashItem{}, err
 	}
 	if !protected {
-		return r.MoveToTrash(relative)
+		return r.moveToTrashGuarded(relative, journal)
 	}
 	if store == nil || journal == nil || len(vaultKey) != encryption.VaultKeySize {
 		return TrashItem{}, encryption.ErrInvalidTransaction
@@ -309,7 +309,7 @@ func (r *Repository) RestoreTrashItemWithCatalog(id, protectionChoice string, ca
 	}
 	protectedSelection := item.encrypted || trashSelectionProtected(item, catalog)
 	if !protectedSelection && !targetProtected {
-		return r.RestoreTrashItem(id)
+		return r.restoreTrashItemGuarded(id, journal)
 	}
 	if store == nil || journal == nil || len(vaultKey) != encryption.VaultKeySize {
 		return TrashItem{}, encryption.ErrInvalidTransaction
@@ -517,7 +517,7 @@ func (r *Repository) DeleteTrashItemWithCatalog(id string, catalog encryption.Ca
 		return TrashItem{}, err
 	}
 	if !item.encrypted && !trashSelectionProtected(item, catalog) {
-		return r.DeleteTrashItem(id)
+		return r.deleteTrashItemGuarded(id, journal)
 	}
 	conversion, err := r.PrepareExistingConversion(context.Background(), trashLogicalRoot(item), catalog, vaultKey, store, journal)
 	if err != nil {

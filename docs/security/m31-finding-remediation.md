@@ -73,7 +73,7 @@ cross-vault binding; it requires independently trusted anti-rollback state.
 
 ## Still open
 
-F5/F6, F8, and F9 await code verification and remediation. A fresh full M31
+F8 and F9 await code verification and remediation. A fresh full M31
 review is required after all confirmed findings are fixed. No merge or security
 approval for P17 is claimed here.
 
@@ -135,3 +135,38 @@ envelope update, and byte-identical saved ciphertext after recovery.
 `TestInterruptedPasswordRecoveryRestoresOldCodeBeforeServing` now saves after
 last verification/first update and checks old password and code restoration.
 Serial uncached app/auth/command suites and app vet passed; CI remains the gate.
+
+## F5/F6 — Mutation generation and lock order
+
+Confirmed by code trace: Trash mutated inside `UseKey` before checking the lease
+again; Move held the manager mutex while acquiring repository locks, whereas
+Save acquired them in reverse order. Tree publication had the same inverse
+acquisition and was corrected too.
+
+Move and every Trash path now validate the reusable lease at each durable
+commit. Failed guards abort prepared stages. Ordinary Trash operations in an
+encrypted vault use the same guard after acquiring filesystem locks. Responses
+are separately checked. All repository locks precede the publication barrier;
+callbacks never hold the manager state mutex. Revocation/manual/idle lock waits
+for an already-entered publication boundary without holding that mutex. Expired
+grants cannot start another commit. Preparation can finish after a successful
+lock, but its durable decision fails and cannot publish plaintext or delete data.
+Already committed transactions remain forward-only for restart recovery.
+
+Regressions:
+- `TestHTTPTrashMutationRejectsLockAfterFinalPreparation`: real CSRF/session
+  routes for Trash, decrypt restore and permanent deletion; pause after final
+  prepare, complete HTTP manual lock, resume, require 423 and original bytes.
+- `TestPreparedTrashMutationCannotCommitAfterSuccessfulLock`: no plaintext or
+  stages after a rejected prepared mutation.
+- `TestOrdinaryTrashPathsInEncryptedVaultRejectRevokedLease`
+- `TestSaveMoveAndManualLockHaveNoLockOrderCycle`
+- `TestPublicationDoesNotHoldStateMutexAndLockWaitsForBoundary`
+- `TestIdleExpiryRejectsPreparedGuardAndCompletesWithoutStateMutexCycle`
+
+Validation: serial uncached full Go suite, focused route cases, affected-package
+vet and focused race checks. Publication callbacks must stay leaf operations.
+Lock completion waits for an active durable commit or response write; existing
+server write timeouts still bound network writes. Physical key erasure and
+already delivered plaintext revocation are not claimed. Fresh independent
+review must verify this ordering across the complete M31 scope.
