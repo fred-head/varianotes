@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -95,7 +96,17 @@ func TestProtectedExportSharesBoundedCredentialWork(t *testing.T) {
 	request.ContentLength = int64(len(body))
 	addAuthRequestContext(request, h.cookie, h.csrf)
 	done := make(chan *httptest.ResponseRecorder, 1)
+	finished := make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(held.release) }) }
+	// Cleanup runs before the harness closes its database. A failing assertion
+	// must still release and join the request that owns the credential slot.
+	t.Cleanup(func() {
+		release()
+		<-finished
+	})
 	go func() {
+		defer close(finished)
 		response := httptest.NewRecorder()
 		h.handler.ServeHTTP(response, request)
 		done <- response
@@ -103,20 +114,21 @@ func TestProtectedExportSharesBoundedCredentialWork(t *testing.T) {
 	select {
 	case <-held.entered:
 	case <-time.After(5 * time.Second):
-		close(held.release)
 		t.Fatal("held export did not reach request decoding")
 	}
 	responses := []*httptest.ResponseRecorder{
 		exportCredentialRequest(t, h, target, exportVaultPassword),
 		exportCredentialRequest(t, h, "/api/encryption/unlock", exportVaultPassword),
 	}
-	close(held.release)
+	release()
+	// Real scrypt remains enabled; race instrumentation on a loaded CI runner
+	// can take longer than five seconds even with only one active derivation.
 	select {
 	case first := <-done:
 		if first.Code != http.StatusOK {
 			t.Fatalf("held export failed: %d %s", first.Code, first.Body.String())
 		}
-	case <-time.After(5 * time.Second):
+	case <-time.After(60 * time.Second):
 		t.Fatal("held export did not complete")
 	}
 	for _, response := range responses {
