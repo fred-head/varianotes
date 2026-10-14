@@ -97,7 +97,7 @@ describe('browser authentication lifecycle',()=>{
       })
       if (url === '/api/encryption/unlock') {
         submittedVaultPasswords.push((JSON.parse(String(init?.body)) as { password: string }).password)
-        return Response.json({ vaultId: 'protected-vault', unlocked: true, generation: 2 })
+        return Response.json({ vaultId: 'protected-vault', unlocked: true, generation: 2, idleRemainingMs: 900_000 })
       }
       if (url === '/api/repository/tree') return Response.json({ entries: [] })
       return Response.json({ error: `unexpected request: ${url}` }, { status: 500 })

@@ -618,13 +618,13 @@ describe('App auto-lock integration', () => {
       if (url === '/api/encryption/status') {
         if (statusUnavailable) return Response.json({ error: 'protection status unavailable' }, { status: 503 })
         return Response.json({
-          vaultId: 'personal', protected: true, locked, generation, recoveryCodeConfigured: true,
+          vaultId: 'personal', protected: true, locked, generation, idleRemainingMs: 900_000, recoveryCodeConfigured: true,
           unlockPasswordMode: 'login', activationEnabled: false, autoLockMinutes: 15, mfaEnabled: false,
         })
       }
       if (url === '/api/repository/tree') return Response.json({ entries: [{ name: 'Secret.md', path: 'Secret.md', type: 'file', protected: true }] })
       if (url === '/api/repository/file?path=Secret.md' && !init?.method) return Response.json({ path: 'Secret.md', content: '# Protected note', version: 'v1' })
-      if (url.startsWith('/api/encryption/activity?')) return Response.json({ recorded: true })
+      if (url.startsWith('/api/encryption/activity?')) return Response.json({ recorded: true, vaultId: 'personal', generation, idleRemainingMs: 900_000 })
       if (url === '/api/encryption/lock' && init?.method === 'POST') {
         locked = true
         generation++
@@ -637,7 +637,7 @@ describe('App auto-lock integration', () => {
         locked = false
         generation++
         eventSources[0]?.emit(false, generation)
-        return Response.json({ vaultId: 'personal', unlocked: true, generation })
+        return Response.json({ vaultId: 'personal', unlocked: true, generation, idleRemainingMs: 900_000 })
       }
       return originalFetch(input, init)
     })

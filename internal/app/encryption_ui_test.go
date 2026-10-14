@@ -73,6 +73,18 @@ func TestEncryptionStatusAndUnlockEndpointsAreSessionScoped(t *testing.T) {
 	if unlocked.Code != http.StatusOK || !strings.Contains(unlocked.Body.String(), `"unlocked":true`) || !harness.manager.IsUnlocked(harness.vaultID, harness.sessionHash[:]) {
 		t.Fatalf("correct password did not unlock the vault: %d %s", unlocked.Code, unlocked.Body.String())
 	}
+	var display struct {
+		IdleRemainingMs int64  `json:"idleRemainingMs"`
+		VaultID         string `json:"vaultId"`
+		Generation      uint64 `json:"generation"`
+	}
+	if err := json.Unmarshal(unlocked.Body.Bytes(), &display); err != nil || display.IdleRemainingMs <= 0 || display.IdleRemainingMs > 900_000 {
+		t.Fatalf("missing unlock display deadline: %#v %v", display, err)
+	}
+	activity := request(http.MethodPost, "/api/encryption/activity?vaultId="+harness.vaultID, nil, true)
+	if err := json.Unmarshal(activity.Body.Bytes(), &display); err != nil || activity.Code != http.StatusOK || display.VaultID != harness.vaultID || display.Generation == 0 || display.IdleRemainingMs <= 0 || display.IdleRemainingMs > 900_000 || activity.Header().Get("Cache-Control") != "no-store, private" {
+		t.Fatalf("activity display binding: %#v %v %s", display, err, activity.Body.String())
+	}
 	tree := request(http.MethodGet, "/api/repository/tree", nil, true)
 	if tree.Code != http.StatusOK || !strings.Contains(tree.Body.String(), `"protected":true`) {
 		t.Fatalf("unlock did not expose protected tree state: %d %s", tree.Code, tree.Body.String())
@@ -85,5 +97,8 @@ func TestEncryptionStatusAndUnlockEndpointsAreSessionScoped(t *testing.T) {
 	status = request(http.MethodGet, "/api/encryption/status", nil, true)
 	if status.Code != http.StatusOK || !strings.Contains(status.Body.String(), `"locked":true`) {
 		t.Fatalf("status did not follow the manual lock: %d %s", status.Code, status.Body.String())
+	}
+	if err := json.Unmarshal(status.Body.Bytes(), &display); err != nil || display.IdleRemainingMs != 0 {
+		t.Fatalf("locked status exposed idle grant: %#v %v", display, err)
 	}
 }
