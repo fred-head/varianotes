@@ -19,10 +19,15 @@ const (
 	sessionPrincipalKey          = "principal"
 	sessionCSRFKey               = "csrf_token"
 	sessionMFAPendingKey         = "mfa_pending"
+	sessionPublicationBarrierKey = "publication_barrier"
 	sessionActivityWriteInterval = time.Minute
 )
 
 var errSessionInactive = errors.New("session is revoked or expired")
+
+// ErrSessionBarrier marks a failure to acquire or commit the cross-process
+// auth transaction that protects a sensitive publication.
+var ErrSessionBarrier = errors.New("authentication session barrier failed")
 
 type SessionOptions struct {
 	CookieSecure     bool
@@ -89,6 +94,50 @@ func (s *Sessions) Active(ctx context.Context) (bool, error) {
 		AND julianday(idle_expires_at)>julianday(?)
 		AND julianday(absolute_expires_at)>julianday(?))`, hash, now, now).Scan(&active)
 	return active, err
+}
+
+// WithActiveSession serializes a sensitive publication with durable session
+// revocation. The no-op write acquires SQLite's cross-process writer lock
+// before the session is checked, then holds it until work returns. Session
+// revokers therefore either win first and prevent work, or wait until work is
+// complete before reporting a successful revocation. The callback must not
+// call back into the auth database.
+func (s *Sessions) WithActiveSession(ctx context.Context, work func() error) error {
+	if s == nil || s.service == nil || s.service.db == nil || work == nil || !s.Authenticated(ctx) {
+		return ErrAuthentication
+	}
+	hash := s.CurrentHash(ctx)
+	if len(hash) != sha256.Size {
+		return ErrAuthentication
+	}
+	tx, err := s.service.db.BeginTx(ctx, nil)
+	if err != nil {
+		return errors.Join(ErrSessionBarrier, err)
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, `UPDATE auth_sessions SET revoked_at=revoked_at WHERE session_id_hash=?`, hash); err != nil {
+		return errors.Join(ErrSessionBarrier, err)
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	var active bool
+	if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM auth_sessions
+		WHERE session_id_hash=? AND revoked_at IS NULL
+		AND julianday(idle_expires_at)>julianday(?)
+		AND julianday(absolute_expires_at)>julianday(?))`, hash, now, now).Scan(&active); err != nil {
+		return errors.Join(ErrSessionBarrier, err)
+	}
+	if !active {
+		return ErrAuthentication
+	}
+	s.manager.Put(ctx, sessionPublicationBarrierKey, true)
+	defer s.manager.Remove(ctx, sessionPublicationBarrierKey)
+	if err := work(); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return errors.Join(ErrSessionBarrier, err)
+	}
+	return nil
 }
 
 // MFAPending reports only whether this short-lived session has already passed
@@ -339,6 +388,12 @@ func (s *sqliteSessionStore) CommitCtx(ctx context.Context, token string, data [
 		deadline, values, err := s.codec.Decode(data)
 		if err != nil {
 			return err
+		}
+		if barrier, ok := values[sessionPublicationBarrierKey].(bool); ok && barrier {
+			// The session is protected by an active auth DB write transaction. A
+			// response may start inside that publication callback; skip the nested
+			// session upsert to avoid blocking on the transaction's sole connection.
+			return nil
 		}
 		absoluteExpiry = deadline.UTC().Format(time.RFC3339Nano)
 		if value, ok := values["client"].(string); ok {

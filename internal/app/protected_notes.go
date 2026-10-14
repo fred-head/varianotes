@@ -1,8 +1,10 @@
 package app
 
 import (
+	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 
 	"github.com/fred-head/varianotes/internal/auth"
@@ -113,8 +115,55 @@ func beginProtectedNoteLease(w http.ResponseWriter, r *http.Request, access *pro
 	return nil, true
 }
 
+func withProtectedSession(ctx context.Context, sessions *auth.Sessions, manager *encryption.KeyManager, work func() error) error {
+	err := sessions.WithActiveSession(ctx, work)
+	if errors.Is(err, auth.ErrAuthentication) || errors.Is(err, auth.ErrSessionBarrier) {
+		if manager != nil && sessions != nil {
+			err = errors.Join(err, manager.RevokeSessionEverywhere(sessions.CurrentHash(ctx)))
+		}
+	}
+	return err
+}
+
+func commitProtectedLease(ctx context.Context, sessions *auth.Sessions, manager *encryption.KeyManager, lease *encryption.KeyLease, publish func() error) error {
+	err := withProtectedSession(ctx, sessions, manager, func() error {
+		return lease.Commit(publish)
+	})
+	if err != nil && lease != nil {
+		lease.Close()
+	}
+	return err
+}
+
+type protectedSessionWriter struct {
+	ctx         context.Context
+	sessions    *auth.Sessions
+	manager     *encryption.KeyManager
+	lease       *encryption.KeyLease
+	destination io.Writer
+}
+
+func (writer *protectedSessionWriter) Write(content []byte) (int, error) {
+	written := 0
+	err := withProtectedSession(writer.ctx, writer.sessions, writer.manager, func() error {
+		return writer.lease.GuardCommit(func() error {
+			var err error
+			written, err = writer.destination.Write(content)
+			if err == nil && written != len(content) {
+				return io.ErrShortWrite
+			}
+			return err
+		})
+	})
+	return written, err
+}
+
 func writeProtectedNoteError(w http.ResponseWriter, err error) {
 	switch {
+	case errors.Is(err, auth.ErrAuthentication):
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "authentication required"})
+	case errors.Is(err, auth.ErrSessionBarrier):
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "authentication state is unavailable"})
 	case errors.Is(err, encryption.ErrVaultLocked):
 		writeJSON(w, http.StatusLocked, map[string]string{"error": "vault is locked", "code": "encryption_locked"})
 	case errors.Is(err, encryption.ErrSessionRequired):

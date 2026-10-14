@@ -413,6 +413,22 @@ func (s *Service) RegenerateRecoveryCodes(ctx context.Context, currentPassword, 
 }
 
 func (s *Service) ResetMFA(ctx context.Context) error {
+	for {
+		err := s.resetMFAOnce(ctx)
+		if !isSQLiteBusy(err) {
+			return err
+		}
+		timer := time.NewTimer(100 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return errors.Join(ctx.Err(), err)
+		case <-timer.C:
+		}
+	}
+}
+
+func (s *Service) resetMFAOnce(ctx context.Context) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -428,6 +444,14 @@ func (s *Service) ResetMFA(ctx context.Context) error {
 		return err
 	}
 	return tx.Commit()
+}
+
+func isSQLiteBusy(err error) bool {
+	if err == nil {
+		return false
+	}
+	var codedError interface{ Code() int }
+	return errors.As(err, &codedError) && codedError.Code()&0xff == 5 // SQLITE_BUSY, including extended busy codes.
 }
 
 func generateRecoveryCodes() ([]string, [][]byte, error) {

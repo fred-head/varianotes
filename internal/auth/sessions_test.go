@@ -7,6 +7,7 @@ import (
 	"io"
 	"log/slog"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 )
@@ -128,6 +129,118 @@ func TestActiveSessionRevalidatesAdmissionWithoutRefreshingExpiry(t *testing.T) 
 				t.Fatal("liveness read refreshed session activity")
 			}
 		})
+	}
+}
+
+func TestSessionPublicationBarrierSerializesMFAReset(t *testing.T) {
+	entered, resume := make(chan struct{}), make(chan struct{})
+	var release sync.Once
+	guardDone := make(chan error, 1)
+	var resetDone chan error
+	guardStarted, resetStarted := false, false
+	guardFinished, resetFinished := false, false
+	metadataPath := filepath.Join(t.TempDir(), "auth.db")
+	service, err := Open(t.Context(), Config{Mode: ModeLocal, MetadataPath: metadataPath}, testLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer service.Close()
+	resetService, err := Open(t.Context(), Config{Mode: ModeLocal, MetadataPath: metadataPath}, testLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		release.Do(func() { close(resume) })
+		if guardStarted && !guardFinished {
+			select {
+			case <-guardDone:
+			case <-time.After(5 * time.Second):
+			}
+		}
+		if resetStarted && !resetFinished {
+			select {
+			case <-resetDone:
+			case <-time.After(5 * time.Second):
+			}
+		}
+		_ = resetService.Close()
+	}()
+	sessions, err := NewSessions(service, DefaultSessionOptions(false))
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := &sqliteSessionStore{db: service.db, codec: sessions.manager.Codec, defaultIdle: time.Hour}
+	token := "session-publication-barrier-test-token"
+	data, err := sessions.manager.Codec.Encode(time.Now().Add(time.Hour), map[string]any{sessionPrincipalKey: OwnerPrincipal})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CommitCtx(t.Context(), token, data, time.Now().Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	ctx, err := sessions.manager.Load(t.Context(), token)
+	if err != nil || !sessions.Authenticated(ctx) {
+		t.Fatalf("load authenticated test session: authenticated=%v error=%v", sessions.Authenticated(ctx), err)
+	}
+
+	guardStarted = true
+	go func() {
+		guardDone <- sessions.WithActiveSession(ctx, func() error {
+			close(entered)
+			<-resume
+			return nil
+		})
+	}()
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("active-session publication barrier did not enter")
+	}
+
+	resetDone = make(chan error, 1)
+	resetStarted = true
+	go func() { resetDone <- resetService.ResetMFA(t.Context()) }()
+	deadline := time.Now().Add(5 * time.Second)
+	for resetService.db.Stats().InUse == 0 && time.Now().Before(deadline) {
+		select {
+		case err := <-resetDone:
+			resetFinished = true
+			t.Fatalf("MFA reset completed inside the active publication barrier: %v", err)
+		case <-time.After(time.Millisecond):
+		}
+	}
+	if resetService.db.Stats().InUse == 0 {
+		t.Fatal("MFA reset did not start its database transaction")
+	}
+	select {
+	case err := <-resetDone:
+		resetFinished = true
+		t.Fatalf("MFA reset bypassed the active publication barrier: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	release.Do(func() { close(resume) })
+	select {
+	case err := <-guardDone:
+		guardFinished = true
+		if err != nil {
+			t.Fatalf("active publication barrier failed: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("active publication barrier did not release")
+	}
+	select {
+	case err := <-resetDone:
+		resetFinished = true
+		if err != nil {
+			t.Fatalf("MFA reset failed after publication released: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("MFA reset did not finish after publication released")
+	}
+
+	called := false
+	if err := sessions.WithActiveSession(ctx, func() error { called = true; return nil }); !errors.Is(err, ErrAuthentication) || called {
+		t.Fatalf("revoked session passed publication barrier: called=%v err=%v", called, err)
 	}
 }
 
