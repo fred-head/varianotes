@@ -2,7 +2,6 @@ package app
 
 import (
 	"bytes"
-	"crypto/sha256"
 	"database/sql"
 	"encoding/base64"
 	"encoding/json"
@@ -60,6 +59,10 @@ func newHandlerWithKeyManager(logger *slog.Logger, repositoryRoot string, authSe
 // The private hook permits deterministic preparation/lock race regressions.
 // Production constructors always pass nil.
 func newHandlerWithMutationHook(logger *slog.Logger, repositoryRoot string, authService *auth.Service, sessions *auth.Sessions, keyManager *encryption.KeyManager, beforeMutationCommit func(), versions ...string) (http.Handler, error) {
+	return newHandlerWithHooks(logger, repositoryRoot, authService, sessions, keyManager, beforeMutationCommit, nil, versions...)
+}
+
+func newHandlerWithHooks(logger *slog.Logger, repositoryRoot string, authService *auth.Service, sessions *auth.Sessions, keyManager *encryption.KeyManager, beforeMutationCommit, beforeUnlockGrant func(), versions ...string) (http.Handler, error) {
 	if keyManager == nil {
 		return nil, errors.New("encryption key manager is required")
 	}
@@ -457,6 +460,7 @@ func newHandlerWithMutationHook(logger *slog.Logger, repositoryRoot string, auth
 				writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "logout failed"})
 				return
 			}
+			_ = keyManager.LockAll(encryption.LockReasonLogout)
 			_ = authService.RecordSecurityEvent(r.Context(), "logout", "success", "client="+auth.ClientReference(requestIdentity.ClientIP(r)))
 			writeJSON(w, http.StatusOK, map[string]bool{"authenticated": false})
 		})
@@ -466,6 +470,7 @@ func newHandlerWithMutationHook(logger *slog.Logger, repositoryRoot string, auth
 				writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "session revocation failed"})
 				return
 			}
+			_ = keyManager.LockAll(encryption.LockReasonLogout)
 			_ = authService.RecordSecurityEvent(r.Context(), "session_revoke_current", "success", "client="+auth.ClientReference(requestIdentity.ClientIP(r)))
 			writeJSON(w, http.StatusOK, map[string]bool{"revoked": true})
 		})
@@ -475,6 +480,7 @@ func newHandlerWithMutationHook(logger *slog.Logger, repositoryRoot string, auth
 				writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "session revocation failed"})
 				return
 			}
+			_ = keyManager.LockAll(encryption.LockReasonLogout)
 			_ = authService.RecordSecurityEvent(r.Context(), "session_revoke_all", "success", "client="+auth.ClientReference(requestIdentity.ClientIP(r)))
 			writeJSON(w, http.StatusOK, map[string]bool{"revoked": true})
 		})
@@ -832,6 +838,13 @@ func newHandlerWithMutationHook(logger *slog.Logger, repositoryRoot string, auth
 				writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "authentication required"})
 				return
 			}
+			sessionHash := sessions.CurrentHash(r.Context())
+			_, noteAccess, record := currentNotebookContext()
+			attempt, err := keyManager.BeginUnlock(record.ID, sessionHash)
+			if err != nil {
+				writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "vault unlock state is unavailable"})
+				return
+			}
 			var input struct {
 				Password string `json:"password"`
 			}
@@ -847,7 +860,6 @@ func newHandlerWithMutationHook(logger *slog.Logger, repositoryRoot string, auth
 				return
 			}
 			defer release()
-			_, noteAccess, record := currentNotebookContext()
 			if noteAccess == nil || !noteAccess.enabled {
 				writeJSON(w, http.StatusConflict, map[string]string{"error": "vault protection is not active", "code": "encryption_not_active"})
 				return
@@ -886,12 +898,23 @@ func newHandlerWithMutationHook(logger *slog.Logger, repositoryRoot string, auth
 				writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "encrypted vault content is unavailable"})
 				return
 			}
-			sessionHash := sessions.CurrentHash(r.Context())
-			if !sessions.Authenticated(r.Context()) || len(sessionHash) != sha256.Size {
+			if beforeUnlockGrant != nil {
+				beforeUnlockGrant()
+			}
+			active, err := sessions.Active(r.Context())
+			if err != nil {
+				writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "authentication state is unavailable"})
+				return
+			}
+			if !active {
 				writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "authentication required"})
 				return
 			}
-			if err := keyManager.Unlock(record.ID, sessionHash, vaultKey); err != nil {
+			if err := keyManager.CompleteUnlock(attempt, vaultKey); err != nil {
+				if errors.Is(err, encryption.ErrVaultLocked) {
+					writeJSON(w, http.StatusLocked, map[string]string{"error": "vault lock state changed; retry unlock"})
+					return
+				}
 				if errors.Is(err, encryption.ErrVaultKeyMismatch) {
 					writeJSON(w, http.StatusConflict, map[string]string{"error": "vault key state changed; retry unlock"})
 					return
