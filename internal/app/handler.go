@@ -1380,7 +1380,7 @@ func newHandlerWithHooks(logger *slog.Logger, repositoryRoot string, authService
 				})
 			})
 			if err != nil {
-				operation.Abort()
+				err = errors.Join(err, operation.Abort())
 				writeProtectedNoteError(w, err)
 			}
 			return
@@ -1429,7 +1429,7 @@ func newHandlerWithHooks(logger *slog.Logger, repositoryRoot string, authService
 				})
 			})
 			if err != nil {
-				operation.Abort()
+				err = errors.Join(err, operation.Abort())
 				writeProtectedNoteError(w, err)
 			}
 			return
@@ -1478,7 +1478,7 @@ func newHandlerWithHooks(logger *slog.Logger, repositoryRoot string, authService
 					})
 				})
 				if err != nil {
-					operation.Abort()
+					err = errors.Join(err, operation.Abort())
 					writeProtectedNoteError(w, err)
 				}
 				return
