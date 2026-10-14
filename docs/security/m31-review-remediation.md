@@ -6,6 +6,13 @@ merges, a fresh AI session must review the complete pre-P01-to-P17 candidate
 and assess release blockers. The AI review does not replace P17's independent
 reviewer sign-off. PR #24 remains open, activation disabled, P18 unchanged.
 
+**Fresh follow-up outcome: blocked.** The completed
+[full-scope AI source review](m31-r-followup-ai-review.md) reports three high
+blockers (B1–B3) and a medium durability finding (B4). R2 remains open at stale
+catalog reconciliation and R4 at documented online CLI revocation. The serial
+R1/R2 barriers, R3 replay and R5 display fences are correction candidates,
+not overall recovery/safety guarantees. No correction PR has merged.
+
 Tests run serially with disk-backed caches/temporary data, `GOMAXPROCS=2` and
 `GOMEMLIMIT=1536MiB`; focused race checks use the same limits. Abrupt subprocess
 exit tests exercise real process death/restart. Fault injection models failed
@@ -61,6 +68,10 @@ Trash/lock/concurrency race tests passed. These exercise process interruption
 and failed barriers, not actual storage power loss. CI/full-scope AI review
 remain outstanding.
 
+**Remaining R2 boundary:** B2 in the follow-up AI review identifies pending
+restore-mapping deletion based on a stale/partially committed catalog. The
+durability tests above do not cover that competing GET/commit interleaving.
+
 ## R3 — matching envelope replay
 
 **Confirmed.** New rollback/forward regressions failed because matching
@@ -97,7 +108,8 @@ but the manager still retained the stale grant.
 **Correction.** A one-use, manager/vault/session-bound attempt captures the
 vault generation and a bounded revocation epoch before credential work.
 Grant installation checks it atomically under the existing commit gate.
-All revocations invalidate pending work, including sessions with no grant;
+All in-process manager revocations invalidate pending work, including sessions
+with no grant;
 no tombstone/request map accumulates. Auth liveness is read again from SQLite
 after slow work. Logout/current/all-session deletion finish with a second
 key-manager barrier after durable auth revocation, covering the interval
@@ -116,6 +128,12 @@ lock regressions) passed, as did the complete uncached auth/app/CLI gate.
 Revocation conservatively cancels unrelated pending unlocks too; existing
 active grants of unaffected sessions remain intact. CI/full-scope AI review
 remain required before merge.
+
+**Remaining R4 boundary:** B3 in the follow-up AI review identifies online CLI
+revocation through a second Auth service/database connection. It does not
+advance the running server's manager epoch, and a session read before grant
+installation is not an atomic cross-process publication barrier. The seven
+HTTP regressions above do not cover that path. R4 is not marked complete.
 
 ## R5 — failed lock-event channel and browser display lifetime
 
@@ -146,3 +164,47 @@ HTTP test cover deadline/grant binding, activity and no-store responses.
 Focused encryption/app race checks including pending unlock passed. These
 are component tests with a simulated event channel/timer, not a real proxy
 outage or suspended-browser process test. CI/full-scope AI review remain gates.
+
+## Combined validation and candidate provenance
+
+- Complete candidate `f29ecf3d4d5a3788565a5216aa8ff8e2eda44f3b` assembles
+  P01–P17, F1–F10 and R1–R5 without merging PR #24. Its baseline is
+  `060e6367a7905f6306bac7273f19e1681df41f39` (before P01).
+- The complete uncached `go test -p 1 -count=1 ./...` and `go vet -p 1 ./...`
+  passed on that candidate, including P17 and official age external recovery.
+- Candidate `7d0e68f7a8caed682ee2dd8861a0050a9798d5d7` adds only three lines
+  that wait for the first note's tab before opening the second tab in an
+  existing frontend test. All 125 frontend tests, lint and build passed with
+  this addition; production sources are identical to `f29ecf3`.
+- CI exposed F9's five-second completion budget under real scrypt/race
+  instrumentation. Its open branch now allows sixty seconds and joins the
+  released request before database cleanup. Real credential work and all
+  security assertions remain enabled; the focused normal/race test passed.
+  The correction was merged into each open R branch without rewriting history.
+- Fresh AI source-review session `01a13a59-9c7c-7073-9792-1f97f8818894`
+  inspects the complete baseline-to-candidate difference in the unchanged
+  isolated `f29ecf3` checkout and the three-line test addition. It executes no
+  tests; implementer validation is not counted as the reviewer's own evidence.
+  It is an AI review, not P17's independent expert sign-off.
+
+## CI at the correction commits (2026-10-14)
+
+All four CI workflow jobs passed: backend tests/security/race/vulnerability,
+frontend lint/tests/build/audit, complete-history secret scan, and hardened
+container build/scan/persistence. These results do not close the AI blockers
+or stand in for protected-main CodeQL/up-to-date/review requirements.
+
+| PR | Correction head | Passing CI run |
+| --- | --- | --- |
+| #30 F8 | `7dded6c` | `38552629909` (CodeQL also passed) |
+| #31 F9 | `10c010f` | `38561259995` |
+| #32 R1 | `66a5bd6` | `38561291819` |
+| #33 R2 | `6f77489` | `38561315066` |
+| #34 R3 | `39e874e` | `38561317712` |
+| #35 R4 | `be85c80` | `38561321991` |
+| #36 R5 | `919fee5` | `38562055107` |
+
+The later documentation-only follow-up has its own pending CI; no inherited
+green result is asserted for its new commit. All PRs are held open. Locally,
+temporary data and caches stayed on disk; sampled swap during the resumed
+validation stayed around 4.0 GiB, with approximately 10–11 GiB RAM available.
