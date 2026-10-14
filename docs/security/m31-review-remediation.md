@@ -34,3 +34,29 @@ destination barrier and checking exact ciphertext/catalog afterwards.
 `TestRecoveryResyncsAlreadyRemovedDirectory` cover repeated fsync failures
 and journal retention. Full encryption/files package tests and focused
 encryption race tests passed. CI and fresh full-scope AI review remain gates.
+
+## R2 — protected Trash durability
+
+**Confirmed.** `TestProtectedTrashDurabilityBeforeSourceDelete` failed against
+the previous path: the restore mapping's directory and its parent had not
+been synced at the commit boundary. Destination directories were absent from
+the authenticated filesystem plan. The shared cause with R1 is treating
+visible namespace entries as durable.
+
+**Correction.** The complete destination/empty-directory chain uses
+`PrepareFilesystem`. Pending restore metadata and its parent are explicitly
+synced before the journal's forward decision; the Trash-root barrier is
+retried and errors propagate. Metadata finalization syncs destination, source,
+and Trash parents in that order; retry repeats the barriers even when the
+rename is already visible. An unexpected pending payload is retained.
+
+**Regression evidence.** `TestProtectedTrashProcessRestart` abruptly exits
+children after pending mkdir, metadata file write, prepared directories,
+content commit and metadata rename. Restart recovers/discards the journal,
+preserves exact note content/protection and restores committed items.
+`TestProtectedTrashBarrierFailuresPreserveRestoreMapping` injects repeated
+pending/final-parent sync failures. The commit-boundary regression checks
+durable metadata and the full directory plan. Full files tests and focused
+Trash/lock/concurrency race tests passed. These exercise process interruption
+and failed barriers, not actual storage power loss. CI/full-scope AI review
+remain outstanding.
