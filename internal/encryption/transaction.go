@@ -69,6 +69,8 @@ type TransactionJournal struct {
 	name      string
 	mu        sync.Mutex
 	fault     func(string) error
+	parent    *TransactionJournal
+	guard     func(func() error) error
 }
 
 type transactionRecord struct {
@@ -119,6 +121,28 @@ type PreparedTransaction struct {
 	prior        map[string]string
 	priorCatalog string
 	used         bool
+	guard        func(func() error) error
+}
+
+// WithCommitGuard scopes durable decisions to a caller's live lease without
+// modifying the shared journal or taking repository locks inside the guard.
+func (j *TransactionJournal) WithCommitGuard(guard func(func() error) error) *TransactionJournal {
+	if j == nil || guard == nil {
+		return nil
+	}
+	return &TransactionJournal{parent: j, guard: guard}
+}
+
+// GuardMutation also covers ordinary Trash paths in an encrypted vault. Those
+// callers must acquire all filesystem locks before entering this leaf guard.
+func (j *TransactionJournal) GuardMutation(work func() error) error {
+	if work == nil {
+		return ErrInvalidTransaction
+	}
+	if j != nil && j.guard != nil {
+		return j.guard(work)
+	}
+	return work()
 }
 
 // NewTransactionJournal binds a journal to one vault root and its catalog.
@@ -172,6 +196,13 @@ func (j *TransactionJournal) PrepareFilesystem(changes []CiphertextChange, catal
 }
 
 func (j *TransactionJournal) prepareFilesystem(ctx context.Context, changes []CiphertextChange, catalog Catalog, vaultKey []byte, createDirectories, removeDirectories []string) (*PreparedTransaction, error) {
+	if j != nil && j.parent != nil {
+		tx, err := j.parent.prepareFilesystem(ctx, changes, catalog, vaultKey, createDirectories, removeDirectories)
+		if err == nil {
+			tx.guard = j.guard
+		}
+		return tx, err
+	}
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -381,6 +412,16 @@ func (tx *PreparedTransaction) CommitContext(ctx context.Context) error {
 	}
 	if tx == nil || tx.journal == nil || tx.used {
 		return ErrInvalidTransaction
+	}
+	if tx.guard != nil {
+		guard := tx.guard
+		tx.guard = nil
+		entered := false
+		err := guard(func() error { entered = true; return tx.CommitContext(ctx) })
+		if !entered {
+			err = errors.Join(err, tx.Abort())
+		}
+		return err
 	}
 	tx.used = true
 	defer clear(tx.key)

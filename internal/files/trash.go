@@ -55,10 +55,10 @@ type resolvedTrashItem struct {
 }
 
 func (r *Repository) MoveToTrash(relative string) (TrashItem, error) {
-	r.trashMu.Lock()
-	defer r.trashMu.Unlock()
-	r.content.mu.Lock()
-	defer r.content.mu.Unlock()
+	return r.moveToTrashGuarded(relative, nil)
+}
+
+func (r *Repository) moveToTrashLocked(relative string) (TrashItem, error) {
 
 	source, info, err := r.resolveEntry(relative)
 	if err != nil {
@@ -188,10 +188,10 @@ func (r *Repository) TrashItems() ([]TrashItem, error) {
 }
 
 func (r *Repository) RestoreTrashItem(id string) (TrashItem, error) {
-	r.trashMu.Lock()
-	defer r.trashMu.Unlock()
-	r.content.mu.Lock()
-	defer r.content.mu.Unlock()
+	return r.restoreTrashItemGuarded(id, nil)
+}
+
+func (r *Repository) restoreTrashItemLocked(id string) (TrashItem, error) {
 
 	item, err := r.loadTrashItem(id)
 	if err != nil {
@@ -242,10 +242,10 @@ func (r *Repository) RestoreTrashItem(id string) (TrashItem, error) {
 }
 
 func (r *Repository) DeleteTrashItem(id string) (TrashItem, error) {
-	r.trashMu.Lock()
-	defer r.trashMu.Unlock()
-	r.content.mu.Lock()
-	defer r.content.mu.Unlock()
+	return r.deleteTrashItemGuarded(id, nil)
+}
+
+func (r *Repository) deleteTrashItemLocked(id string) (TrashItem, error) {
 
 	item, err := r.loadTrashItem(id)
 	if err != nil {

@@ -54,6 +54,12 @@ func newHandlerWithSessions(logger *slog.Logger, repositoryRoot string, authServ
 }
 
 func newHandlerWithKeyManager(logger *slog.Logger, repositoryRoot string, authService *auth.Service, sessions *auth.Sessions, keyManager *encryption.KeyManager, versions ...string) (http.Handler, error) {
+	return newHandlerWithMutationHook(logger, repositoryRoot, authService, sessions, keyManager, nil, versions...)
+}
+
+// The private hook permits deterministic preparation/lock race regressions.
+// Production constructors always pass nil.
+func newHandlerWithMutationHook(logger *slog.Logger, repositoryRoot string, authService *auth.Service, sessions *auth.Sessions, keyManager *encryption.KeyManager, beforeMutationCommit func(), versions ...string) (http.Handler, error) {
 	if keyManager == nil {
 		return nil, errors.New("encryption key manager is required")
 	}
@@ -100,6 +106,14 @@ func newHandlerWithKeyManager(logger *slog.Logger, repositoryRoot string, authSe
 		noteRecord = notebookRecord{ID: "local", LocalPath: repositoryRoot}
 	}
 	activeNoteAccess := newProtectedNoteAccess(repository, metadataPath, noteRecord)
+	guardJournal := func(access *protectedNoteAccess, lease *encryption.KeyLease) *encryption.TransactionJournal {
+		return access.journal.WithCommitGuard(func(commit func() error) error {
+			if beforeMutationCommit != nil {
+				beforeMutationCommit()
+			}
+			return lease.GuardCommit(commit)
+		})
+	}
 	currentRepository := func() *files.Repository {
 		activeMu.RLock()
 		defer activeMu.RUnlock()
@@ -1164,21 +1178,20 @@ func newHandlerWithKeyManager(logger *slog.Logger, repositoryRoot string, authSe
 			if lease == nil {
 				return
 			}
-			var catalog encryption.Catalog
+			var tree []files.Node
 			if err := lease.UseKey(func(key []byte) error {
-				var loadErr error
-				catalog, loadErr = noteAccess.catalogForKey(key)
-				return loadErr
+				catalog, err := noteAccess.catalogForKey(key)
+				if err != nil {
+					return err
+				}
+				tree, err = repository.TreeWithCatalog(catalog)
+				return err
 			}); err != nil {
 				lease.Close()
 				writeProtectedNoteError(w, err)
 				return
 			}
 			err := lease.Commit(func() error {
-				tree, treeErr := repository.TreeWithCatalog(catalog)
-				if treeErr != nil {
-					return treeErr
-				}
 				w.Header().Set("Cache-Control", "no-store, private")
 				writeJSON(w, http.StatusOK, map[string]any{"entries": tree})
 				return nil
@@ -1449,29 +1462,23 @@ func newHandlerWithKeyManager(logger *slog.Logger, repositoryRoot string, authSe
 				return
 			}
 			var preview files.MoveLinkPreview
-			var bufferedKey []byte
-			if err := lease.UseKey(func(key []byte) error {
-				bufferedKey = append([]byte(nil), key...)
-				return nil
-			}); err != nil {
+			err := lease.UseKey(func(key []byte) error {
+				catalog, err := noteAccess.catalogForKey(key)
+				if err != nil {
+					return err
+				}
+				preview, err = repository.MoveWithCatalog(input.Source, input.Target, input.RewriteToken, input.ProtectionChoice, catalog, key, noteAccess.store, guardJournal(noteAccess, lease))
+				return err
+			})
+			if err != nil {
 				lease.Close()
+				if errors.Is(err, encryption.ErrTransactionNeedsRecovery) {
+					noteAccess.needsRecovery()
+				}
 				writeProtectedNoteError(w, err)
 				return
 			}
-			defer clear(bufferedKey)
-			err := lease.Commit(func() error {
-				catalog, loadErr := noteAccess.catalogForKey(bufferedKey)
-				if loadErr != nil {
-					return loadErr
-				}
-				var moveErr error
-				preview, moveErr = repository.MoveWithCatalog(input.Source, input.Target, input.RewriteToken, input.ProtectionChoice, catalog, bufferedKey, noteAccess.store, noteAccess.journal)
-				if moveErr != nil {
-					if errors.Is(moveErr, encryption.ErrTransactionNeedsRecovery) {
-						noteAccess.needsRecovery()
-					}
-					return moveErr
-				}
+			err = lease.Commit(func() error {
 				if err := presentationStore.move(currentNotebookID(), input.Source, input.Target); err != nil {
 					logger.Warn("move image presentation metadata failed", "error", err)
 				}
@@ -1611,7 +1618,7 @@ func newHandlerWithKeyManager(logger *slog.Logger, repositoryRoot string, authSe
 					return loadErr
 				}
 				var moveErr error
-				item, moveErr = repository.MoveToTrashWithCatalog(r.URL.Query().Get("path"), catalog, key, noteAccess.store, noteAccess.journal)
+				item, moveErr = repository.MoveToTrashWithCatalog(r.URL.Query().Get("path"), catalog, key, noteAccess.store, guardJournal(noteAccess, lease))
 				return moveErr
 			})
 			if err != nil {
@@ -1702,7 +1709,7 @@ func newHandlerWithKeyManager(logger *slog.Logger, repositoryRoot string, authSe
 					return loadErr
 				}
 				var restoreErr error
-				item, restoreErr = repository.RestoreTrashItemWithCatalog(r.PathValue("trashID"), input.ProtectionChoice, catalog, key, noteAccess.store, noteAccess.journal)
+				item, restoreErr = repository.RestoreTrashItemWithCatalog(r.PathValue("trashID"), input.ProtectionChoice, catalog, key, noteAccess.store, guardJournal(noteAccess, lease))
 				return restoreErr
 			})
 			if err != nil {
@@ -1743,7 +1750,7 @@ func newHandlerWithKeyManager(logger *slog.Logger, repositoryRoot string, authSe
 					return loadErr
 				}
 				var deleteErr error
-				item, deleteErr = repository.DeleteTrashItemWithCatalog(r.PathValue("trashID"), catalog, key, noteAccess.store, noteAccess.journal)
+				item, deleteErr = repository.DeleteTrashItemWithCatalog(r.PathValue("trashID"), catalog, key, noteAccess.store, guardJournal(noteAccess, lease))
 				return deleteErr
 			})
 			if err != nil {

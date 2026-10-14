@@ -54,6 +54,7 @@ type vaultKeyState struct {
 	grants       map[[32]byte]keyGrant
 	generation   uint64
 	lastActivity time.Time
+	expiresAt    time.Time
 	subscribers  map[uint64]keySubscriber
 }
 
@@ -61,12 +62,15 @@ type vaultKeyState struct {
 // manager always starts locked, and all grants are scoped to an authenticated
 // session hash. Construct one manager per server process.
 type KeyManager struct {
-	mu        sync.Mutex
-	timeout   time.Duration
-	vaults    map[string]*vaultKeyState
-	timer     *time.Timer
-	nextSubID uint64
-	closed    bool
+	// Publication callbacks never hold mu. Revocation waits for this barrier
+	// without mu, so repository locks cannot deadlock status or idle locking.
+	commitGate sync.RWMutex
+	mu         sync.Mutex
+	timeout    time.Duration
+	vaults     map[string]*vaultKeyState
+	timer      *time.Timer
+	nextSubID  uint64
+	closed     bool
 }
 
 func NewKeyManager() *KeyManager {
@@ -95,9 +99,11 @@ func (m *KeyManager) Unlock(vaultID string, sessionID, vaultKey []byte) error {
 		return ErrInvalidKey
 	}
 
+	m.commitGate.Lock()
+	defer m.commitGate.Unlock()
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.expireLocked(time.Now())
+	m.expireWithCommitGateLocked(time.Now())
 	if m.closed {
 		return ErrKeyManagerClosed
 	}
@@ -107,6 +113,7 @@ func (m *KeyManager) Unlock(vaultID string, sessionID, vaultKey []byte) error {
 		state.key = append([]byte(nil), vaultKey...)
 		state.grants = make(map[[32]byte]keyGrant)
 		state.lastActivity = time.Now()
+		state.expiresAt = state.lastActivity.Add(m.timeout)
 		state.grants[session] = keyGrant{generation: state.generation}
 		m.publishLocked(state, LockEvent{VaultID: vaultID, Locked: false, Generation: state.generation, Reason: LockReasonUnlocked}, &session)
 		m.scheduleIdleTimerLocked()
@@ -120,6 +127,7 @@ func (m *KeyManager) Unlock(vaultID string, sessionID, vaultKey []byte) error {
 		m.publishLocked(state, LockEvent{VaultID: vaultID, Locked: false, Generation: state.generation, Reason: LockReasonUnlocked}, &session)
 	}
 	state.lastActivity = time.Now()
+	state.expiresAt = state.lastActivity.Add(m.timeout)
 	m.scheduleIdleTimerLocked()
 	return nil
 }
@@ -186,6 +194,7 @@ func (m *KeyManager) Touch(vaultID string, sessionID []byte) error {
 		return ErrVaultLocked
 	}
 	state.lastActivity = time.Now()
+	state.expiresAt = state.lastActivity.Add(m.timeout)
 	m.scheduleIdleTimerLocked()
 	return nil
 }
@@ -215,9 +224,9 @@ func (m *KeyManager) BeginUse(vaultID string, sessionID []byte) (*KeyLease, erro
 	return &KeyLease{manager: m, vaultID: vaultID, session: session, generation: state.generation, key: append([]byte(nil), state.key...)}, nil
 }
 
-// KeyLease confines a copied key to one piece of protected work. UseKey must
-// only perform in-memory work and buffer any derived output. Publish buffered
-// output inside Commit, not from the UseKey callback.
+// KeyLease confines a copied key to one piece of protected work. UseKey reads
+// and prepares buffered output/ciphertext stages; it never authorizes a live
+// mutation. Durable mutations use GuardCommit and buffered responses use Commit.
 type KeyLease struct {
 	manager    *KeyManager
 	vaultID    string
@@ -297,8 +306,9 @@ func (l *KeyLease) UseKey(work func([]byte) error) error {
 }
 
 // Commit publishes buffered output only while this lease still matches the
-// current session grant and lock generation. The callback runs under the
-// manager lock and must not call back into KeyManager.
+// current session grant and lock generation. The callback runs under a publication
+// barrier, without the manager state mutex, and must not acquire repository
+// locks or call back into KeyManager.
 func (l *KeyLease) Commit(publish func() error) error {
 	if l == nil || publish == nil || l.manager == nil {
 		return ErrVaultLocked
@@ -313,22 +323,40 @@ func (l *KeyLease) Commit(publish func() error) error {
 	l.key = nil
 	l.mu.Unlock()
 
-	m := l.manager
+	return l.manager.guardLease(l, publish)
+}
+
+// GuardCommit validates a reusable lease at the durable mutation boundary.
+// The callback must be a leaf transaction: acquire repository locks before
+// calling this method and never acquire them (or call KeyManager) inside it.
+func (l *KeyLease) GuardCommit(commit func() error) error {
+	if l == nil || l.manager == nil || commit == nil {
+		return ErrVaultLocked
+	}
+	l.mu.Lock()
+	closed := l.closed
+	l.mu.Unlock()
+	if closed {
+		return ErrVaultLocked
+	}
+	return l.manager.guardLease(l, commit)
+}
+
+func (m *KeyManager) guardLease(l *KeyLease, work func() error) error {
+	m.commitGate.RLock()
+	defer m.commitGate.RUnlock()
 	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.expireLocked(time.Now())
 	if m.closed {
+		m.mu.Unlock()
 		return ErrKeyManagerClosed
 	}
 	state := m.vaults[l.vaultID]
-	if state == nil {
+	if !hasGrant(state, l.session) || state.generation != l.generation {
+		m.mu.Unlock()
 		return ErrVaultLocked
 	}
-	grant, ok := state.grants[l.session]
-	if len(state.key) != VaultKeySize || state.generation != l.generation || !ok || grant.generation != l.generation {
-		return ErrVaultLocked
-	}
-	return publish()
+	m.mu.Unlock()
+	return work()
 }
 
 func (l *KeyLease) Close() {
@@ -352,6 +380,8 @@ func (m *KeyManager) LockVault(vaultID string, reason LockReason) error {
 	if reason == "" {
 		reason = LockReasonManual
 	}
+	m.commitGate.Lock()
+	defer m.commitGate.Unlock()
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.closed {
@@ -369,6 +399,8 @@ func (m *KeyManager) LockAll(reason LockReason) error {
 	if reason == "" {
 		reason = LockReasonManual
 	}
+	m.commitGate.Lock()
+	defer m.commitGate.Unlock()
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.closed {
@@ -391,12 +423,14 @@ func (m *KeyManager) RevokeSession(vaultID string, sessionID []byte) error {
 	if !ok {
 		return ErrSessionRequired
 	}
+	m.commitGate.Lock()
+	defer m.commitGate.Unlock()
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.closed {
 		return ErrKeyManagerClosed
 	}
-	m.expireLocked(time.Now())
+	m.expireWithCommitGateLocked(time.Now())
 	state := m.vaults[vaultID]
 	if state == nil {
 		return nil
@@ -419,12 +453,14 @@ func (m *KeyManager) RevokeSessionsExcept(sessionID []byte) error {
 	if !ok {
 		return ErrSessionRequired
 	}
+	m.commitGate.Lock()
+	defer m.commitGate.Unlock()
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.closed {
 		return ErrKeyManagerClosed
 	}
-	m.expireLocked(time.Now())
+	m.expireWithCommitGateLocked(time.Now())
 	for vaultID, state := range m.vaults {
 		for session := range state.grants {
 			if session == keep {
@@ -447,12 +483,14 @@ func (m *KeyManager) RevokeSessionEverywhere(sessionID []byte) error {
 	if !ok {
 		return ErrSessionRequired
 	}
+	m.commitGate.Lock()
+	defer m.commitGate.Unlock()
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.closed {
 		return ErrKeyManagerClosed
 	}
-	m.expireLocked(time.Now())
+	m.expireWithCommitGateLocked(time.Now())
 	for vaultID, state := range m.vaults {
 		if _, exists := state.grants[session]; !exists {
 			continue
@@ -510,6 +548,8 @@ func (m *KeyManager) Subscribe(vaultID string, sessionID []byte) (<-chan LockEve
 // Close revokes all in-memory grants, notifies subscribers, and prevents future
 // unlocks. It is safe to call more than once.
 func (m *KeyManager) Close() error {
+	m.commitGate.Lock()
+	defer m.commitGate.Unlock()
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.closed {
@@ -547,6 +587,7 @@ func (m *KeyManager) lockStateLocked(vaultID string, state *vaultKeyState, reaso
 	state.key = nil
 	state.grants = make(map[[32]byte]keyGrant)
 	state.lastActivity = time.Time{}
+	state.expiresAt = time.Time{}
 	state.generation++
 	m.publishLocked(state, LockEvent{VaultID: vaultID, Locked: true, Generation: state.generation, Reason: reason}, nil)
 }
@@ -571,7 +612,16 @@ func (m *KeyManager) publishLocked(state *vaultKeyState, event LockEvent, target
 	}
 }
 
+// Ordinary state inspection must not wait for publication while holding mu.
 func (m *KeyManager) expireLocked(now time.Time) {
+	if !m.commitGate.TryLock() {
+		return
+	}
+	defer m.commitGate.Unlock()
+	m.expireWithCommitGateLocked(now)
+}
+
+func (m *KeyManager) expireWithCommitGateLocked(now time.Time) {
 	for vaultID, state := range m.vaults {
 		if len(state.key) == VaultKeySize && !state.lastActivity.IsZero() && !now.Before(state.lastActivity.Add(m.timeout)) {
 			m.lockStateLocked(vaultID, state, LockReasonIdle)
@@ -608,17 +658,19 @@ func (m *KeyManager) scheduleIdleTimerLocked() {
 }
 
 func (m *KeyManager) idleTimerFired() {
+	m.commitGate.Lock()
+	defer m.commitGate.Unlock()
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.closed {
 		return
 	}
-	m.expireLocked(time.Now())
+	m.expireWithCommitGateLocked(time.Now())
 	m.scheduleIdleTimerLocked()
 }
 
 func hasGrant(state *vaultKeyState, session [32]byte) bool {
-	if state == nil || len(state.key) != VaultKeySize {
+	if state == nil || len(state.key) != VaultKeySize || (!state.expiresAt.IsZero() && !time.Now().Before(state.expiresAt)) {
 		return false
 	}
 	grant, ok := state.grants[session]
