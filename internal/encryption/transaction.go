@@ -552,6 +552,12 @@ func (j *TransactionJournal) recoverForVault(vaultKey []byte, expectedVaultID st
 		}
 		return nil
 	}
+	// A rename can be visible after a failed directory fsync or an abrupt
+	// process exit. Re-establish the forward-only decision before touching live
+	// content; merely reading a committed marker is not a durability barrier.
+	if err := j.saveRecord(record, vaultKey); err != nil {
+		return errors.Join(ErrTransactionNeedsRecovery, err)
+	}
 	root, err := os.OpenRoot(j.vaultRoot)
 	if err != nil {
 		return errors.Join(ErrTransactionNeedsRecovery, fmt.Errorf("open transaction vault root: %w", err))
@@ -719,6 +725,11 @@ func (j *TransactionJournal) applyCommitted(root *os.Root, record transactionRec
 			return err
 		}
 		if transactionChangeInstalled(entry, current, vaultKey) {
+			// This target may be visible from an interrupted rename whose parent
+			// was never synced. Secure it before any source delete can follow.
+			if err := j.syncVaultDirectory(root, path.Dir(entry.Path), "transaction.content.directory_sync"); err != nil {
+				return err
+			}
 			continue
 		}
 		if entry.PriorFingerprint != "" && !transactionPriorMatches(entry, current, vaultKey) {
@@ -763,36 +774,10 @@ func (j *TransactionJournal) applyCommitted(root *os.Root, record transactionRec
 		return errors.Join(ErrTransactionJournalCorrupt, err)
 	}
 
+	// Publish and sync every destination before removing any source. The
+	// authenticated record remains path-sorted; replay ordering is independent.
 	for _, entry := range record.Changes {
 		if entry.Delete {
-			if err := validateTransactionTarget(root, entry.Path); err != nil {
-				if errors.Is(err, fs.ErrNotExist) {
-					continue
-				}
-				return err
-			}
-			if info, err := root.Lstat(filepath.FromSlash(entry.Path)); err == nil {
-				if entry.ExpectedFingerprint != "" {
-					actual, digestErr := transactionTargetDigest(root, entry.Path)
-					if digestErr != nil || transactionSourceFingerprint(vaultKey, actual) != entry.ExpectedFingerprint {
-						return errors.Join(ErrTransactionNeedsRecovery, ErrTransactionConflict, digestErr)
-					}
-				}
-				if entry.RejectHardlinks && !hasSingleLink(info) {
-					return errors.Join(ErrTransactionNeedsRecovery, ErrInvalidTransaction)
-				}
-				if err := j.fail("transaction.content.delete"); err != nil {
-					return err
-				}
-				if err := root.Remove(filepath.FromSlash(entry.Path)); err != nil {
-					return fmt.Errorf("remove transaction target %q: %w", entry.Path, err)
-				}
-			} else if !errors.Is(err, fs.ErrNotExist) {
-				return err
-			}
-			if err := j.syncVaultDirectory(root, path.Dir(entry.Path), "transaction.content.directory_sync"); err != nil {
-				return err
-			}
 			continue
 		}
 		current, err := transactionTargetDigest(root, entry.Path)
@@ -820,6 +805,44 @@ func (j *TransactionJournal) applyCommitted(root *os.Root, record transactionRec
 		}
 	}
 
+	for _, entry := range record.Changes {
+		if !entry.Delete {
+			continue
+		}
+		if err := validateTransactionTarget(root, entry.Path); err != nil {
+			if errors.Is(err, fs.ErrNotExist) {
+				if err := j.syncExistingVaultAncestor(root, path.Dir(entry.Path)); err != nil {
+					return err
+				}
+				continue
+			}
+			return err
+		}
+		if info, err := root.Lstat(filepath.FromSlash(entry.Path)); err == nil {
+			if entry.ExpectedFingerprint != "" {
+				actual, digestErr := transactionTargetDigest(root, entry.Path)
+				if digestErr != nil || transactionSourceFingerprint(vaultKey, actual) != entry.ExpectedFingerprint {
+					return errors.Join(ErrTransactionNeedsRecovery, ErrTransactionConflict, digestErr)
+				}
+			}
+			if entry.RejectHardlinks && !hasSingleLink(info) {
+				return errors.Join(ErrTransactionNeedsRecovery, ErrInvalidTransaction)
+			}
+			if err := j.fail("transaction.content.delete"); err != nil {
+				return err
+			}
+			if err := root.Remove(filepath.FromSlash(entry.Path)); err != nil {
+				return fmt.Errorf("remove transaction target %q: %w", entry.Path, err)
+			}
+		} else if !errors.Is(err, fs.ErrNotExist) {
+			return err
+		}
+		if err := j.syncVaultDirectory(root, path.Dir(entry.Path), "transaction.content.directory_sync"); err != nil {
+			return err
+		}
+		continue
+	}
+
 	catalogDigest, err = transactionFileDigest(metadataRoot, j.catalog.name)
 	if err != nil && !errors.Is(err, fs.ErrNotExist) {
 		return err
@@ -831,9 +854,10 @@ func (j *TransactionJournal) applyCommitted(root *os.Root, record transactionRec
 		if err := metadataRoot.Rename(record.CatalogStage, j.catalog.name); err != nil {
 			return fmt.Errorf("install transaction catalog: %w", err)
 		}
-		if err := syncTransactionDirectory(metadataRoot, ".", j.fail, "transaction.catalog.directory_sync"); err != nil {
-			return err
-		}
+	}
+	// Equality after restart does not prove the catalog rename was durable.
+	if err := syncTransactionDirectory(metadataRoot, ".", j.fail, "transaction.catalog.directory_sync"); err != nil {
+		return err
 	}
 	if err := j.removeTransactionDirectories(root, record.RemoveDirectories); err != nil {
 		return err
