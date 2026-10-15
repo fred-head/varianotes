@@ -186,6 +186,11 @@ func (s *Service) replacePassword(ctx context.Context, password string, keepSess
 func (s *Service) RecoverPassword(ctx context.Context, password string) error {
 	s.credentialMu.Lock()
 	defer s.credentialMu.Unlock()
+	releaseJournal, err := lockAuthJournal(ctx, s.config.MetadataPath)
+	if err != nil {
+		return err
+	}
+	defer releaseJournal()
 	if err := s.ensureNoPendingEncryptionRecovery(ctx); err != nil {
 		return err
 	}
@@ -196,8 +201,10 @@ func (s *Service) RecoverPassword(ctx context.Context, password string) error {
 	if state.Mode != ModeLocal || !state.SetupCompleted {
 		return ErrSetupUnavailable
 	}
-	if _, _, err := s.pendingPasswordChange(ctx); err != nil {
+	if phase, _, err := s.pendingPasswordChange(ctx); err != nil {
 		return err
+	} else if phase != "" {
+		return ErrPasswordChangePending
 	}
 	return s.replacePassword(ctx, password, nil, true, false)
 }
@@ -209,6 +216,14 @@ func (s *Service) ChangePassword(ctx context.Context, currentPassword, newPasswo
 }
 
 func (s *Service) changePassword(ctx context.Context, currentPassword, newPassword string, keepSessionHash []byte) error {
+	// Both Service.ChangePassword and Sessions.ChangePassword enter here with
+	// credentialMu held. Ownership must span preflight, durable journal, every
+	// envelope write and journal completion/rollback, including error paths.
+	releaseJournal, err := lockAuthJournal(ctx, s.config.MetadataPath)
+	if err != nil {
+		return err
+	}
+	defer releaseJournal()
 	if err := s.ensureNoPendingEncryptionRecovery(ctx); err != nil {
 		return err
 	}
