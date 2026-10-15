@@ -247,9 +247,9 @@ Completion criteria:
 
 M31 remains in Alpha 3. This checklist is the implementation plan. **P01–P16
 are complete; P17–P18 remain open.** M31 is not complete until P01–P18 are
-complete and the independent security review in P17 has passed. Encryption
-activation must stay disabled in the UI, API, and any operator command until
-the P18 release gate passes.
+complete and P17's Alpha 3 sign-off rule has passed. Encryption activation
+must stay disabled in the UI, API, and any operator command until the P18
+release gate passes.
 
 The size labels are relative estimates, not measured durations: S is small, M
 is medium, and L is large or has substantial failure-recovery work. Each step
@@ -468,7 +468,7 @@ requires its listed tests; P17 adds end-to-end and adversarial coverage.
   uploads stream through a bounded reader without temporary files. Locked image
   requests return no content and the editor shows “Geschützter Anhang”; shared
   cleanup tests retain an object until every reference is removed. M31
-  activation remains gated by P12–P18 and the independent security review.
+  activation remains gated by P12–P18, including P17's Alpha 3 sign-off rule.
 
 - [x] **P11 — Convert existing notes, folders, and attachments**
   *(dependencies: P04, P06, P09, P10; size: L)*
@@ -589,21 +589,33 @@ requires its listed tests; P17 adds end-to-end and adversarial coverage.
   affected Go packages, production build, and `git diff --check` passed. Swap
   use stayed at 3.4 GiB during validation. Drafts are intentionally not
   recoverable after closing or reloading the browser tab, and physical memory
-  erasure is not claimed. P17's integration fault matrix and independent
-  security review remain required.
+  erasure is not claimed. P17's integration fault matrix and Alpha 3 sign-off
+  rule remain required.
 
-- [ ] **P17 — End-to-end fault matrix and independent security review**
+- [ ] **P17 — End-to-end fault matrix and Alpha 3 security review sign-off**
   *(dependencies: P01–P16; size: L)*
-  **Goal/scope:** exercise complete flows and obtain independent review of crypto
-  integration, transaction recovery, auth coordination, and data leaks.
+  **Goal/scope:** exercise complete flows and review crypto integration,
+  transaction recovery, auth coordination, and data leaks.
   **Acceptance/tests:** cover conversion/save/move/Trash/export aborts; restarts at
   journal boundaries; corrupt files/envelopes; password change and recovery
   interruption; multi-session lock races; shared assets; and byte-for-byte
   external recovery without VariaNotes. Resolve all blocking findings before
   release; document any remaining finding and confirm it does not weaken the
-  agreed security boundary. Obtain reviewer sign-off.
+  agreed security boundary. Complete the sign-off under the Alpha 3 rule in
+  [`m31-p17-ai-review-signoff.md`](../security/m31-p17-ai-review-signoff.md).
 
-  **P17 status — validation passed; independent review pending (2026-10-13):** conversion and journal
+  **Alpha 3 sign-off decision:** no independent security expert is available.
+  A fresh, separate, read-only AI session is therefore the selected P17
+  sign-off for this Alpha 3 milestone, subject to the complete conditions in
+  [P17 review rule](../security/m31-p17-ai-review-signoff.md). This is a
+  bounded AI review, not an expert audit or general security certification.
+  P17 stays open until that review reports no open release blockers and every
+  required technical check passes on the exact commit reviewed. Any change to
+  the reviewed candidate requires a fresh review and the required checks on the
+  changed commit. P18 and production activation stay blocked until P17 is
+  complete; activation remains separately blocked until P18 passes.
+
+  **P17 status — validation passed; sign-off pending (2026-10-13):** conversion and journal
   fault/restart boundaries are covered by the P06/P11 tests; protected move
   rollback and Trash restart reconciliation by the P12/P13 tests. Added focused
   P17 tests for an uncommitted protected save recovered after restart, export
@@ -632,14 +644,12 @@ requires its listed tests; P17 adds end-to-end and adversarial coverage.
   ./internal/app`, `go test -p 1 -count=1 ./internal/auth ./cmd/varianotes`,
   the focused lock-race test under `-race`, `go vet -p 1` for the affected Go
   packages, targeted `gosec -quiet ./internal/files/externalrestore`, and
-  `git diff --check`. The independent reviewer sign-off remains pending: PR #24
-  has no review submissions or requests, and the repository's current
-  collaborator/contributor lists show only the PR author (`fred-head`) and
-  `dependabot[bot]`; neither provides an independent security review. Local
-  review and passing CI do not satisfy that approval requirement. P17 remains
-  open until an independent reviewer signs off. Swap use remained at its
-  3.4-GiB baseline throughout these checks. Encryption activation stays gated;
-  P18 is unchanged.
+  `git diff --check`. At the time of this validation record, PR #24 had no review
+  submissions or requests. These checks and the implementation review are not
+  the fresh full-scope AI sign-off required by the Alpha 3 rule above. P17
+  remains open pending that review and its release-blocker assessment. Swap use
+  remained at its 3.4-GiB baseline throughout these checks. Encryption
+  activation stays gated; P18 is unchanged.
 
 - [ ] **P18 — Operations documentation and release gate**
   *(dependencies: P01–P17; size: S)*
@@ -654,14 +664,14 @@ requires its listed tests; P17 adds end-to-end and adversarial coverage.
 
 - P01–P18 are mandatory and ordered. Each step's tests must pass before it is
   marked complete.
-- P17's independent security review and end-to-end external recovery are
+- P17's sign-off under the Alpha 3 rule and end-to-end external recovery are
   release conditions, not follow-up work.
 - P16 may be developed behind a disabled gate, but no UI, API, or operator
   command may activate encryption before P18.
 - If a data path bypasses the shared layer, a failure can expose or lose content,
   or external recovery cannot decrypt the full vault without VariaNotes, the
   activation gate remains closed.
-- M31 is complete only after every checklist step and the security review pass.
+- M31 is complete only after every checklist step and P17's sign-off pass.
   Earlier plaintext backups and physical remnants remain outside this claim.
 
 ## Milestone 32 - Document outline / table of contents
