@@ -67,6 +67,70 @@ func TestSessionCookieSecurityOptions(t *testing.T) {
 	}
 }
 
+func TestActiveSessionRevalidatesAdmissionWithoutRefreshingExpiry(t *testing.T) {
+	service, err := Open(t.Context(), Config{Mode: ModeLocal, MetadataPath: filepath.Join(t.TempDir(), "auth.db")}, testLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer service.Close()
+	sessions, err := NewSessions(service, DefaultSessionOptions(false))
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := &sqliteSessionStore{db: service.db, codec: sessions.manager.Codec, defaultIdle: time.Hour}
+	token := "active-revalidation-test-token"
+	data, err := sessions.manager.Codec.Encode(time.Now().Add(time.Hour), map[string]any{sessionPrincipalKey: OwnerPrincipal})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, mutation := range []string{"live", "revoked", "expired", "malformed"} {
+		t.Run(mutation, func(t *testing.T) {
+			if _, err := service.db.Exec(`DELETE FROM auth_sessions`); err != nil {
+				t.Fatal(err)
+			}
+			if err := store.CommitCtx(t.Context(), token, data, time.Now().Add(time.Hour)); err != nil {
+				t.Fatal(err)
+			}
+			ctx, err := sessions.manager.Load(t.Context(), token)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !sessions.Authenticated(ctx) {
+				t.Fatal("test admission principal missing")
+			}
+			var activityBefore, expiryBefore string
+			if err := service.db.QueryRow(`SELECT last_activity_at,idle_expires_at FROM auth_sessions`).Scan(&activityBefore, &expiryBefore); err != nil {
+				t.Fatal(err)
+			}
+			switch mutation {
+			case "revoked":
+				err = store.DeleteCtx(t.Context(), token)
+			case "expired":
+				_, err = service.db.Exec(`UPDATE auth_sessions SET absolute_expires_at=?`, time.Now().Add(-time.Minute).UTC().Format(time.RFC3339Nano))
+			case "malformed":
+				_, err = service.db.Exec(`UPDATE auth_sessions SET absolute_expires_at='not-a-date'`)
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			active, err := sessions.Active(ctx)
+			if err != nil || active != (mutation == "live") {
+				t.Fatalf("active=%v error=%v after %s", active, err, mutation)
+			}
+			if !sessions.Authenticated(ctx) {
+				t.Fatal("admission principal unexpectedly changed")
+			}
+			var activityAfter, expiryAfter string
+			if err := service.db.QueryRow(`SELECT last_activity_at,idle_expires_at FROM auth_sessions`).Scan(&activityAfter, &expiryAfter); err != nil {
+				t.Fatal(err)
+			}
+			if activityAfter != activityBefore || expiryAfter != expiryBefore {
+				t.Fatal("liveness read refreshed session activity")
+			}
+		})
+	}
+}
+
 func TestSQLiteSessionStoreRejectsExpiredSessions(t *testing.T) {
 	service, err := Open(t.Context(), Config{Mode: ModeLocal, MetadataPath: filepath.Join(t.TempDir(), "auth.db")}, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {

@@ -70,7 +70,10 @@ type KeyManager struct {
 	vaults     map[string]*vaultKeyState
 	timer      *time.Timer
 	nextSubID  uint64
-	closed     bool
+	// A bounded scalar fences pending unlocks, including revocation before a
+	// session's first grant. Revocations conservatively fence all pending work.
+	unlockEpoch uint64
+	closed      bool
 }
 
 func NewKeyManager() *KeyManager {
@@ -88,17 +91,53 @@ func newKeyManager(timeout time.Duration) *KeyManager {
 // to the already-unlocked vault when it presents the same key. A different
 // session must call Unlock independently.
 func (m *KeyManager) Unlock(vaultID string, sessionID, vaultKey []byte) error {
+	attempt, err := m.BeginUnlock(vaultID, sessionID)
+	if err != nil {
+		return err
+	}
+	return m.CompleteUnlock(attempt, vaultKey)
+}
+
+// UnlockAttempt contains no secrets or retained manager-side allocation. Capture
+// it before password derivation/integrity work and complete it exactly once.
+type UnlockAttempt struct {
+	manager    *KeyManager
+	vaultID    string
+	session    [32]byte
+	generation uint64
+	epoch      uint64
+	used       bool // protected by manager.mu
+}
+
+func (m *KeyManager) BeginUnlock(vaultID string, sessionID []byte) (*UnlockAttempt, error) {
 	if !validVaultID(vaultID) {
-		return ErrInvalidVaultID
+		return nil, ErrInvalidVaultID
 	}
 	session, ok := sessionKey(sessionID)
 	if !ok {
-		return ErrSessionRequired
+		return nil, ErrSessionRequired
+	}
+	m.commitGate.Lock()
+	defer m.commitGate.Unlock()
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.expireWithCommitGateLocked(time.Now())
+	if m.closed {
+		return nil, ErrKeyManagerClosed
+	}
+	state := m.stateLocked(vaultID)
+	return &UnlockAttempt{manager: m, vaultID: vaultID, session: session, generation: state.generation, epoch: m.unlockEpoch}, nil
+}
+
+// CompleteUnlock serializes the final grant with lock/revocation. Slow password
+// work and auth-store reads must happen before this call, outside state locks.
+func (m *KeyManager) CompleteUnlock(attempt *UnlockAttempt, vaultKey []byte) error {
+	if attempt == nil || attempt.manager != m {
+		return ErrVaultLocked
 	}
 	if len(vaultKey) != VaultKeySize {
 		return ErrInvalidKey
 	}
-
 	m.commitGate.Lock()
 	defer m.commitGate.Unlock()
 	m.mu.Lock()
@@ -107,7 +146,12 @@ func (m *KeyManager) Unlock(vaultID string, sessionID, vaultKey []byte) error {
 	if m.closed {
 		return ErrKeyManagerClosed
 	}
-	state := m.stateLocked(vaultID)
+	state := m.stateLocked(attempt.vaultID)
+	if attempt.used || attempt.epoch != m.unlockEpoch || attempt.generation != state.generation {
+		return ErrVaultLocked
+	}
+	attempt.used = true
+	vaultID, session := attempt.vaultID, attempt.session
 	if len(state.key) == 0 {
 		state.generation++
 		state.key = append([]byte(nil), vaultKey...)
@@ -406,6 +450,7 @@ func (m *KeyManager) LockAll(reason LockReason) error {
 	if m.closed {
 		return ErrKeyManagerClosed
 	}
+	m.unlockEpoch++
 	for vaultID, state := range m.vaults {
 		m.lockStateLocked(vaultID, state, reason)
 	}
@@ -430,6 +475,7 @@ func (m *KeyManager) RevokeSession(vaultID string, sessionID []byte) error {
 	if m.closed {
 		return ErrKeyManagerClosed
 	}
+	m.unlockEpoch++
 	m.expireWithCommitGateLocked(time.Now())
 	state := m.vaults[vaultID]
 	if state == nil {
@@ -460,6 +506,7 @@ func (m *KeyManager) RevokeSessionsExcept(sessionID []byte) error {
 	if m.closed {
 		return ErrKeyManagerClosed
 	}
+	m.unlockEpoch++
 	m.expireWithCommitGateLocked(time.Now())
 	for vaultID, state := range m.vaults {
 		for session := range state.grants {
@@ -490,6 +537,7 @@ func (m *KeyManager) RevokeSessionEverywhere(sessionID []byte) error {
 	if m.closed {
 		return ErrKeyManagerClosed
 	}
+	m.unlockEpoch++
 	m.expireWithCommitGateLocked(time.Now())
 	for vaultID, state := range m.vaults {
 		if _, exists := state.grants[session]; !exists {

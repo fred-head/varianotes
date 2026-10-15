@@ -85,3 +85,34 @@ The child performs the writer's rename sequence explicitly; it is not a full
 backend process or a physical power-cut test. Focused password/recovery app
 tests and race checks (including concurrent catalog-save replay) passed.
 The broader uncached auth/route gate and CI/full-scope AI review remain gates.
+
+## R4 — pending Unlock against lock/revocation
+
+**Confirmed.** Deterministically paused HTTP unlocks restored grants after
+manual lock (including an already locked vault), logout, current/all-session
+revocation, revocation before first grant, and another session's revocation.
+After logout the auth middleware could reject response/session persistence,
+but the manager still retained the stale grant.
+
+**Correction.** A one-use, manager/vault/session-bound attempt captures the
+vault generation and a bounded revocation epoch before credential work.
+Grant installation checks it atomically under the existing commit gate.
+All revocations invalidate pending work, including sessions with no grant;
+no tombstone/request map accumulates. Auth liveness is read again from SQLite
+after slow work. Logout/current/all-session deletion finish with a second
+key-manager barrier after durable auth revocation, covering the interval
+between their initial lock and auth commit. No manager-state mutex spans
+filesystem/auth callbacks; existing mutation-lock ordering is retained.
+
+**Regression evidence.** `TestPendingHTTPUnlockCannotOvertakeLockOrRevocation`
+covers seven transitions at a paused HTTP grant boundary.
+`TestUnlockAttemptFencesEveryRevocationBeforeFirstGrant` and
+`TestUnlockAttemptIsBoundToManagerAndUsedOnce` cover all manager revocations,
+foreign/reused attempts and bounded retained state.
+`TestActiveSessionRevalidatesAdmissionWithoutRefreshingExpiry` covers live,
+revoked, expired and malformed durable session timestamps.
+Focused encryption/files/app race tests (including parallel write/manual/idle
+lock regressions) passed, as did the complete uncached auth/app/CLI gate.
+Revocation conservatively cancels unrelated pending unlocks too; existing
+active grants of unaffected sessions remain intact. CI/full-scope AI review
+remain required before merge.

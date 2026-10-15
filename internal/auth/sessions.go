@@ -71,6 +71,26 @@ func (s *Sessions) Authenticated(ctx context.Context) bool {
 	return s.manager.GetString(ctx, sessionPrincipalKey) == OwnerPrincipal
 }
 
+// Active revalidates durable revocation/expiry for slow sensitive requests;
+// Authenticated alone only inspects the principal loaded at request admission.
+// This check never refreshes activity or writes session state.
+func (s *Sessions) Active(ctx context.Context) (bool, error) {
+	if !s.Authenticated(ctx) {
+		return false, nil
+	}
+	hash := s.CurrentHash(ctx)
+	if len(hash) != sha256.Size {
+		return false, nil
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	var active bool
+	err := s.service.db.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM auth_sessions
+		WHERE session_id_hash=? AND revoked_at IS NULL
+		AND julianday(idle_expires_at)>julianday(?)
+		AND julianday(absolute_expires_at)>julianday(?))`, hash, now, now).Scan(&active)
+	return active, err
+}
+
 // MFAPending reports only whether this short-lived session has already passed
 // the password step. It does not expose or weaken either authentication factor.
 func (s *Sessions) MFAPending(ctx context.Context) bool {

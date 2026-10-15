@@ -220,6 +220,10 @@ func newExportHarness(t *testing.T, includeProtected bool) protectedExportHarnes
 }
 
 func newExportHarnessWithMutationHook(t *testing.T, includeProtected bool, beforeCommit func()) protectedExportHarness {
+	return newExportHarnessWithHooks(t, includeProtected, beforeCommit, nil)
+}
+
+func newExportHarnessWithHooks(t *testing.T, includeProtected bool, beforeCommit, beforeUnlockGrant func()) protectedExportHarness {
 	t.Helper()
 	root := t.TempDir()
 	metadataRoot := t.TempDir()
@@ -317,7 +321,7 @@ func newExportHarnessWithMutationHook(t *testing.T, includeProtected bool, befor
 	}
 	manager := encryption.NewKeyManager()
 	t.Cleanup(func() { _ = manager.Close() })
-	handler, err := newHandlerWithMutationHook(logger, "", authService, sessions, manager, beforeCommit)
+	handler, err := newHandlerWithHooks(logger, "", authService, sessions, manager, beforeCommit, beforeUnlockGrant)
 	if err != nil {
 		t.Fatal(err)
 	}
