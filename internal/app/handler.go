@@ -802,9 +802,10 @@ func newHandlerWithHooks(logger *slog.Logger, repositoryRoot string, authService
 			}
 			unlocked := false
 			generation := uint64(0)
+			idleRemaining := time.Duration(0)
 			if sessions != nil && sessions.Authenticated(r.Context()) {
 				var err error
-				unlocked, generation, err = keyManager.SessionStatus(record.ID, sessions.CurrentHash(r.Context()))
+				unlocked, generation, idleRemaining, err = keyManager.SessionStatusWithIdleTime(record.ID, sessions.CurrentHash(r.Context()))
 				if err != nil && !errors.Is(err, encryption.ErrSessionRequired) {
 					writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "vault lock status is unavailable"})
 					return
@@ -828,6 +829,7 @@ func newHandlerWithHooks(logger *slog.Logger, repositoryRoot string, authService
 			writeJSON(w, http.StatusOK, map[string]any{
 				"vaultId": record.ID, "protected": protected, "locked": !unlocked,
 				"generation": generation, "recoveryCodeConfigured": protection.hasRecoveryEnvelope,
+				"idleRemainingMs":    idleRemaining.Milliseconds(),
 				"unlockPasswordMode": passwordMode, "activationEnabled": false,
 				"autoLockMinutes": int(encryption.DefaultIdleLockTimeout.Minutes()), "mfaEnabled": mfaEnabled,
 			})
@@ -925,12 +927,12 @@ func newHandlerWithHooks(logger *slog.Logger, repositoryRoot string, authService
 			if err := loginThrottle.SuccessOperation(r.Context(), auth.ThrottleOperationSensitive, clientIP); err != nil {
 				logger.Warn("clear vault unlock throttle failed", "operation", auth.ThrottleOperationSensitive)
 			}
-			unlocked, generation, err := keyManager.SessionStatus(record.ID, sessionHash)
+			unlocked, generation, idleRemaining, err := keyManager.SessionStatusWithIdleTime(record.ID, sessionHash)
 			if err != nil || !unlocked {
 				writeJSON(w, http.StatusLocked, map[string]string{"error": "vault lock state changed; retry unlock"})
 				return
 			}
-			writeJSON(w, http.StatusOK, map[string]any{"vaultId": record.ID, "unlocked": true, "generation": generation})
+			writeJSON(w, http.StatusOK, map[string]any{"vaultId": record.ID, "unlocked": true, "generation": generation, "idleRemainingMs": idleRemaining.Milliseconds()})
 		})
 		mux.HandleFunc("POST /api/encryption/lock", func(w http.ResponseWriter, r *http.Request) {
 			setExportNoStore(w)
@@ -947,10 +949,17 @@ func newHandlerWithHooks(logger *slog.Logger, repositoryRoot string, authService
 			writeJSON(w, http.StatusOK, map[string]any{"vaultId": vaultID, "locked": !unlocked, "generation": generation})
 		})
 		mux.HandleFunc("POST /api/encryption/activity", func(w http.ResponseWriter, r *http.Request) {
-			err := keyManager.Touch(r.URL.Query().Get("vaultId"), sessions.CurrentHash(r.Context()))
+			setExportNoStore(w)
+			vaultID, sessionHash := r.URL.Query().Get("vaultId"), sessions.CurrentHash(r.Context())
+			err := keyManager.Touch(vaultID, sessionHash)
 			switch {
 			case err == nil:
-				writeJSON(w, http.StatusOK, map[string]bool{"recorded": true})
+				unlocked, generation, remaining, err := keyManager.SessionStatusWithIdleTime(vaultID, sessionHash)
+				if err != nil || !unlocked {
+					writeJSON(w, http.StatusLocked, map[string]string{"error": "vault is locked"})
+					return
+				}
+				writeJSON(w, http.StatusOK, map[string]any{"recorded": true, "vaultId": vaultID, "generation": generation, "idleRemainingMs": remaining.Milliseconds()})
 			case errors.Is(err, encryption.ErrVaultLocked):
 				writeJSON(w, http.StatusLocked, map[string]string{"error": "vault is locked"})
 			case errors.Is(err, encryption.ErrSessionRequired):

@@ -10,6 +10,8 @@ vi.mock('./components/editor/MarkdownEditor', () => ({
 }))
 
 let emit: (locked: boolean) => void
+let failChannel: () => void
+let openChannel: () => void
 let generation: number
 let intercept: (url: string, init?: RequestInit) => Promise<Response> | undefined
 beforeEach(() => {
@@ -27,6 +29,8 @@ beforeEach(() => {
           data: JSON.stringify({ vaultId: 'personal', locked, generation }),
         }))
       }
+      failChannel = () => this.listeners.get('error')?.(new Event('error'))
+      openChannel = () => this.listeners.get('open')?.(new Event('open'))
     }
     addEventListener(type: string, listener: EventListener) { this.listeners.set(type, listener) }
     removeEventListener(type: string) { this.listeners.delete(type) }
@@ -39,14 +43,14 @@ beforeEach(() => {
     if (url === '/api/health') return Response.json({})
     if (url === '/api/notebook') return Response.json({ name: 'Personal', configured: true })
     if (url === '/api/notebooks') return Response.json({ activeId: 'personal', notebooks: [{ id: 'personal', name: 'Personal' }] })
-    if (url === '/api/encryption/status') return Response.json({ vaultId: 'personal', protected: true, locked: false, generation, activationEnabled: false })
+    if (url === '/api/encryption/status') return Response.json({ vaultId: 'personal', protected: true, locked: false, generation, idleRemainingMs: 900_000, activationEnabled: false })
     if (url === '/api/repository/tree') return Response.json({ entries: ['Secret', 'Second'].map((name) => ({ name: `${name}.md`, path: `${name}.md`, type: 'file', protected: true })) })
     if (url.startsWith('/api/repository/file?')) return Response.json({ path: new URL(url, 'https://test').searchParams.get('path'), content: 'original protected content', version: 'v1' })
-    if (url.startsWith('/api/encryption/activity?')) return Response.json({ recorded: true })
+    if (url.startsWith('/api/encryption/activity?')) return Response.json({ recorded: true, vaultId: 'personal', generation, idleRemainingMs: 900_000 })
     return Response.json({ error: 'unexpected request' }, { status: 500 })
   }))
 })
-afterEach(() => { cleanup(); vi.unstubAllGlobals() })
+afterEach(() => { cleanup(); vi.useRealTimers(); vi.unstubAllGlobals() })
 
 async function openDraft() {
   const view = render(<App />)
@@ -57,6 +61,100 @@ async function openDraft() {
 }
 
 describe('protected content response fences', () => {
+  it('does not extend the display deadline through successful status polling', async () => {
+    vi.useFakeTimers()
+    const view = render(<App />)
+    await act(async () => { await vi.advanceTimersByTimeAsync(1) })
+    fireEvent.click(view.getByRole('button', { name: 'Secret' }))
+    await act(async () => { await vi.advanceTimersByTimeAsync(1) })
+    expect(view.getByRole('textbox', { name: 'Test draft' })).toBeTruthy()
+    await act(async () => { await vi.advanceTimersByTimeAsync(900_001) })
+    expect(view.queryByRole('textbox', { name: 'Test draft' })).toBeNull()
+    expect(vi.mocked(fetch).mock.calls.filter(([url]) => String(url) === '/api/encryption/status').length).toBeGreaterThan(2)
+  })
+
+  it('uses the remaining server idle time, including response latency', async () => {
+    vi.useFakeTimers()
+    let confirm!: (response: Response) => void
+    intercept = (url) => url === '/api/encryption/status' ? new Promise((resolve) => { confirm = resolve }) : undefined
+    const view = render(<App />)
+    await act(async () => { await vi.advanceTimersByTimeAsync(1) })
+    expect(confirm).toBeTypeOf('function')
+    await act(async () => { await vi.advanceTimersByTimeAsync(2_000) })
+    await act(async () => confirm(Response.json({ vaultId: 'personal', protected: true, locked: false, generation, idleRemainingMs: 1_000, activationEnabled: false })))
+    expect(view.getAllByRole('button', { name: 'Unlock vault' }).length).toBeGreaterThan(0)
+    expect(view.queryByRole('button', { name: 'Lock vault' })).toBeNull()
+  })
+
+  it('does not reveal the retained draft through a late unlock after channel failure', async () => {
+    const view = await openDraft()
+    fireEvent.change(view.getByRole('textbox', { name: 'Test draft' }), { target: { value: 'hidden-late-unlock-draft' } })
+    act(() => emit(true))
+    let finish!: (response: Response) => void
+    intercept = (url) => url === '/api/encryption/unlock' ? new Promise((resolve) => { finish = resolve }) : undefined
+    fireEvent.click(view.getAllByRole('button', { name: 'Unlock vault' })[0])
+    fireEvent.change(view.getByLabelText('Encryption password'), { target: { value: 'password' } })
+    fireEvent.click(view.getByRole('button', { name: 'Unlock' }))
+    await waitFor(() => expect(finish).toBeTypeOf('function'))
+    act(() => failChannel())
+    await act(async () => finish(Response.json({ vaultId: 'personal', unlocked: true, generation: generation + 1, idleRemainingMs: 900_000 })))
+    expect(view.queryByRole('textbox', { name: 'Test draft' })).toBeNull()
+  })
+
+  it.each(['editor', 'conflict', 'search'] as const)('hides %s at the idle deadline with a silent channel and stalled status', async (surface) => {
+    vi.useFakeTimers()
+    const view = render(<App />)
+    await act(async () => { await vi.advanceTimersByTimeAsync(1) })
+    fireEvent.click(view.getByRole('button', { name: 'Secret' }))
+    await act(async () => { await vi.advanceTimersByTimeAsync(1) })
+    fireEvent.change(view.getByRole('textbox', { name: 'Test draft' }), { target: { value: 'idle-hidden-draft' } })
+    intercept = (url, init) => {
+      if (url === '/api/encryption/status') return new Promise(() => undefined)
+      if (url === '/api/repository/search') return Promise.resolve(Response.json({ results: [{ path: 'Secret.md', type: 'content', line: 1, excerpt: 'idle-search-secret' }] }))
+      if (url.startsWith('/api/repository/file?') && init?.method === 'PUT') return Promise.resolve(Response.json({ error: 'stale' }, { status: 409 }))
+      if (url.startsWith('/api/repository/file?')) return Promise.resolve(Response.json({ path: 'Secret.md', content: 'idle-conflict-secret', version: 'v2' }))
+    }
+    if (surface === 'search') {
+      fireEvent.change(view.getByRole('searchbox', { name: 'Search this notebook' }), { target: { value: 'idle-search-secret' } })
+      await act(async () => { await vi.advanceTimersByTimeAsync(300) })
+      expect(view.container.textContent).toContain('idle-search-secret')
+    } else if (surface === 'conflict') {
+      fireEvent.click(view.getByRole('button', { name: 'Save' }))
+      await act(async () => { await vi.advanceTimersByTimeAsync(1) })
+      expect(view.getByRole('dialog', { name: 'This note changed on the server' })).toBeTruthy()
+    }
+    await act(async () => { await vi.advanceTimersByTimeAsync(900_001) })
+    expect(view.queryByRole('textbox', { name: 'Test draft' })).toBeNull()
+    expect(view.queryByRole('dialog', { name: 'This note changed on the server' })).toBeNull()
+    expect(view.container.textContent).not.toContain('idle-search-secret')
+    expect(view.container.textContent).not.toContain('idle-conflict-secret')
+    const stored = [localStorage, sessionStorage].flatMap((storage) => Array.from({ length: storage.length }, (_, index) => storage.getItem(storage.key(index)!))).join(' ')
+    expect(stored).not.toContain('idle-hidden-draft')
+  })
+
+  it.each(['sse', 'offline'] as const)('hides the protected draft immediately on %s loss and rejects a late search', async (failure) => {
+    const view = await openDraft()
+    let finish!: (response: Response) => void
+    intercept = (url) => url === '/api/repository/search' ? new Promise((resolve) => { finish = resolve }) : undefined
+    fireEvent.change(view.getByRole('textbox', { name: 'Test draft' }), { target: { value: 'hidden-channel-draft' } })
+    // Start a pending derived-content response while retaining the draft.
+    fireEvent.change(view.getByRole('searchbox', { name: 'Search this notebook' }), { target: { value: 'late-channel-query' } })
+    await waitFor(() => expect(finish).toBeTypeOf('function'))
+    act(() => { if (failure === 'sse') failChannel(); else window.dispatchEvent(new Event('offline')) })
+    expect(view.queryByRole('textbox', { name: 'Test draft' })).toBeNull()
+    await act(async () => finish(Response.json({ results: [{ path: 'Secret.md', type: 'content', excerpt: 'late-channel-secret' }] })))
+    expect(view.container.textContent).not.toContain('late-channel-secret')
+    // A channel reopening alone does not authorize plaintext; fresh status does.
+    let confirm!: (response: Response) => void
+    intercept = (url) => url === '/api/encryption/status' ? new Promise((resolve) => { confirm = resolve }) : undefined
+    act(() => openChannel())
+    await waitFor(() => expect(confirm).toBeTypeOf('function'))
+    expect(view.queryByRole('textbox', { name: 'Test draft' })).toBeNull()
+    await act(async () => confirm(Response.json({ vaultId: 'personal', protected: true, locked: false, generation, idleRemainingMs: 900_000, activationEnabled: false })))
+    expect((await view.findByRole('textbox', { name: 'Test draft' }) as HTMLTextAreaElement).value).toBe('hidden-channel-draft')
+    const stored = [localStorage, sessionStorage].flatMap((storage) => Array.from({ length: storage.length }, (_, index) => storage.getItem(storage.key(index)!))).join(' ')
+    expect(stored).not.toContain('hidden-channel-draft')
+  })
   it.each(['visible', 'late'] as const)('discards a %s conflict on lock and preserves the unsaved draft', async (mode) => {
     const view = await openDraft()
     let finish!: (response: Response) => void
@@ -114,7 +212,7 @@ describe('protected content response fences', () => {
         active = url.includes('/work/') ? 'work' : 'personal'
         return Promise.resolve(Response.json({ id: active, name: active }))
       }
-      if (url === '/api/encryption/status') return Promise.resolve(Response.json({ vaultId: active, protected: true, locked: false, generation: 1, activationEnabled: false }))
+      if (url === '/api/encryption/status') return Promise.resolve(Response.json({ vaultId: active, protected: true, locked: false, generation: 1, idleRemainingMs: 900_000, activationEnabled: false }))
       if (url === '/api/repository/file?path=Second.md') return new Promise((resolve) => { finish = resolve })
     }
     const view = await openDraft()

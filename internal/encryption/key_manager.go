@@ -200,21 +200,32 @@ func (m *KeyManager) IsUnlocked(vaultID string, sessionID []byte) bool {
 // SessionStatus returns the lock state and generation visible to one session.
 // It does not count as user activity and never extends the idle timeout.
 func (m *KeyManager) SessionStatus(vaultID string, sessionID []byte) (bool, uint64, error) {
+	unlocked, generation, _, err := m.SessionStatusWithIdleTime(vaultID, sessionID)
+	return unlocked, generation, err
+}
+
+// SessionStatusWithIdleTime returns a consistent grant/epoch and remaining
+// idle duration. Polling it never counts as activity. Relative time lets the
+// browser enforce its display deadline without trusting clock synchronisation.
+func (m *KeyManager) SessionStatusWithIdleTime(vaultID string, sessionID []byte) (bool, uint64, time.Duration, error) {
 	if !validVaultID(vaultID) {
-		return false, 0, ErrInvalidVaultID
+		return false, 0, 0, ErrInvalidVaultID
 	}
 	session, ok := sessionKey(sessionID)
 	if !ok {
-		return false, 0, ErrSessionRequired
+		return false, 0, 0, ErrSessionRequired
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.expireLocked(time.Now())
 	if m.closed {
-		return false, 0, ErrKeyManagerClosed
+		return false, 0, 0, ErrKeyManagerClosed
 	}
 	state := m.stateLocked(vaultID)
-	return hasGrant(state, session), state.generation, nil
+	if !hasGrant(state, session) {
+		return false, state.generation, 0, nil
+	}
+	return true, state.generation, max(0, time.Until(state.expiresAt)), nil
 }
 
 // Touch records explicit foreground activity for a session with a live grant.

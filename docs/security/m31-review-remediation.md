@@ -116,3 +116,33 @@ lock regressions) passed, as did the complete uncached auth/app/CLI gate.
 Revocation conservatively cancels unrelated pending unlocks too; existing
 active grants of unaffected sessions remain intact. CI/full-scope AI review
 remain required before merge.
+
+## R5 — failed lock-event channel and browser display lifetime
+
+**Confirmed.** Before the fix, five new browser regressions kept protected
+plaintext visible after SSE failure/offline or after fifteen minutes with a
+silent channel and stalled status requests (editor, conflict and search).
+The existing editor read-only timer did not hide the rendered content.
+
+**Correction.** SSE errors/malformed events, offline and health failures hide
+content immediately and invalidate pending content/unlock responses. Channel
+reopening and unlock events require a fresh session/generation status before
+display. Status, unlock and confirmed activity return a consistent remaining
+server idle duration without status polling renewing activity. A monotonic
+browser timer enforces that duration, bounded to fifteen minutes and reduced
+by request latency; status polling cannot extend the confirmed deadline.
+Only confirmed activity or a new grant can renew it. Abort/epoch checks reject
+stale status and activity replies. Unknown status with protected tree entries
+also hides content. Unsaved drafts remain hidden in tab memory; derived
+search/conflict/preview data is discarded, with no browser-storage copy.
+
+**Regression evidence.** `App.lock-security.test.tsx` covers channel failure,
+offline, silent-channel deadlines for all three surfaces, successful polling
+without deadline extension, response latency, reconnect confirmation, late
+unlock/search replies and hidden draft retention. All 125 frontend tests,
+lint and production build passed (existing large-chunk warning remains).
+`TestSessionIdleTimeIsBoundToGrantAndPollingDoesNotRenew` and the session-scoped
+HTTP test cover deadline/grant binding, activity and no-store responses.
+Focused encryption/app race checks including pending unlock passed. These
+are component tests with a simulated event channel/timer, not a real proxy
+outage or suspended-browser process test. CI/full-scope AI review remain gates.

@@ -96,6 +96,47 @@ func TestKeyManagerStartsLockedAndRequiresPerSessionUnlock(t *testing.T) {
 	}
 }
 
+func TestSessionIdleTimeIsBoundToGrantAndPollingDoesNotRenew(t *testing.T) {
+	manager := newKeyManager(time.Minute)
+	defer manager.Close()
+	session, other := bytes.Repeat([]byte{1}, 32), bytes.Repeat([]byte{2}, 32)
+	if err := manager.Unlock("vault", session, bytes.Repeat([]byte{3}, VaultKeySize)); err != nil {
+		t.Fatal(err)
+	}
+	manager.mu.Lock()
+	state := manager.vaults["vault"]
+	state.lastActivity = time.Now().Add(-20 * time.Second)
+	state.expiresAt = state.lastActivity.Add(time.Minute)
+	deadline, activity := state.expiresAt, state.lastActivity
+	manager.mu.Unlock()
+	for range 3 {
+		unlocked, _, remaining, err := manager.SessionStatusWithIdleTime("vault", session)
+		if err != nil || !unlocked || remaining <= 35*time.Second || remaining > 40*time.Second {
+			t.Fatalf("remaining time: %v %v %v", unlocked, remaining, err)
+		}
+	}
+	manager.mu.Lock()
+	if state.expiresAt != deadline || state.lastActivity != activity {
+		t.Error("status polling renewed idle time")
+	}
+	manager.mu.Unlock()
+	if unlocked, _, remaining, err := manager.SessionStatusWithIdleTime("vault", other); err != nil || unlocked || remaining != 0 {
+		t.Fatalf("other session acquired display lease: %v %v %v", unlocked, remaining, err)
+	}
+	if err := manager.Touch("vault", session); err != nil {
+		t.Fatal(err)
+	}
+	if unlocked, _, remaining, err := manager.SessionStatusWithIdleTime("vault", session); err != nil || !unlocked || remaining <= 55*time.Second {
+		t.Fatalf("activity did not renew: %v %v %v", unlocked, remaining, err)
+	}
+	if err := manager.LockVault("vault", LockReasonManual); err != nil {
+		t.Fatal(err)
+	}
+	if unlocked, _, remaining, err := manager.SessionStatusWithIdleTime("vault", session); err != nil || unlocked || remaining != 0 {
+		t.Fatalf("locked display lease remains: %v %v %v", unlocked, remaining, err)
+	}
+}
+
 func TestPublicationDoesNotHoldStateMutexAndLockWaitsForBoundary(t *testing.T) {
 	manager := newKeyManager(time.Minute)
 	defer manager.Close()
