@@ -224,6 +224,14 @@ func newExportHarnessWithMutationHook(t *testing.T, includeProtected bool, befor
 }
 
 func newExportHarnessWithHooks(t *testing.T, includeProtected bool, beforeCommit, beforeUnlockGrant func()) protectedExportHarness {
+	return newExportHarnessWithPublicationHook(t, includeProtected, beforeCommit, beforeUnlockGrant, nil)
+}
+
+func newExportHarnessWithPublicationHook(t *testing.T, includeProtected bool, beforeCommit, beforeUnlockGrant, beforeProtectedCommit func()) protectedExportHarness {
+	return newExportHarnessWithSessionHook(t, includeProtected, beforeCommit, beforeUnlockGrant, beforeProtectedCommit, nil)
+}
+
+func newExportHarnessWithSessionHook(t *testing.T, includeProtected bool, beforeCommit, beforeUnlockGrant, beforeProtectedCommit, afterProtectedSession func()) protectedExportHarness {
 	t.Helper()
 	root := t.TempDir()
 	metadataRoot := t.TempDir()
@@ -321,7 +329,7 @@ func newExportHarnessWithHooks(t *testing.T, includeProtected bool, beforeCommit
 	}
 	manager := encryption.NewKeyManager()
 	t.Cleanup(func() { _ = manager.Close() })
-	handler, err := newHandlerWithHooks(logger, "", authService, sessions, manager, beforeCommit, beforeUnlockGrant)
+	handler, err := newHandlerWithPublicationHook(logger, "", authService, sessions, manager, beforeCommit, beforeUnlockGrant, beforeProtectedCommit, afterProtectedSession)
 	if err != nil {
 		t.Fatal(err)
 	}
