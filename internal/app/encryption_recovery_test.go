@@ -155,6 +155,7 @@ func TestRecoveryCodeSetupUsesSeparateEncryptionPassword(t *testing.T) {
 
 func TestInterruptedPasswordRecoveryRestoresOldCodeBeforeServing(t *testing.T) {
 	metadataPath, entries, _ := passwordChangeFixture(t, 2, true)
+	concurrentWrite := credentialConcurrentWriter(t, metadataPath, entries[0])
 	authPath := filepath.Join(filepath.Dir(metadataPath), "auth.db")
 	service := openRecoveryTestService(t, metadataPath)
 	oldCode := activateRecoveryCode(t, service)
@@ -169,6 +170,9 @@ func TestInterruptedPasswordRecoveryRestoresOldCodeBeforeServing(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if err := coordinator.VerifyRecoveryPlan(t.Context(), planBytes, newPassword, newCode); err != nil {
+		t.Fatal(err)
+	}
 	first := plan.Updates[0]
 	firstState, err := inspectVaultProtection(entries[0], metadataPath)
 	if err != nil {
@@ -180,6 +184,7 @@ func TestInterruptedPasswordRecoveryRestoresOldCodeBeforeServing(t *testing.T) {
 	if err := applyRecoveryEnvelope(firstState.recoveryEnvelopePath, first.OldRecoveryEnvelope, first.NewRecoveryEnvelope, first.OldRecoveryPresent, true, true); err != nil {
 		t.Fatal(err)
 	}
+	concurrentWrite("save after recovery validation and first envelope update")
 	payload, err := json.Marshal(map[string]any{
 		"operation": "password", "plan": planBytes,
 		"credential": map[string]any{

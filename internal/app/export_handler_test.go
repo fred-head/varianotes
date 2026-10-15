@@ -198,6 +198,7 @@ func TestNotebookExportDoesNotPromptWhenCatalogHasNoProtectedContent(t *testing.
 
 type protectedExportHarness struct {
 	handler      http.Handler
+	service      *auth.Service
 	manager      *encryption.KeyManager
 	root         string
 	metadataRoot string
@@ -215,6 +216,22 @@ func newProtectedExportHarness(t *testing.T) protectedExportHarness {
 }
 
 func newExportHarness(t *testing.T, includeProtected bool) protectedExportHarness {
+	return newExportHarnessWithMutationHook(t, includeProtected, nil)
+}
+
+func newExportHarnessWithMutationHook(t *testing.T, includeProtected bool, beforeCommit func()) protectedExportHarness {
+	return newExportHarnessWithHooks(t, includeProtected, beforeCommit, nil)
+}
+
+func newExportHarnessWithHooks(t *testing.T, includeProtected bool, beforeCommit, beforeUnlockGrant func()) protectedExportHarness {
+	return newExportHarnessWithPublicationHook(t, includeProtected, beforeCommit, beforeUnlockGrant, nil)
+}
+
+func newExportHarnessWithPublicationHook(t *testing.T, includeProtected bool, beforeCommit, beforeUnlockGrant, beforeProtectedCommit func()) protectedExportHarness {
+	return newExportHarnessWithSessionHook(t, includeProtected, beforeCommit, beforeUnlockGrant, beforeProtectedCommit, nil)
+}
+
+func newExportHarnessWithSessionHook(t *testing.T, includeProtected bool, beforeCommit, beforeUnlockGrant, beforeProtectedCommit, afterProtectedSession func()) protectedExportHarness {
 	t.Helper()
 	root := t.TempDir()
 	metadataRoot := t.TempDir()
@@ -242,6 +259,7 @@ func newExportHarness(t *testing.T, includeProtected bool) protectedExportHarnes
 		t.Fatal(err)
 	}
 	var asset []byte
+	catalog.VaultID = registeredCatalogID(vaultID)
 	if includeProtected {
 		noteID, err := encryption.NewCatalogObjectID()
 		if err != nil {
@@ -311,7 +329,7 @@ func newExportHarness(t *testing.T, includeProtected bool) protectedExportHarnes
 	}
 	manager := encryption.NewKeyManager()
 	t.Cleanup(func() { _ = manager.Close() })
-	handler, err := newHandlerWithKeyManager(logger, "", authService, sessions, manager)
+	handler, err := newHandlerWithPublicationHook(logger, "", authService, sessions, manager, beforeCommit, beforeUnlockGrant, beforeProtectedCommit, afterProtectedSession)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -337,7 +355,7 @@ func newExportHarness(t *testing.T, includeProtected bool) protectedExportHarnes
 		t.Fatal(err)
 	}
 	return protectedExportHarness{
-		handler: handler, manager: manager, root: root, metadataRoot: metadataRoot, vaultID: vaultID,
+		handler: handler, service: authService, manager: manager, root: root, metadataRoot: metadataRoot, vaultID: vaultID,
 		cookie: cookie, csrf: csrf, key: key, asset: asset, sessionHash: sessionHash, logs: logs,
 	}
 }

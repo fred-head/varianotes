@@ -2,7 +2,7 @@ package app
 
 import (
 	"bytes"
-	"crypto/sha256"
+	"context"
 	"database/sql"
 	"encoding/base64"
 	"encoding/json"
@@ -54,6 +54,20 @@ func newHandlerWithSessions(logger *slog.Logger, repositoryRoot string, authServ
 }
 
 func newHandlerWithKeyManager(logger *slog.Logger, repositoryRoot string, authService *auth.Service, sessions *auth.Sessions, keyManager *encryption.KeyManager, versions ...string) (http.Handler, error) {
+	return newHandlerWithMutationHook(logger, repositoryRoot, authService, sessions, keyManager, nil, versions...)
+}
+
+// The private hook permits deterministic preparation/lock race regressions.
+// Production constructors always pass nil.
+func newHandlerWithMutationHook(logger *slog.Logger, repositoryRoot string, authService *auth.Service, sessions *auth.Sessions, keyManager *encryption.KeyManager, beforeMutationCommit func(), versions ...string) (http.Handler, error) {
+	return newHandlerWithHooks(logger, repositoryRoot, authService, sessions, keyManager, beforeMutationCommit, nil, versions...)
+}
+
+func newHandlerWithHooks(logger *slog.Logger, repositoryRoot string, authService *auth.Service, sessions *auth.Sessions, keyManager *encryption.KeyManager, beforeMutationCommit, beforeUnlockGrant func(), versions ...string) (http.Handler, error) {
+	return newHandlerWithPublicationHook(logger, repositoryRoot, authService, sessions, keyManager, beforeMutationCommit, beforeUnlockGrant, nil, nil, versions...)
+}
+
+func newHandlerWithPublicationHook(logger *slog.Logger, repositoryRoot string, authService *auth.Service, sessions *auth.Sessions, keyManager *encryption.KeyManager, beforeMutationCommit, beforeUnlockGrant, beforeProtectedCommit, afterProtectedSession func(), versions ...string) (http.Handler, error) {
 	if keyManager == nil {
 		return nil, errors.New("encryption key manager is required")
 	}
@@ -100,6 +114,27 @@ func newHandlerWithKeyManager(logger *slog.Logger, repositoryRoot string, authSe
 		noteRecord = notebookRecord{ID: "local", LocalPath: repositoryRoot}
 	}
 	activeNoteAccess := newProtectedNoteAccess(repository, metadataPath, noteRecord)
+	commitLease := func(r *http.Request, lease *encryption.KeyLease, publish func() error) error {
+		if beforeProtectedCommit != nil {
+			beforeProtectedCommit()
+		}
+		return commitProtectedLease(r.Context(), sessions, keyManager, lease, func() error {
+			if afterProtectedSession != nil {
+				afterProtectedSession()
+			}
+			return publish()
+		})
+	}
+	guardJournal := func(ctx context.Context, access *protectedNoteAccess, lease *encryption.KeyLease) *encryption.TransactionJournal {
+		return access.journal.WithCommitGuard(func(commit func() error) error {
+			if beforeMutationCommit != nil {
+				beforeMutationCommit()
+			}
+			return withProtectedSession(ctx, sessions, keyManager, func() error {
+				return lease.GuardCommit(commit)
+			})
+		})
+	}
 	currentRepository := func() *files.Repository {
 		activeMu.RLock()
 		defer activeMu.RUnlock()
@@ -443,6 +478,7 @@ func newHandlerWithKeyManager(logger *slog.Logger, repositoryRoot string, authSe
 				writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "logout failed"})
 				return
 			}
+			_ = keyManager.LockAll(encryption.LockReasonLogout)
 			_ = authService.RecordSecurityEvent(r.Context(), "logout", "success", "client="+auth.ClientReference(requestIdentity.ClientIP(r)))
 			writeJSON(w, http.StatusOK, map[string]bool{"authenticated": false})
 		})
@@ -452,6 +488,7 @@ func newHandlerWithKeyManager(logger *slog.Logger, repositoryRoot string, authSe
 				writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "session revocation failed"})
 				return
 			}
+			_ = keyManager.LockAll(encryption.LockReasonLogout)
 			_ = authService.RecordSecurityEvent(r.Context(), "session_revoke_current", "success", "client="+auth.ClientReference(requestIdentity.ClientIP(r)))
 			writeJSON(w, http.StatusOK, map[string]bool{"revoked": true})
 		})
@@ -461,6 +498,7 @@ func newHandlerWithKeyManager(logger *slog.Logger, repositoryRoot string, authSe
 				writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "session revocation failed"})
 				return
 			}
+			_ = keyManager.LockAll(encryption.LockReasonLogout)
 			_ = authService.RecordSecurityEvent(r.Context(), "session_revoke_all", "success", "client="+auth.ClientReference(requestIdentity.ClientIP(r)))
 			writeJSON(w, http.StatusOK, map[string]bool{"revoked": true})
 		})
@@ -782,9 +820,10 @@ func newHandlerWithKeyManager(logger *slog.Logger, repositoryRoot string, authSe
 			}
 			unlocked := false
 			generation := uint64(0)
+			idleRemaining := time.Duration(0)
 			if sessions != nil && sessions.Authenticated(r.Context()) {
 				var err error
-				unlocked, generation, err = keyManager.SessionStatus(record.ID, sessions.CurrentHash(r.Context()))
+				unlocked, generation, idleRemaining, err = keyManager.SessionStatusWithIdleTime(record.ID, sessions.CurrentHash(r.Context()))
 				if err != nil && !errors.Is(err, encryption.ErrSessionRequired) {
 					writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "vault lock status is unavailable"})
 					return
@@ -808,6 +847,7 @@ func newHandlerWithKeyManager(logger *slog.Logger, repositoryRoot string, authSe
 			writeJSON(w, http.StatusOK, map[string]any{
 				"vaultId": record.ID, "protected": protected, "locked": !unlocked,
 				"generation": generation, "recoveryCodeConfigured": protection.hasRecoveryEnvelope,
+				"idleRemainingMs":    idleRemaining.Milliseconds(),
 				"unlockPasswordMode": passwordMode, "activationEnabled": false,
 				"autoLockMinutes": int(encryption.DefaultIdleLockTimeout.Minutes()), "mfaEnabled": mfaEnabled,
 			})
@@ -816,6 +856,13 @@ func newHandlerWithKeyManager(logger *slog.Logger, repositoryRoot string, authSe
 			setExportNoStore(w)
 			if sessions == nil || !sessions.Authenticated(r.Context()) {
 				writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "authentication required"})
+				return
+			}
+			sessionHash := sessions.CurrentHash(r.Context())
+			_, noteAccess, record := currentNotebookContext()
+			attempt, err := keyManager.BeginUnlock(record.ID, sessionHash)
+			if err != nil {
+				writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "vault unlock state is unavailable"})
 				return
 			}
 			var input struct {
@@ -833,7 +880,6 @@ func newHandlerWithKeyManager(logger *slog.Logger, repositoryRoot string, authSe
 				return
 			}
 			defer release()
-			_, noteAccess, record := currentNotebookContext()
 			if noteAccess == nil || !noteAccess.enabled {
 				writeJSON(w, http.StatusConflict, map[string]string{"error": "vault protection is not active", "code": "encryption_not_active"})
 				return
@@ -872,12 +918,45 @@ func newHandlerWithKeyManager(logger *slog.Logger, repositoryRoot string, authSe
 				writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "encrypted vault content is unavailable"})
 				return
 			}
-			sessionHash := sessions.CurrentHash(r.Context())
-			if !sessions.Authenticated(r.Context()) || len(sessionHash) != sha256.Size {
+			active, err := sessions.Active(r.Context())
+			if err != nil {
+				writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "authentication state is unavailable"})
+				return
+			}
+			if !active {
 				writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "authentication required"})
 				return
 			}
-			if err := keyManager.Unlock(record.ID, sessionHash, vaultKey); err != nil {
+			if beforeUnlockGrant != nil {
+				beforeUnlockGrant()
+			}
+			err = withProtectedSession(r.Context(), sessions, keyManager, func() error {
+				if afterProtectedSession != nil {
+					afterProtectedSession()
+				}
+				if err := keyManager.CompleteUnlock(attempt, vaultKey); err != nil {
+					return err
+				}
+				unlocked, generation, idleRemaining, err := keyManager.SessionStatusWithIdleTime(record.ID, sessionHash)
+				if err != nil || !unlocked {
+					return encryption.ErrVaultLocked
+				}
+				writeJSON(w, http.StatusOK, map[string]any{"vaultId": record.ID, "unlocked": true, "generation": generation, "idleRemainingMs": idleRemaining.Milliseconds()})
+				return nil
+			})
+			if err != nil {
+				if errors.Is(err, auth.ErrAuthentication) {
+					writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "authentication required"})
+					return
+				}
+				if errors.Is(err, auth.ErrSessionBarrier) {
+					writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "authentication state is unavailable"})
+					return
+				}
+				if errors.Is(err, encryption.ErrVaultLocked) {
+					writeJSON(w, http.StatusLocked, map[string]string{"error": "vault lock state changed; retry unlock"})
+					return
+				}
 				if errors.Is(err, encryption.ErrVaultKeyMismatch) {
 					writeJSON(w, http.StatusConflict, map[string]string{"error": "vault key state changed; retry unlock"})
 					return
@@ -888,12 +967,6 @@ func newHandlerWithKeyManager(logger *slog.Logger, repositoryRoot string, authSe
 			if err := loginThrottle.SuccessOperation(r.Context(), auth.ThrottleOperationSensitive, clientIP); err != nil {
 				logger.Warn("clear vault unlock throttle failed", "operation", auth.ThrottleOperationSensitive)
 			}
-			unlocked, generation, err := keyManager.SessionStatus(record.ID, sessionHash)
-			if err != nil || !unlocked {
-				writeJSON(w, http.StatusLocked, map[string]string{"error": "vault lock state changed; retry unlock"})
-				return
-			}
-			writeJSON(w, http.StatusOK, map[string]any{"vaultId": record.ID, "unlocked": true, "generation": generation})
 		})
 		mux.HandleFunc("POST /api/encryption/lock", func(w http.ResponseWriter, r *http.Request) {
 			setExportNoStore(w)
@@ -910,18 +983,33 @@ func newHandlerWithKeyManager(logger *slog.Logger, repositoryRoot string, authSe
 			writeJSON(w, http.StatusOK, map[string]any{"vaultId": vaultID, "locked": !unlocked, "generation": generation})
 		})
 		mux.HandleFunc("POST /api/encryption/activity", func(w http.ResponseWriter, r *http.Request) {
-			err := keyManager.Touch(r.URL.Query().Get("vaultId"), sessions.CurrentHash(r.Context()))
-			switch {
-			case err == nil:
-				writeJSON(w, http.StatusOK, map[string]bool{"recorded": true})
-			case errors.Is(err, encryption.ErrVaultLocked):
-				writeJSON(w, http.StatusLocked, map[string]string{"error": "vault is locked"})
-			case errors.Is(err, encryption.ErrSessionRequired):
-				writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "authenticated session is required"})
-			case errors.Is(err, encryption.ErrInvalidVaultID):
-				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid vault ID"})
-			default:
-				writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "encryption activity state is unavailable"})
+			setExportNoStore(w)
+			vaultID, sessionHash := r.URL.Query().Get("vaultId"), sessions.CurrentHash(r.Context())
+			err := withProtectedSession(r.Context(), sessions, keyManager, func() error {
+				err := keyManager.Touch(vaultID, sessionHash)
+				switch {
+				case err == nil:
+					unlocked, generation, remaining, err := keyManager.SessionStatusWithIdleTime(vaultID, sessionHash)
+					if err != nil || !unlocked {
+						writeJSON(w, http.StatusLocked, map[string]string{"error": "vault is locked"})
+						return nil
+					}
+					writeJSON(w, http.StatusOK, map[string]any{"recorded": true, "vaultId": vaultID, "generation": generation, "idleRemainingMs": remaining.Milliseconds()})
+				case errors.Is(err, encryption.ErrVaultLocked):
+					writeJSON(w, http.StatusLocked, map[string]string{"error": "vault is locked"})
+				case errors.Is(err, encryption.ErrSessionRequired):
+					writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "authenticated session is required"})
+				case errors.Is(err, encryption.ErrInvalidVaultID):
+					writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid vault ID"})
+				default:
+					writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "encryption activity state is unavailable"})
+				}
+				return nil
+			})
+			if errors.Is(err, auth.ErrAuthentication) {
+				writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "authentication required"})
+			} else if err != nil {
+				writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "authentication state is unavailable"})
 			}
 		})
 		mux.HandleFunc("GET /api/encryption/lock-events", func(w http.ResponseWriter, r *http.Request) {
@@ -1078,7 +1166,23 @@ func newHandlerWithKeyManager(logger *slog.Logger, repositoryRoot string, authSe
 		handleNotebookExport(w, r, logger, metadataPath, sessions, keyManager, exportGrants, false)
 	})
 	mux.HandleFunc("POST /api/notebooks/{notebookID}/export/reauth", func(w http.ResponseWriter, r *http.Request) {
-		handleNotebookExportReauthentication(w, r, metadataPath, sessions, keyManager, exportGrants)
+		setExportNoStore(w)
+		if sessions == nil || loginThrottle == nil {
+			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "authenticated session is required"})
+			return
+		}
+		clientIP, release, allowed := beginCredentialAttempt(w, r, auth.ThrottleOperationSensitive)
+		if !allowed {
+			return
+		}
+		defer release()
+		handleNotebookExportReauthentication(w, r, metadataPath, sessions, keyManager, exportGrants,
+			func() bool { return recordCredentialFailure(w, r, auth.ThrottleOperationSensitive, clientIP) },
+			func() {
+				if err := loginThrottle.SuccessOperation(r.Context(), auth.ThrottleOperationSensitive, clientIP); err != nil {
+					logger.Warn("clear export credential throttle failed", "operation", auth.ThrottleOperationSensitive)
+				}
+			})
 	})
 	mux.HandleFunc("POST /api/notebooks/{notebookID}/export", func(w http.ResponseWriter, r *http.Request) {
 		handleNotebookExport(w, r, logger, metadataPath, sessions, keyManager, exportGrants, true)
@@ -1164,21 +1268,20 @@ func newHandlerWithKeyManager(logger *slog.Logger, repositoryRoot string, authSe
 			if lease == nil {
 				return
 			}
-			var catalog encryption.Catalog
+			var tree []files.Node
 			if err := lease.UseKey(func(key []byte) error {
-				var loadErr error
-				catalog, loadErr = noteAccess.catalogForKey(key)
-				return loadErr
+				catalog, err := noteAccess.catalogForKey(key)
+				if err != nil {
+					return err
+				}
+				tree, err = repository.TreeWithCatalog(catalog)
+				return err
 			}); err != nil {
 				lease.Close()
 				writeProtectedNoteError(w, err)
 				return
 			}
-			err := lease.Commit(func() error {
-				tree, treeErr := repository.TreeWithCatalog(catalog)
-				if treeErr != nil {
-					return treeErr
-				}
+			err := commitLease(r, lease, func() error {
 				w.Header().Set("Cache-Control", "no-store, private")
 				writeJSON(w, http.StatusOK, map[string]any{"entries": tree})
 				return nil
@@ -1222,7 +1325,7 @@ func newHandlerWithKeyManager(logger *slog.Logger, repositoryRoot string, authSe
 				writeProtectedNoteError(w, err)
 				return
 			}
-			if err := lease.Commit(func() error {
+			if err := commitLease(r, lease, func() error {
 				w.Header().Set("Cache-Control", "no-store, private")
 				writeJSON(w, http.StatusOK, map[string]any{"results": results})
 				return nil
@@ -1261,7 +1364,7 @@ func newHandlerWithKeyManager(logger *slog.Logger, repositoryRoot string, authSe
 				writeProtectedNoteError(w, err)
 				return
 			}
-			err := lease.Commit(func() error {
+			err := commitLease(r, lease, func() error {
 				w.Header().Set("Cache-Control", "no-store, private")
 				writeJSON(w, http.StatusOK, map[string]string{"path": filePath, "content": markdown.Content, "version": markdown.Version})
 				return nil
@@ -1311,7 +1414,7 @@ func newHandlerWithKeyManager(logger *slog.Logger, repositoryRoot string, authSe
 				writeProtectedNoteError(w, err)
 				return
 			}
-			err := lease.Commit(func() error {
+			err := commitLease(r, lease, func() error {
 				return operation.Commit(func(markdown files.Markdown) error {
 					w.Header().Set("Cache-Control", "no-store, private")
 					writeJSON(w, http.StatusOK, map[string]string{"path": filePath, "content": markdown.Content, "version": markdown.Version})
@@ -1319,8 +1422,7 @@ func newHandlerWithKeyManager(logger *slog.Logger, repositoryRoot string, authSe
 				})
 			})
 			if err != nil {
-				operation.Abort()
-				noteAccess.needsRecovery()
+				err = errors.Join(err, operation.Abort())
 				writeProtectedNoteError(w, err)
 			}
 			return
@@ -1361,7 +1463,7 @@ func newHandlerWithKeyManager(logger *slog.Logger, repositoryRoot string, authSe
 				writeProtectedNoteError(w, err)
 				return
 			}
-			err := lease.Commit(func() error {
+			err := commitLease(r, lease, func() error {
 				return operation.Commit(func(markdown files.Markdown) error {
 					w.Header().Set("Cache-Control", "no-store, private")
 					writeJSON(w, http.StatusOK, map[string]string{"path": input.Path, "content": markdown.Content, "version": markdown.Version})
@@ -1369,8 +1471,7 @@ func newHandlerWithKeyManager(logger *slog.Logger, repositoryRoot string, authSe
 				})
 			})
 			if err != nil {
-				operation.Abort()
-				noteAccess.needsRecovery()
+				err = errors.Join(err, operation.Abort())
 				writeProtectedNoteError(w, err)
 			}
 			return
@@ -1411,7 +1512,7 @@ func newHandlerWithKeyManager(logger *slog.Logger, repositoryRoot string, authSe
 					writeProtectedNoteError(w, err)
 					return
 				}
-				err := lease.Commit(func() error {
+				err := commitLease(r, lease, func() error {
 					return operation.Commit(func(files.Markdown) error {
 						w.Header().Set("Cache-Control", "no-store, private")
 						writeJSON(w, http.StatusCreated, map[string]string{"path": input.Path, "type": input.Type})
@@ -1419,8 +1520,7 @@ func newHandlerWithKeyManager(logger *slog.Logger, repositoryRoot string, authSe
 					})
 				})
 				if err != nil {
-					operation.Abort()
-					noteAccess.needsRecovery()
+					err = errors.Join(err, operation.Abort())
 					writeProtectedNoteError(w, err)
 				}
 				return
@@ -1449,29 +1549,20 @@ func newHandlerWithKeyManager(logger *slog.Logger, repositoryRoot string, authSe
 				return
 			}
 			var preview files.MoveLinkPreview
-			var bufferedKey []byte
-			if err := lease.UseKey(func(key []byte) error {
-				bufferedKey = append([]byte(nil), key...)
-				return nil
-			}); err != nil {
+			err := lease.UseKey(func(key []byte) error {
+				catalog, err := noteAccess.catalogForKey(key)
+				if err != nil {
+					return err
+				}
+				preview, err = repository.MoveWithCatalog(input.Source, input.Target, input.RewriteToken, input.ProtectionChoice, catalog, key, noteAccess.store, guardJournal(r.Context(), noteAccess, lease))
+				return err
+			})
+			if err != nil {
 				lease.Close()
 				writeProtectedNoteError(w, err)
 				return
 			}
-			defer clear(bufferedKey)
-			err := lease.Commit(func() error {
-				catalog, loadErr := noteAccess.catalogForKey(bufferedKey)
-				if loadErr != nil {
-					return loadErr
-				}
-				var moveErr error
-				preview, moveErr = repository.MoveWithCatalog(input.Source, input.Target, input.RewriteToken, input.ProtectionChoice, catalog, bufferedKey, noteAccess.store, noteAccess.journal)
-				if moveErr != nil {
-					if errors.Is(moveErr, encryption.ErrTransactionNeedsRecovery) {
-						noteAccess.needsRecovery()
-					}
-					return moveErr
-				}
+			err = commitLease(r, lease, func() error {
 				if err := presentationStore.move(currentNotebookID(), input.Source, input.Target); err != nil {
 					logger.Warn("move image presentation metadata failed", "error", err)
 				}
@@ -1543,7 +1634,7 @@ func newHandlerWithKeyManager(logger *slog.Logger, repositoryRoot string, authSe
 				writeProtectedNoteError(w, err)
 				return
 			}
-			if err := lease.Commit(func() error {
+			if err := commitLease(r, lease, func() error {
 				w.Header().Set("Cache-Control", "no-store, private")
 				writeJSON(w, http.StatusOK, preview)
 				return nil
@@ -1581,7 +1672,7 @@ func newHandlerWithKeyManager(logger *slog.Logger, repositoryRoot string, authSe
 				writeProtectedNoteError(w, err)
 				return
 			}
-			if err := lease.Commit(func() error {
+			if err := commitLease(r, lease, func() error {
 				w.Header().Set("Cache-Control", "no-store, private")
 				writeJSON(w, http.StatusOK, map[string]any{"links": links})
 				return nil
@@ -1611,18 +1702,15 @@ func newHandlerWithKeyManager(logger *slog.Logger, repositoryRoot string, authSe
 					return loadErr
 				}
 				var moveErr error
-				item, moveErr = repository.MoveToTrashWithCatalog(r.URL.Query().Get("path"), catalog, key, noteAccess.store, noteAccess.journal)
+				item, moveErr = repository.MoveToTrashWithCatalog(r.URL.Query().Get("path"), catalog, key, noteAccess.store, guardJournal(r.Context(), noteAccess, lease))
 				return moveErr
 			})
 			if err != nil {
 				lease.Close()
-				if errors.Is(err, encryption.ErrTransactionNeedsRecovery) {
-					noteAccess.needsRecovery()
-				}
 				writeProtectedNoteError(w, err)
 				return
 			}
-			if err := lease.Commit(func() error {
+			if err := commitLease(r, lease, func() error {
 				if err := presentationStore.deletePath(currentNotebookID(), item.OriginalPath); err != nil {
 					logger.Warn("delete image presentation metadata failed", "error", err)
 				}
@@ -1658,7 +1746,7 @@ func newHandlerWithKeyManager(logger *slog.Logger, repositoryRoot string, authSe
 					return loadErr
 				}
 				var listErr error
-				items, listErr = repository.TrashItemsWithCatalog(catalog, key)
+				items, listErr = repository.TrashItemsWithCatalog(catalog, key, noteAccess.journal)
 				return listErr
 			})
 			if err != nil {
@@ -1666,7 +1754,7 @@ func newHandlerWithKeyManager(logger *slog.Logger, repositoryRoot string, authSe
 				writeProtectedNoteError(w, err)
 				return
 			}
-			if err := lease.Commit(func() error {
+			if err := commitLease(r, lease, func() error {
 				w.Header().Set("Cache-Control", "no-store, private")
 				writeJSON(w, http.StatusOK, map[string]any{"items": items})
 				return nil
@@ -1702,18 +1790,15 @@ func newHandlerWithKeyManager(logger *slog.Logger, repositoryRoot string, authSe
 					return loadErr
 				}
 				var restoreErr error
-				item, restoreErr = repository.RestoreTrashItemWithCatalog(r.PathValue("trashID"), input.ProtectionChoice, catalog, key, noteAccess.store, noteAccess.journal)
+				item, restoreErr = repository.RestoreTrashItemWithCatalog(r.PathValue("trashID"), input.ProtectionChoice, catalog, key, noteAccess.store, guardJournal(r.Context(), noteAccess, lease))
 				return restoreErr
 			})
 			if err != nil {
 				lease.Close()
-				if errors.Is(err, encryption.ErrTransactionNeedsRecovery) {
-					noteAccess.needsRecovery()
-				}
 				writeProtectedNoteError(w, err)
 				return
 			}
-			if err := lease.Commit(func() error {
+			if err := commitLease(r, lease, func() error {
 				w.Header().Set("Cache-Control", "no-store, private")
 				writeJSON(w, http.StatusOK, item)
 				return nil
@@ -1743,18 +1828,15 @@ func newHandlerWithKeyManager(logger *slog.Logger, repositoryRoot string, authSe
 					return loadErr
 				}
 				var deleteErr error
-				item, deleteErr = repository.DeleteTrashItemWithCatalog(r.PathValue("trashID"), catalog, key, noteAccess.store, noteAccess.journal)
+				item, deleteErr = repository.DeleteTrashItemWithCatalog(r.PathValue("trashID"), catalog, key, noteAccess.store, guardJournal(r.Context(), noteAccess, lease))
 				return deleteErr
 			})
 			if err != nil {
 				lease.Close()
-				if errors.Is(err, encryption.ErrTransactionNeedsRecovery) {
-					noteAccess.needsRecovery()
-				}
 				writeProtectedNoteError(w, err)
 				return
 			}
-			if err := lease.Commit(func() error {
+			if err := commitLease(r, lease, func() error {
 				w.Header().Set("Cache-Control", "no-store, private")
 				writeJSON(w, http.StatusOK, item)
 				return nil
@@ -1803,7 +1885,7 @@ func newHandlerWithKeyManager(logger *slog.Logger, repositoryRoot string, authSe
 				writeProtectedNoteError(w, err)
 				return
 			}
-			err := lease.Commit(func() error {
+			err := commitLease(r, lease, func() error {
 				return operation.Commit(func(asset files.Asset) error {
 					writeJSON(w, http.StatusCreated, map[string]string{"path": asset.RelativePath})
 					return nil
@@ -1811,7 +1893,6 @@ func newHandlerWithKeyManager(logger *slog.Logger, repositoryRoot string, authSe
 			})
 			if err != nil {
 				operation.Abort()
-				noteAccess.needsRecovery()
 				writeProtectedNoteError(w, err)
 			}
 			return
@@ -1854,7 +1935,7 @@ func newHandlerWithKeyManager(logger *slog.Logger, repositoryRoot string, authSe
 				writeProtectedNoteError(w, err)
 				return
 			}
-			if err := lease.Commit(func() error {
+			if err := commitLease(r, lease, func() error {
 				writeAsset(asset, "no-store, private")
 				return nil
 			}); err != nil {
@@ -1902,7 +1983,7 @@ func newHandlerWithKeyManager(logger *slog.Logger, repositoryRoot string, authSe
 				writeProtectedNoteError(w, err)
 				return
 			}
-			if err := lease.Commit(func() error {
+			if err := commitLease(r, lease, func() error {
 				w.Header().Set("Cache-Control", "no-store, private")
 				writeJSON(w, http.StatusOK, map[string]any{"presentations": presentations})
 				return nil
@@ -1969,7 +2050,7 @@ func newHandlerWithKeyManager(logger *slog.Logger, repositoryRoot string, authSe
 				writeProtectedNoteError(w, err)
 				return
 			}
-			if err := lease.Commit(func() error {
+			if err := commitLease(r, lease, func() error {
 				if err := set(); err != nil {
 					logger.Warn("write image presentation metadata failed", "error", err)
 					writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "image presentation setting could not be saved"})
@@ -2024,7 +2105,7 @@ func newHandlerWithKeyManager(logger *slog.Logger, repositoryRoot string, authSe
 				writeProtectedNoteError(w, err)
 				return
 			}
-			if err := lease.Commit(func() error {
+			if err := commitLease(r, lease, func() error {
 				if err := remove(); err != nil {
 					logger.Warn("delete image presentation metadata failed", "error", err)
 					writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "image presentation setting could not be removed"})

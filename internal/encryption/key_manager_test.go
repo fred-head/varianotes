@@ -98,6 +98,130 @@ func TestKeyManagerStartsLockedAndRequiresPerSessionUnlock(t *testing.T) {
 	}
 }
 
+func TestSessionIdleTimeIsBoundToGrantAndPollingDoesNotRenew(t *testing.T) {
+	manager := newKeyManager(time.Minute)
+	defer manager.Close()
+	session, other := bytes.Repeat([]byte{1}, 32), bytes.Repeat([]byte{2}, 32)
+	if err := manager.Unlock("vault", session, bytes.Repeat([]byte{3}, VaultKeySize)); err != nil {
+		t.Fatal(err)
+	}
+	manager.mu.Lock()
+	state := manager.vaults["vault"]
+	state.lastActivity = time.Now().Add(-20 * time.Second)
+	state.expiresAt = state.lastActivity.Add(time.Minute)
+	deadline, activity := state.expiresAt, state.lastActivity
+	manager.mu.Unlock()
+	for range 3 {
+		unlocked, _, remaining, err := manager.SessionStatusWithIdleTime("vault", session)
+		if err != nil || !unlocked || remaining <= 35*time.Second || remaining > 40*time.Second {
+			t.Fatalf("remaining time: %v %v %v", unlocked, remaining, err)
+		}
+	}
+	manager.mu.Lock()
+	if state.expiresAt != deadline || state.lastActivity != activity {
+		t.Error("status polling renewed idle time")
+	}
+	manager.mu.Unlock()
+	if unlocked, _, remaining, err := manager.SessionStatusWithIdleTime("vault", other); err != nil || unlocked || remaining != 0 {
+		t.Fatalf("other session acquired display lease: %v %v %v", unlocked, remaining, err)
+	}
+	if err := manager.Touch("vault", session); err != nil {
+		t.Fatal(err)
+	}
+	if unlocked, _, remaining, err := manager.SessionStatusWithIdleTime("vault", session); err != nil || !unlocked || remaining <= 55*time.Second {
+		t.Fatalf("activity did not renew: %v %v %v", unlocked, remaining, err)
+	}
+	if err := manager.LockVault("vault", LockReasonManual); err != nil {
+		t.Fatal(err)
+	}
+	if unlocked, _, remaining, err := manager.SessionStatusWithIdleTime("vault", session); err != nil || unlocked || remaining != 0 {
+		t.Fatalf("locked display lease remains: %v %v %v", unlocked, remaining, err)
+	}
+}
+
+func TestPublicationDoesNotHoldStateMutexAndLockWaitsForBoundary(t *testing.T) {
+	manager := newKeyManager(time.Minute)
+	defer manager.Close()
+	session, key := bytes.Repeat([]byte{1}, 32), bytes.Repeat([]byte{2}, VaultKeySize)
+	if err := manager.Unlock("vault", session, key); err != nil {
+		t.Fatal(err)
+	}
+	lease, err := manager.BeginUse("vault", session)
+	if err != nil {
+		t.Fatal(err)
+	}
+	started, resume, done := make(chan struct{}), make(chan struct{}), make(chan error, 1)
+	go func() { done <- lease.Commit(func() error { close(started); <-resume; return nil }) }()
+	<-started
+	status := make(chan bool, 1)
+	go func() { status <- manager.IsUnlocked("vault", session) }()
+	select {
+	case <-status:
+	case <-time.After(time.Second):
+		close(resume)
+		<-done
+		t.Fatal("publication held manager state mutex")
+	}
+	locked := make(chan error, 1)
+	go func() { locked <- manager.LockVault("vault", LockReasonManual) }()
+	select {
+	case err := <-locked:
+		close(resume)
+		t.Fatalf("lock returned before active boundary completed: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(resume)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-locked:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("lock did not finish after boundary")
+	}
+	if manager.IsUnlocked("vault", session) {
+		t.Fatal("lock failed to revoke grant")
+	}
+}
+
+func TestIdleExpiryRejectsPreparedGuardAndCompletesWithoutStateMutexCycle(t *testing.T) {
+	manager := newKeyManager(30 * time.Millisecond)
+	defer manager.Close()
+	session, key := bytes.Repeat([]byte{1}, 32), bytes.Repeat([]byte{2}, VaultKeySize)
+	if err := manager.Unlock("vault", session, key); err != nil {
+		t.Fatal(err)
+	}
+	lease, err := manager.BeginUse("vault", session)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lease.Close()
+	events, cancel, err := manager.Subscribe("vault", session)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cancel()
+	deadline := time.After(time.Second)
+	for {
+		select {
+		case event := <-events:
+			if !event.Locked || event.Reason != LockReasonIdle {
+				continue
+			}
+			called := false
+			if err := lease.GuardCommit(func() error { called = true; return nil }); !errors.Is(err, ErrVaultLocked) || called {
+				t.Fatalf("expired boundary accepted: %v", err)
+			}
+			return
+		case <-deadline:
+			t.Fatal("idle lock failed to complete")
+		}
+	}
+}
+
 func TestKeyManagerIdleTimerLocksWithoutBackgroundRequestsExtendingIt(t *testing.T) {
 	manager := newKeyManager(120 * time.Millisecond)
 	defer manager.Close()

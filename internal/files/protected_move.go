@@ -196,15 +196,6 @@ func (r *Repository) moveWithCatalogPrepared(source, target, expectedToken, prot
 		}
 	}
 
-	// Decrypt protected payloads before the physical move. These buffers are
-	// cleared on every return; plaintext is written only when the caller made an
-	// explicit decrypt choice.
-	plaintext := make(map[string][]byte, len(selectedObjects))
-	defer func() {
-		for _, content := range plaintext {
-			clear(content)
-		}
-	}()
 	nextCatalog := cloneCatalog(catalog)
 	changes := make([]encryption.CiphertextChange, 0, len(selectedObjects)+len(planned))
 	updatedContent := make(map[string]string)
@@ -213,13 +204,8 @@ func (r *Repository) moveWithCatalogPrepared(source, target, expectedToken, prot
 	}
 	newObjects := make([]encryption.CatalogObject, 0, len(nextCatalog.Objects))
 	for _, object := range nextCatalog.Objects {
-		original, selected := selectedObjects[object.ObjectID]
+		_, selected := selectedObjects[object.ObjectID]
 		if selected && object.Protected && protectionChoice == MoveProtectionDecrypt && !keepProtectedAssets[object.ObjectID] {
-			content, readErr := r.readProtectedBytesLimit(original, vaultKey, transactionPlaintextLimit(original.Kind), transactionPlaintextLimit(original.Kind)+(1<<20))
-			if readErr != nil {
-				return MoveLinkPreview{}, readErr
-			}
-			plaintext[original.ObjectID] = content
 			continue
 		}
 		if selected {
@@ -269,142 +255,28 @@ func (r *Repository) moveWithCatalogPrepared(source, target, expectedToken, prot
 		}
 	}
 
-	if protectionChoice == MoveProtectionDecrypt {
-		for _, object := range selectedObjects {
-			if !object.Protected || keepProtectedAssets[object.ObjectID] {
-				continue
-			}
-			physicalPath := object.PhysicalPath
-			stored, readErr := r.content.read(physicalPath, transactionPlaintextLimit(object.Kind)+(1<<20))
-			if readErr != nil {
-				return MoveLinkPreview{}, readErr
-			}
-			movedPhysicalPath := remapSelectedMovePath(object.LogicalPath, source, target, sourceIsFolder) + ".age"
-			changes = append(changes, encryption.CiphertextChange{Path: movedPhysicalPath, Delete: true, ExpectedSHA256: encryption.CiphertextSHA256(stored.Bytes)})
-			clear(stored.Bytes)
-		}
-	}
-
-	if err := r.movePhysicalSelection(source, target, sourceIsFolder, catalog); err != nil {
+	changes, createDirectories, removeDirectories, err := r.prepareDurableMoveChangesLocked(source, target, sourceIsFolder, catalog, nextCatalog, vaultKey, planned, changes)
+	if err != nil {
 		return MoveLinkPreview{}, err
 	}
-	moved := true
-	rollbackMove := func() error {
-		if !moved {
-			return nil
+	defer func() {
+		for _, change := range changes {
+			clear(change.Ciphertext)
 		}
-		if err := r.movePhysicalSelection(target, source, sourceIsFolder, catalog); err != nil {
-			return err
-		}
-		moved = false
-		return nil
+	}()
+	transaction, err := journal.PrepareFilesystem(changes, nextCatalog, vaultKey, createDirectories, removeDirectories)
+	if err == nil && r.transactionPrepared != nil {
+		err = r.transactionPrepared()
 	}
-	for _, object := range selectedObjects {
-		if !object.Protected {
-			continue
-		}
-		movedPath := remapSelectedMovePath(object.LogicalPath, source, target, sourceIsFolder)
-		movedObject := object
-		movedObject.LogicalPath = movedPath
-		movedObject.PhysicalPath = movedPath + ".age"
-		stored, readErr := r.content.read(movedObject.PhysicalPath, transactionPlaintextLimit(object.Kind)+(1<<20))
-		if readErr == nil {
-			readErr = encryption.VerifyCatalogCiphertext(movedObject, stored.Bytes)
-			clear(stored.Bytes)
-		}
-		if readErr != nil {
-			rollbackErr := rollbackMove()
-			return MoveLinkPreview{}, errors.Join(ErrProtectedContentCorrupt, readErr, moveRollbackError(rollbackErr))
-		}
-	}
-	plainWrites := make([]plannedLinkFile, 0)
-	createdPlainPaths := make([]string, 0, len(plaintext))
-	rollbackPlainWrites := func() error {
-		var rollbackErr error
-		for index := len(plainWrites) - 1; index >= 0; index-- {
-			item := plainWrites[index]
-			current, readErr := r.content.read(item.newPath, maxMarkdownSize)
-			if readErr != nil {
-				rollbackErr = errors.Join(rollbackErr, readErr)
-				continue
-			}
-			if string(current.Bytes) != item.updated {
-				rollbackErr = errors.Join(rollbackErr, ErrConflict)
-				continue
-			}
-			if _, writeErr := r.content.write(item.newPath, []byte(item.content), current.Version, maxMarkdownSize); writeErr != nil {
-				rollbackErr = errors.Join(rollbackErr, writeErr)
-			}
-		}
-		for index := len(createdPlainPaths) - 1; index >= 0; index-- {
-			if removeErr := r.content.remove(createdPlainPaths[index]); removeErr != nil && !errors.Is(removeErr, fs.ErrNotExist) {
-				rollbackErr = errors.Join(rollbackErr, removeErr)
-			}
-		}
-		return rollbackErr
-	}
-	if protectionChoice == MoveProtectionDecrypt {
-		for _, object := range selectedObjects {
-			if !object.Protected || keepProtectedAssets[object.ObjectID] {
-				continue
-			}
-			movedPath := remapSelectedMovePath(object.LogicalPath, source, target, sourceIsFolder)
-			if object.Kind == encryption.CatalogObjectAsset {
-				if _, typeErr := supportedImageType(plaintext[object.ObjectID]); typeErr != nil {
-					rollbackErr := errors.Join(rollbackPlainWrites(), rollbackMove())
-					return MoveLinkPreview{}, errors.Join(typeErr, moveRollbackError(rollbackErr))
-				}
-			}
-			if writeErr := r.content.writeNew(movedPath, plaintext[object.ObjectID], 0o644); writeErr != nil {
-				rollbackErr := errors.Join(rollbackPlainWrites(), rollbackMove())
-				return MoveLinkPreview{}, errors.Join(writeErr, moveRollbackError(rollbackErr))
-			}
-			createdPlainPaths = append(createdPlainPaths, movedPath)
-		}
-	}
-	for _, item := range planned {
-		object, protected := catalogNote(catalog, item.oldPath)
-		if protected && object.Protected {
-			selected := pathSelectedForMove(item.oldPath, source, sourceIsFolder)
-			if protectionChoice != MoveProtectionDecrypt || !selected {
-				continue
-			}
-		}
-		current, readErr := r.content.read(item.newPath, maxMarkdownSize)
-		if errors.Is(readErr, fs.ErrNotExist) && item.oldPath != item.newPath {
-			// A catalog-backed protected note has no plaintext target path.
-			continue
-		}
-		if readErr != nil {
-			rollbackErr := errors.Join(rollbackPlainWrites(), rollbackMove())
-			return MoveLinkPreview{}, errors.Join(readErr, moveRollbackError(rollbackErr))
-		}
-		if string(current.Bytes) == item.updated {
-			continue
-		}
-		if string(current.Bytes) != item.afterMove {
-			rollbackErr := errors.Join(rollbackPlainWrites(), rollbackMove())
-			return MoveLinkPreview{}, errors.Join(fmt.Errorf("note %q changed during link rewrite: %w", item.newPath, ErrConflict), moveRollbackError(rollbackErr))
-		}
-		if _, writeErr := r.content.write(item.newPath, []byte(item.updated), current.Version, maxMarkdownSize); writeErr != nil {
-			rollbackErr := errors.Join(rollbackPlainWrites(), rollbackMove())
-			return MoveLinkPreview{}, errors.Join(writeErr, moveRollbackError(rollbackErr))
-		}
-		plainWrites = append(plainWrites, item)
-	}
-
-	transaction, err := journal.Prepare(changes, nextCatalog, vaultKey)
 	if err == nil {
 		err = transaction.Commit()
+	} else if transaction != nil {
+		err = errors.Join(err, transaction.Abort())
 	}
 	if err != nil {
-		if errors.Is(err, encryption.ErrTransactionNeedsRecovery) {
-			return MoveLinkPreview{}, err
-		}
-		rollbackErr := errors.Join(rollbackPlainWrites(), rollbackMove())
-		return MoveLinkPreview{}, errors.Join(err, moveRollbackError(rollbackErr))
+		return MoveLinkPreview{}, err
 	}
-	moved = false
+
 	return preview, nil
 }
 
@@ -669,59 +541,4 @@ func parseMarkdownAssetLinks(notePath, content string) []linkOccurrence {
 		})
 	}
 	return result
-}
-
-func (r *Repository) movePhysicalSelection(source, target string, folder bool, catalog encryption.Catalog) error {
-	if folder {
-		if err := r.content.rename(source, target); err != nil {
-			return err
-		}
-		_ = r.content.syncDir(path.Dir(source))
-		if err := r.content.syncDir(path.Dir(target)); err != nil {
-			rollbackErr := r.content.rename(target, source)
-			return errors.Join(err, moveRollbackError(rollbackErr))
-		}
-		return nil
-	}
-	sourceObject, protected := catalogNote(catalog, source)
-	if !protected {
-		sourceObject, protected = catalogNote(catalog, target)
-	}
-	from, to := source, target
-	if protected && sourceObject.Protected {
-		from += ".age"
-		to += ".age"
-	}
-	if err := r.content.rename(from, to); err != nil {
-		return err
-	}
-	sourceAssets, targetAssets := noteAssetsPath(source), noteAssetsPath(target)
-	assetsExist, err := validateOwnedAssets(r.content, sourceAssets)
-	if err != nil {
-		rollbackErr := r.content.rename(to, from)
-		return errors.Join(err, moveRollbackError(rollbackErr))
-	}
-	if assetsExist {
-		if _, err := r.content.lstat(targetAssets); err == nil {
-			rollbackErr := r.content.rename(to, from)
-			return errors.Join(ErrAlreadyExists, moveRollbackError(rollbackErr))
-		} else if !errors.Is(err, fs.ErrNotExist) {
-			rollbackErr := r.content.rename(to, from)
-			return errors.Join(err, moveRollbackError(rollbackErr))
-		}
-		if err := r.content.rename(sourceAssets, targetAssets); err != nil {
-			rollbackErr := r.content.rename(to, from)
-			return errors.Join(err, moveRollbackError(rollbackErr))
-		}
-	}
-	_ = r.content.syncDir(path.Dir(from))
-	if err := r.content.syncDir(path.Dir(to)); err != nil {
-		var rollbackErr error
-		if assetsExist {
-			rollbackErr = errors.Join(rollbackErr, r.content.rename(targetAssets, sourceAssets))
-		}
-		rollbackErr = errors.Join(rollbackErr, r.content.rename(to, from))
-		return errors.Join(err, moveRollbackError(rollbackErr))
-	}
-	return nil
 }

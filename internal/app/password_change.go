@@ -86,10 +86,7 @@ func (c *vaultPasswordChangeCoordinator) PreparePasswordChange(ctx context.Conte
 		if err != nil {
 			return nil, fmt.Errorf("unlock registered vault %q: %w", entry.ID, err)
 		}
-		catalogID, idErr := catalogStore.ReadVaultID()
-		if idErr == nil {
-			_, idErr = catalogStore.Load(vaultKey, catalogID)
-		}
+		_, idErr := catalogStore.Load(vaultKey, registeredCatalogID(entry.ID))
 		newEnvelope, wrapErr := encryption.EncryptVaultKey(newPassword, vaultKey)
 		clear(vaultKey)
 		if idErr != nil {
@@ -199,13 +196,12 @@ func (c *vaultPasswordChangeCoordinator) apply(ctx context.Context, encoded []by
 		if err != nil || !state.hasCatalog || !state.hasEnvelope {
 			return errors.Join(fmt.Errorf("registered vault %q encryption metadata is unavailable", entry.ID), err)
 		}
-		catalogBytes, err := readRegularFile(state.catalogPath, 16<<20)
-		if err != nil {
-			return fmt.Errorf("read registered vault %q catalog: %w", entry.ID, err)
-		}
-		digest := sha256.Sum256(catalogBytes)
-		if hex.EncodeToString(digest[:]) != update.CatalogSHA256 {
-			return fmt.Errorf("registered vault %q catalog changed during password change", entry.ID)
+		// Content saves keep the data key and can legitimately change catalog
+		// bytes after preparation. Replay/rollback depends on exact old/new
+		// envelopes, never the mutable content snapshot. The prepare step already
+		// authenticated the catalog and key against this registration.
+		if err := checkRegisteredCatalogIdentity(state.catalogPath, entry.ID); err != nil {
+			return err
 		}
 		store, err := encryption.NewVaultKeyEnvelopeStore(state.envelopePath)
 		if err != nil {
@@ -235,18 +231,19 @@ func (c *vaultPasswordChangeCoordinator) apply(ctx context.Context, encoded []by
 		}
 		switch {
 		case bytes.Equal(currentBytes, targetBytes):
-			continue
+			// A visible prior rename may still lack its directory barrier.
+			// Replay identical authenticated bytes through the durable writer.
 		case bytes.Equal(currentBytes, sourceBytes):
-			if forward {
-				err = store.Save(newEnvelope)
-			} else {
-				err = store.Save(oldEnvelope)
-			}
-			if err != nil {
-				return fmt.Errorf("replace registered vault %q key envelope: %w", entry.ID, err)
-			}
 		default:
 			return fmt.Errorf("registered vault %q key envelope changed during password change", entry.ID)
+		}
+		if forward {
+			err = store.Save(newEnvelope)
+		} else {
+			err = store.Save(oldEnvelope)
+		}
+		if err != nil {
+			return fmt.Errorf("replace registered vault %q key envelope: %w", entry.ID, err)
 		}
 	}
 	return nil
@@ -350,6 +347,30 @@ func inspectVaultProtection(entry notebookRecord, registryPath string) (vaultPro
 func vaultEncryptionDirectory(registryPath, notebookID string) string {
 	digest := sha256.Sum256([]byte(notebookID))
 	return filepath.Join(filepath.Dir(registryPath), "encryption", hex.EncodeToString(digest[:]))
+}
+
+// registeredCatalogID binds authenticated vault metadata to its independently
+// configured registration. Never derive the expected identity from the catalog
+// being checked, or enroll an existing catalog automatically. Unbound pre-release
+// fixtures remain decryptable externally but must fail closed in the app.
+func registeredCatalogID(notebookID string) string {
+	digest := sha256.Sum256([]byte("varianotes/registered-vault-catalog/v1\x00" + notebookID))
+	return hex.EncodeToString(digest[:16])
+}
+
+func checkRegisteredCatalogIdentity(filename, notebookID string) error {
+	store, err := encryption.NewCatalogStore(filename)
+	if err != nil {
+		return err
+	}
+	id, err := store.ReadVaultID()
+	if err != nil {
+		return err
+	}
+	if id != registeredCatalogID(notebookID) {
+		return encryption.ErrCatalogAuthentication
+	}
+	return nil
 }
 
 func validateRegisteredVault(entry notebookRecord) error {

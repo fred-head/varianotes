@@ -6,6 +6,57 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Fixed
+
+- M31 exports and repository instances share vault synchronization and preserve
+  active Save/Move/Restore transactions through commit or abort. Protected
+  Trash reconciliation recovers and reloads the current catalog under those
+  locks, retaining restore mappings across interrupted commits/finalization.
+  B3/B4 and further security review remain open; activation stays disabled.
+
+- M31 recovery repeats commit, content, catalog and key-envelope durability
+  barriers before completing interrupted work. Serial protected Trash paths journal their
+  destination directories and preserves durable restore metadata across
+  interrupted finalization. Further security review remains required.
+
+- M31 pending unlock requests are fenced against HTTP manual lock, logout
+  and session revocation. Online CLI revocation coordination remains open.
+
+- M31 protected views hide plaintext on lock-channel or connection failures
+  and enforce a local display deadline when lock events stop arriving.
+  Reconnection requires confirmed session status; hidden drafts stay in tab
+  memory. Productive encryption activation remains disabled.
+
+- M31 export password reauthentication now shares the bounded credential slot
+  and persistent failure throttle with vault unlock, including across restarts.
+
+- M31 locks discard conflict and backlink comparisons and reject late content
+  responses across lock generations and vault switches. Unsaved drafts stay
+  hidden in tab memory and remain available after unlocking.
+
+- M31 Move/Trash commits recheck the session and lock generation before changing
+  live content. Manual and idle locks reject prepared late mutations; content
+  preparation and publication now use a consistent lock order without holding
+  the key-manager state mutex during filesystem or network work.
+
+- M31 password and recovery journal replay permits concurrent content saves
+  with the unchanged data key, preserving ciphertext and preventing legitimate
+  catalog changes from permanently blocking authentication startup.
+
+- M31 moves, ordinary backlink updates, and explicit decrypt restores stage
+  encrypted data before the durable journal decision. Directory plans and
+  plaintext publication now recover after interruption; unexpected target
+  files are retained instead of overwritten during recovery.
+
+- Bind M31 catalog and journal recovery to the independently registered vault
+  identity. Foreign packages and unbound pre-release fixtures fail closed
+  without rewriting or deleting encrypted data.
+
+- M31 protection preflight rejects existing plaintext attachment references on
+  protected saves and unsupported local attachments during conversion. ZIP
+  export rejects unregistered plaintext descendants of protected folders before
+  streaming. Encryption activation remains disabled pending the M31 gates.
+
 ### Added
 
 - Added M31P16 protection status, per-session unlock and manual lock, recovery

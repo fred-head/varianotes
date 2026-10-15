@@ -12,6 +12,8 @@ import (
 	"strings"
 	"sync"
 	"unicode"
+
+	"github.com/fred-head/varianotes/internal/vaultsync"
 )
 
 const maxMarkdownSize = 10 << 20
@@ -27,19 +29,21 @@ var (
 )
 
 type Node struct {
-	Name                 string `json:"name"`
-	Path                 string `json:"path"`
-	Type                 string `json:"type"`
-	Protected            bool   `json:"protected,omitempty"`
-	ProtectionInherited  bool   `json:"protectionInherited,omitempty"`
-	Children             []Node `json:"children,omitempty"`
+	Name                string `json:"name"`
+	Path                string `json:"path"`
+	Type                string `json:"type"`
+	Protected           bool   `json:"protected,omitempty"`
+	ProtectionInherited bool   `json:"protectionInherited,omitempty"`
+	Children            []Node `json:"children,omitempty"`
 }
 
 type Repository struct {
 	root    string
-	trashMu sync.Mutex
-	moveMu  sync.Mutex
+	trashMu *sync.Mutex
+	moveMu  *sync.Mutex
 	content *contentStore
+	// Test-only pause/error boundary before a filesystem transaction commits.
+	transactionPrepared func() error
 }
 
 type Markdown struct {
@@ -49,7 +53,7 @@ type Markdown struct {
 
 func NewRepository(root string) (*Repository, error) {
 	if strings.TrimSpace(root) == "" {
-		return &Repository{content: &contentStore{}}, nil
+		return &Repository{trashMu: &sync.Mutex{}, moveMu: &sync.Mutex{}, content: &contentStore{mu: &sync.RWMutex{}}}, nil
 	}
 
 	absolute, err := filepath.Abs(root)
@@ -69,7 +73,11 @@ func NewRepository(root string) (*Repository, error) {
 	}
 
 	cleanRoot := filepath.Clean(resolved)
-	return &Repository{root: cleanRoot, content: &contentStore{root: cleanRoot}}, nil
+	coordination := vaultsync.ForRoot(cleanRoot)
+	return &Repository{
+		root: cleanRoot, trashMu: &coordination.Trash, moveMu: &coordination.Move,
+		content: &contentStore{root: cleanRoot, mu: &coordination.Content},
+	}, nil
 }
 
 func (r *Repository) Configured() bool {

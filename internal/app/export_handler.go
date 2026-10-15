@@ -1,6 +1,8 @@
 package app
 
 import (
+	"bufio"
+	"context"
 	"crypto/subtle"
 	"errors"
 	"log/slog"
@@ -77,9 +79,7 @@ func handleNotebookExport(w http.ResponseWriter, r *http.Request, logger *slog.L
 			return
 		}
 		setNotebookExportHeaders(w, record)
-		err = lease.UseKey(func(key []byte) error {
-			return repository.WriteArchiveWithCatalog(w, catalog, key, snapshot.Fingerprint, lease.CheckCurrent)
-		})
+		err = writeProtectedNotebookArchive(r.Context(), w, repository, catalog, snapshot.Fingerprint, sessions, manager, lease)
 		if err != nil {
 			logger.Warn("notebook export stream stopped", "notebook", record.ID)
 		}
@@ -135,15 +135,27 @@ func handleNotebookExport(w http.ResponseWriter, r *http.Request, logger *slog.L
 		return
 	}
 	setNotebookExportHeaders(w, record)
-	err = lease.UseKey(func(key []byte) error {
-		return repository.WriteArchiveWithCatalog(w, catalog, key, grant.fingerprint, lease.CheckCurrent)
-	})
+	err = writeProtectedNotebookArchive(r.Context(), w, repository, catalog, grant.fingerprint, sessions, manager, lease)
 	if err != nil {
 		logger.Warn("reauthenticated notebook export stream stopped", "notebook", record.ID)
 	}
 }
 
-func handleNotebookExportReauthentication(w http.ResponseWriter, r *http.Request, metadataPath string, sessions *auth.Sessions, manager *encryption.KeyManager, grants *exportGrantStore) {
+func writeProtectedNotebookArchive(ctx context.Context, destination http.ResponseWriter, repository *files.Repository, catalog encryption.Catalog, fingerprint string, sessions *auth.Sessions, manager *encryption.KeyManager, lease *encryption.KeyLease) error {
+	buffered := bufio.NewWriterSize(&protectedSessionWriter{
+		ctx: ctx, sessions: sessions, manager: manager, lease: lease, destination: destination,
+	}, 64<<10)
+	if err := lease.UseKey(func(key []byte) error {
+		return repository.WriteArchiveWithCatalog(buffered, catalog, key, fingerprint, lease.CheckCurrent)
+	}); err != nil {
+		return err
+	}
+	return buffered.Flush()
+}
+
+// The route holds the shared credential slot across decoding, derivation and
+// grant issuance. Callbacks persist only actual password rejection/success.
+func handleNotebookExportReauthentication(w http.ResponseWriter, r *http.Request, metadataPath string, sessions *auth.Sessions, manager *encryption.KeyManager, grants *exportGrantStore, credentialRejected func() bool, credentialAccepted func()) {
 	setExportNoStore(w)
 	if sessions == nil {
 		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "authenticated session is required"})
@@ -223,6 +235,9 @@ func handleNotebookExportReauthentication(w http.ResponseWriter, r *http.Request
 	})
 	input.Password = ""
 	if invalidPassword {
+		if !credentialRejected() {
+			return
+		}
 		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "vault password is incorrect", "code": "invalid_credentials"})
 		return
 	}
@@ -234,6 +249,7 @@ func handleNotebookExportReauthentication(w http.ResponseWriter, r *http.Request
 		writeJSON(w, http.StatusConflict, map[string]string{"error": "vault has no protected content", "code": "export_not_protected"})
 		return
 	}
+	credentialAccepted()
 	writeJSON(w, http.StatusOK, map[string]string{"token": issuedToken})
 }
 

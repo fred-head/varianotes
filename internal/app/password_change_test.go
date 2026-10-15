@@ -284,6 +284,7 @@ func passwordChangeFixture(t *testing.T, count int, includeTrash bool) (string, 
 		if err != nil {
 			t.Fatal(err)
 		}
+		catalog.VaultID = registeredCatalogID(id)
 		key, err := encryption.NewVaultKey()
 		if err != nil {
 			t.Fatal(err)

@@ -17,6 +17,8 @@ import (
 	"sort"
 	"strings"
 	"sync"
+
+	"github.com/fred-head/varianotes/internal/vaultsync"
 )
 
 const (
@@ -53,6 +55,9 @@ type CiphertextChange struct {
 	// RejectHardlinks makes deletion fail closed if another path still shares
 	// the source inode. It is used when converting plaintext originals.
 	RejectHardlinks bool
+	// PublishPlaintext is only for an explicitly approved decrypt operation or
+	// ordinary backlink update. Staging remains encrypted until durable commit.
+	PublishPlaintext bool
 }
 
 // TransactionJournal coordinates ciphertext replacements and an authenticated
@@ -61,47 +66,58 @@ type CiphertextChange struct {
 // staged catalog live beside the catalog in server-owned application metadata.
 // Only one backend writer per vault is supported.
 type TransactionJournal struct {
-	vaultRoot string
-	catalog   *CatalogStore
-	name      string
-	mu        sync.Mutex
-	fault     func(string) error
+	vaultRoot    string
+	catalog      *CatalogStore
+	name         string
+	mu           *sync.Mutex
+	coordination *vaultsync.Coordinator
+	fault        func(string) error
+	parent       *TransactionJournal
+	guard        func(func() error) error
 }
 
 type transactionRecord struct {
-	Version       uint8               `json:"version"`
-	ID            string              `json:"id"`
-	VaultID       string              `json:"vault_id"`
-	State         string              `json:"state"`
-	Changes       []transactionChange `json:"changes"`
-	CatalogStage  string              `json:"catalog_stage"`
-	CatalogSHA256 string              `json:"catalog_sha256"`
-	MAC           string              `json:"authentication"`
+	Version           uint8               `json:"version"`
+	ID                string              `json:"id"`
+	VaultID           string              `json:"vault_id"`
+	State             string              `json:"state"`
+	Changes           []transactionChange `json:"changes"`
+	CatalogStage      string              `json:"catalog_stage"`
+	CatalogSHA256     string              `json:"catalog_sha256"`
+	MAC               string              `json:"authentication"`
+	CreateDirectories []string            `json:"create_directories,omitempty"`
+	RemoveDirectories []string            `json:"remove_directories,omitempty"`
 }
 
 type transactionChange struct {
-	Path                string `json:"path"`
-	ObjectID            string `json:"object_id,omitempty"`
-	Stage               string `json:"stage,omitempty"`
-	SHA256              string `json:"sha256,omitempty"`
-	Delete              bool   `json:"delete,omitempty"`
-	ExpectedFingerprint string `json:"expected_fingerprint,omitempty"`
-	RejectHardlinks     bool   `json:"reject_hardlinks,omitempty"`
+	Path                 string              `json:"path"`
+	ObjectID             string              `json:"object_id,omitempty"`
+	Stage                string              `json:"stage,omitempty"`
+	SHA256               string              `json:"sha256,omitempty"`
+	Delete               bool                `json:"delete,omitempty"`
+	ExpectedFingerprint  string              `json:"expected_fingerprint,omitempty"`
+	RejectHardlinks      bool                `json:"reject_hardlinks,omitempty"`
+	PlaintextFingerprint string              `json:"plaintext_fingerprint,omitempty"`
+	ContentKeyEnvelope   *ContentKeyEnvelope `json:"content_key_envelope,omitempty"`
+	PriorFingerprint     string              `json:"prior_fingerprint,omitempty"`
 }
 
 type transactionPayload struct {
-	Version       uint8               `json:"version"`
-	ID            string              `json:"id"`
-	VaultID       string              `json:"vault_id"`
-	State         string              `json:"state"`
-	Changes       []transactionChange `json:"changes"`
-	CatalogStage  string              `json:"catalog_stage"`
-	CatalogSHA256 string              `json:"catalog_sha256"`
+	Version           uint8               `json:"version"`
+	ID                string              `json:"id"`
+	VaultID           string              `json:"vault_id"`
+	State             string              `json:"state"`
+	Changes           []transactionChange `json:"changes"`
+	CatalogStage      string              `json:"catalog_stage"`
+	CatalogSHA256     string              `json:"catalog_sha256"`
+	CreateDirectories []string            `json:"create_directories,omitempty"`
+	RemoveDirectories []string            `json:"remove_directories,omitempty"`
 }
 
 // PreparedTransaction is a durable prepare record plus ciphertext staging.
 // The original target fingerprints are held only in memory; a restart before
 // Commit discards the prepared transaction and leaves originals untouched.
+// Callers must Commit or Abort it to release its live vault ownership.
 type PreparedTransaction struct {
 	journal      *TransactionJournal
 	record       transactionRecord
@@ -109,10 +125,33 @@ type PreparedTransaction struct {
 	prior        map[string]string
 	priorCatalog string
 	used         bool
+	guard        func(func() error) error
 }
 
-// NewTransactionJournal binds a journal to one vault root and its catalog.
-func NewTransactionJournal(vaultDirectory string, catalog *CatalogStore) (*TransactionJournal, error) {
+// WithCommitGuard scopes durable decisions to a caller's live lease without
+// modifying the shared journal or taking repository locks inside the guard.
+func (j *TransactionJournal) WithCommitGuard(guard func(func() error) error) *TransactionJournal {
+	if j == nil || guard == nil {
+		return nil
+	}
+	return &TransactionJournal{parent: j, guard: guard}
+}
+
+// GuardMutation also covers ordinary Trash paths in an encrypted vault. Those
+// callers must acquire all filesystem locks before entering this leaf guard.
+func (j *TransactionJournal) GuardMutation(work func() error) error {
+	if work == nil {
+		return ErrInvalidTransaction
+	}
+	if j != nil && j.guard != nil {
+		return j.guard(work)
+	}
+	return work()
+}
+
+// NewTransactionJournal binds a journal to one vault root and its catalog,
+// joining the process-lifetime coordination used by every instance of that root.
+func NewTransactionJournal(vaultDirectory string, catalog *CatalogStore, options ...TransactionJournalOptions) (*TransactionJournal, error) {
 	if catalog == nil || vaultDirectory == "" {
 		return nil, ErrInvalidTransaction
 	}
@@ -127,6 +166,10 @@ func NewTransactionJournal(vaultDirectory string, catalog *CatalogStore) (*Trans
 	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
 		return nil, ErrInvalidTransaction
 	}
+	absolute, err = filepath.EvalSymlinks(absolute)
+	if err != nil {
+		return nil, fmt.Errorf("resolve transaction vault root symlinks: %w", err)
+	}
 	relativeMetadata, err := filepath.Rel(filepath.Clean(absolute), catalog.directory)
 	if err != nil {
 		return nil, ErrInvalidTransaction
@@ -134,11 +177,36 @@ func NewTransactionJournal(vaultDirectory string, catalog *CatalogStore) (*Trans
 	if relativeMetadata == "." || (relativeMetadata != ".." && !strings.HasPrefix(relativeMetadata, ".."+string(filepath.Separator))) {
 		return nil, ErrInvalidTransaction
 	}
-	return &TransactionJournal{
-		vaultRoot: filepath.Clean(absolute),
-		catalog:   catalog,
-		name:      "." + catalog.name + ".transaction.json",
-	}, nil
+	coordination := vaultsync.ForRoot(filepath.Clean(absolute))
+	journal := &TransactionJournal{
+		vaultRoot:    filepath.Clean(absolute),
+		catalog:      catalog,
+		name:         "." + catalog.name + ".transaction.json",
+		mu:           &coordination.Journal,
+		coordination: coordination,
+	}
+	if len(options) > 1 {
+		return nil, ErrInvalidTransaction
+	}
+	if len(options) == 1 {
+		journal.fault = options[0].Fault
+	}
+	return journal, nil
+}
+
+// TransactionJournalOptions supplies a filesystem fault seam for deterministic
+// interruption tests. Production callers leave it unset.
+type TransactionJournalOptions struct {
+	Fault func(phase string) error
+}
+
+// CoordinatesVault lets repository callbacks verify that the shared filesystem
+// lock belongs to their canonical root, including commit-guard wrappers.
+func (j *TransactionJournal) CoordinatesVault(canonicalRoot string) bool {
+	if j != nil && j.parent != nil {
+		return j.parent.CoordinatesVault(canonicalRoot)
+	}
+	return j != nil && j.vaultRoot == canonicalRoot
 }
 
 // Prepare validates and fingerprints current targets, writes a durable
@@ -151,6 +219,24 @@ func (j *TransactionJournal) Prepare(changes []CiphertextChange, catalog Catalog
 // PrepareContext stages a transaction and aborts it if the caller cancels
 // before every ciphertext and the authenticated catalog have been verified.
 func (j *TransactionJournal) PrepareContext(ctx context.Context, changes []CiphertextChange, catalog Catalog, vaultKey []byte) (*PreparedTransaction, error) {
+	return j.prepareFilesystem(ctx, changes, catalog, vaultKey, nil, nil)
+}
+
+// PrepareFilesystem also journals directory creation/removal. Before commit
+// only empty destination directories and ciphertext stages may be created.
+// Prepared recovery removes them; committed recovery completes publication.
+func (j *TransactionJournal) PrepareFilesystem(changes []CiphertextChange, catalog Catalog, vaultKey []byte, createDirectories, removeDirectories []string) (*PreparedTransaction, error) {
+	return j.prepareFilesystem(context.Background(), changes, catalog, vaultKey, createDirectories, removeDirectories)
+}
+
+func (j *TransactionJournal) prepareFilesystem(ctx context.Context, changes []CiphertextChange, catalog Catalog, vaultKey []byte, createDirectories, removeDirectories []string) (*PreparedTransaction, error) {
+	if j != nil && j.parent != nil {
+		tx, err := j.parent.prepareFilesystem(ctx, changes, catalog, vaultKey, createDirectories, removeDirectories)
+		if err == nil {
+			tx.guard = j.guard
+		}
+		return tx, err
+	}
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -166,6 +252,9 @@ func (j *TransactionJournal) PrepareContext(ctx context.Context, changes []Ciphe
 	}
 	j.mu.Lock()
 	defer j.mu.Unlock()
+	if j.coordination.ActiveTransaction != "" {
+		return nil, ErrTransactionPending
+	}
 	priorCatalog, err := j.currentCatalogDigest()
 	if err != nil {
 		return nil, err
@@ -185,6 +274,11 @@ func (j *TransactionJournal) PrepareContext(ctx context.Context, changes []Ciphe
 		return nil, fmt.Errorf("open transaction vault root: %w", err)
 	}
 	defer root.Close()
+	createDirectories = sortedTransactionDirectories(createDirectories)
+	removeDirectories = sortedTransactionDirectories(removeDirectories)
+	if err := validatePlannedDirectories(root, createDirectories, removeDirectories); err != nil {
+		return nil, err
+	}
 	prior := make(map[string]string, len(changes))
 	previousObjects := make(map[string]CatalogObject, len(previousCatalog.Objects))
 	for _, object := range previousCatalog.Objects {
@@ -204,7 +298,7 @@ func (j *TransactionJournal) PrepareContext(ctx context.Context, changes []Ciphe
 		}
 		seen[change.Path] = struct{}{}
 		if change.Delete {
-			if len(change.Ciphertext) != 0 || change.ObjectID != "" || change.ContentKeyEnvelope.Version != 0 || len(change.ContentKeyEnvelope.Ciphertext) != 0 || (change.ExpectedSHA256 != "" && !isSHA256Hex(change.ExpectedSHA256)) {
+			if change.PublishPlaintext || len(change.Ciphertext) != 0 || change.ObjectID != "" || change.ContentKeyEnvelope.Version != 0 || len(change.ContentKeyEnvelope.Ciphertext) != 0 || (change.ExpectedSHA256 != "" && !isSHA256Hex(change.ExpectedSHA256)) {
 				return nil, ErrInvalidTransaction
 			}
 		} else {
@@ -219,10 +313,14 @@ func (j *TransactionJournal) PrepareContext(ctx context.Context, changes []Ciphe
 				return nil, errors.Join(ErrInvalidTransaction, err)
 			}
 		}
-		if err := validateTransactionTarget(root, change.Path); err != nil {
+		if err := validatePlannedTransactionTarget(root, change.Path, createDirectories); err != nil {
 			return nil, err
 		}
 		prior[change.Path], err = transactionTargetDigest(root, change.Path)
+		if errors.Is(err, fs.ErrNotExist) && plannedTransactionParent(change.Path, createDirectories) {
+			err = nil
+			prior[change.Path] = ""
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -253,7 +351,11 @@ func (j *TransactionJournal) PrepareContext(ctx context.Context, changes []Ciphe
 	record := transactionRecord{
 		Version: transactionFormatVersion, ID: id, VaultID: catalog.VaultID, State: "prepared",
 		CatalogStage: transactionCatalogStageName(id), CatalogSHA256: transactionDigest(encodedCatalog),
-		Changes: make([]transactionChange, 0, len(changes)),
+		Changes:           make([]transactionChange, 0, len(changes)),
+		CreateDirectories: createDirectories, RemoveDirectories: removeDirectories,
+	}
+	if len(createDirectories)+len(removeDirectories) > 0 {
+		record.Version = 2
 	}
 	ordered := append([]CiphertextChange(nil), changes...)
 	sort.Slice(ordered, func(a, b int) bool { return ordered[a].Path < ordered[b].Path })
@@ -265,8 +367,30 @@ func (j *TransactionJournal) PrepareContext(ctx context.Context, changes []Ciphe
 		if !change.Delete {
 			entry.Stage = transactionContentStageName(id, index)
 			entry.SHA256 = transactionDigest(change.Ciphertext)
+			if change.PublishPlaintext {
+				record.Version = 2
+				plaintext, err := DecryptContent(vaultKey, change.ObjectID, change.Ciphertext, change.ContentKeyEnvelope)
+				if err != nil {
+					return nil, err
+				}
+				entry.PlaintextFingerprint = transactionSourceFingerprint(vaultKey, transactionDigest(plaintext))
+				clear(plaintext)
+				envelope := change.ContentKeyEnvelope
+				entry.ContentKeyEnvelope = &envelope
+			}
 		}
 		record.Changes = append(record.Changes, entry)
+	}
+	if record.Version == 2 {
+		for index := range record.Changes {
+			entry := &record.Changes[index]
+			if !entry.Delete {
+				entry.PriorFingerprint = "missing"
+				if digest := prior[entry.Path]; digest != "" {
+					entry.PriorFingerprint = transactionSourceFingerprint(vaultKey, digest)
+				}
+			}
+		}
 	}
 	if err := validateTransactionRecord(record); err != nil {
 		return nil, err
@@ -276,6 +400,9 @@ func (j *TransactionJournal) PrepareContext(ctx context.Context, changes []Ciphe
 	}
 	tx := &PreparedTransaction{
 		journal: j, record: record, key: append([]byte(nil), vaultKey...), prior: prior, priorCatalog: priorCatalog,
+	}
+	if err := j.createTransactionDirectories(root, record); err != nil {
+		return nil, j.abortPrepared(tx, err)
 	}
 	for index, change := range ordered {
 		if err := ctx.Err(); err != nil {
@@ -304,6 +431,7 @@ func (j *TransactionJournal) PrepareContext(ctx context.Context, changes []Ciphe
 	if err := ctx.Err(); err != nil {
 		return nil, j.abortPrepared(tx, err)
 	}
+	j.coordination.ActiveTransaction = tx.record.ID
 	return tx, nil
 }
 
@@ -323,11 +451,22 @@ func (tx *PreparedTransaction) CommitContext(ctx context.Context) error {
 	if tx == nil || tx.journal == nil || tx.used {
 		return ErrInvalidTransaction
 	}
+	if tx.guard != nil {
+		guard := tx.guard
+		tx.guard = nil
+		entered := false
+		err := guard(func() error { entered = true; return tx.CommitContext(ctx) })
+		if !entered {
+			err = errors.Join(err, tx.Abort())
+		}
+		return err
+	}
 	tx.used = true
 	defer clear(tx.key)
 	j := tx.journal
 	j.mu.Lock()
 	defer j.mu.Unlock()
+	defer tx.releaseOwnership()
 	root, err := os.OpenRoot(j.vaultRoot)
 	if err != nil {
 		return fmt.Errorf("open transaction vault root: %w", err)
@@ -400,6 +539,7 @@ func (tx *PreparedTransaction) Abort() error {
 	j := tx.journal
 	j.mu.Lock()
 	defer j.mu.Unlock()
+	defer tx.releaseOwnership()
 	record, err := j.loadRecord(tx.key)
 	if errors.Is(err, fs.ErrNotExist) {
 		return nil
@@ -413,15 +553,104 @@ func (tx *PreparedTransaction) Abort() error {
 	return tx.journal.cleanupRecord(record)
 }
 
-// Recover discards a prepared transaction because its live targets are still
-// the old state. A committed transaction is verified and completed forward.
+// Called under the shared journal lock, even when storage cleanup fails. Such
+// work is then orphaned and recoverable; it must not retain a live owner.
+func (tx *PreparedTransaction) releaseOwnership() {
+	if tx.journal.coordination.ActiveTransaction == tx.record.ID {
+		tx.journal.coordination.ActiveTransaction = ""
+	}
+}
+
+// Recover rejects live transactions and discards orphaned prepared work because
+// its targets are still the old state. Committed work is completed forward.
 // Callers must run it before serving affected content after a restart.
 func (j *TransactionJournal) Recover(vaultKey []byte) error {
-	if j == nil || len(vaultKey) != VaultKeySize {
+	return j.recoverForVault(vaultKey, "")
+}
+
+// RecoverForVault also checks the independently registered vault identity
+// before discarding stages or publishing a committed journal. Applications
+// must use this when a journal belongs to a registered vault.
+func (j *TransactionJournal) RecoverForVault(vaultKey []byte, expectedVaultID string) error {
+	if !isCatalogID(expectedVaultID) {
+		return ErrInvalidVaultID
+	}
+	return j.recoverForVault(vaultKey, expectedVaultID)
+}
+
+func (j *TransactionJournal) recoverForVault(vaultKey []byte, expectedVaultID string) error {
+	if j != nil && j.parent != nil {
+		return j.parent.recoverForVault(vaultKey, expectedVaultID)
+	}
+	return j.withRecoveryLock(vaultKey, expectedVaultID, func() error {
+		return j.recoverLocked(vaultKey, expectedVaultID)
+	})
+}
+
+// WithRecoveredCatalog authenticates the registered identity, recovers orphaned
+// work and loads the authoritative catalog under the shared vault lock. The
+// callback may inspect/reconcile files using its already-locked helpers; it
+// must not acquire Content or Journal again or prepare a transaction.
+func (j *TransactionJournal) WithRecoveredCatalog(vaultKey []byte, expectedVaultID string, work func(Catalog) error) error {
+	if !isCatalogID(expectedVaultID) || work == nil {
 		return ErrInvalidTransaction
 	}
+	if j != nil && j.parent != nil {
+		return j.parent.WithRecoveredCatalog(vaultKey, expectedVaultID, work)
+	}
+	return j.withRecoveryLock(vaultKey, expectedVaultID, func() error {
+		// Check registration before recovery can mutate live files.
+		if _, err := j.catalog.Load(vaultKey, expectedVaultID); err != nil {
+			return err
+		}
+		if err := j.recoverLocked(vaultKey, expectedVaultID); err != nil {
+			return err
+		}
+		catalog, err := j.catalog.Load(vaultKey, expectedVaultID)
+		if err != nil {
+			return err
+		}
+		return work(catalog)
+	})
+}
+
+func (j *TransactionJournal) withRecoveryLock(vaultKey []byte, expectedVaultID string, work func() error) error {
+	if j == nil || j.coordination == nil || len(vaultKey) != VaultKeySize {
+		return ErrInvalidTransaction
+	}
+	// Fail promptly for active prepared work: its owner may hold Content until
+	// a later commit/abort, including while a request waits for authorization.
+	j.mu.Lock()
+	err := j.checkRecoveryOwnership(vaultKey, expectedVaultID)
+	j.mu.Unlock()
+	if err != nil {
+		return err
+	}
+	j.coordination.Content.Lock()
+	defer j.coordination.Content.Unlock()
 	j.mu.Lock()
 	defer j.mu.Unlock()
+	if err := j.checkRecoveryOwnership(vaultKey, expectedVaultID); err != nil {
+		return err
+	}
+	return work()
+}
+
+func (j *TransactionJournal) checkRecoveryOwnership(vaultKey []byte, expectedVaultID string) error {
+	if j.coordination.ActiveTransaction == "" {
+		return nil
+	}
+	record, err := j.loadRecord(vaultKey)
+	if err != nil {
+		return err
+	}
+	if expectedVaultID != "" && record.VaultID != expectedVaultID {
+		return ErrCatalogAuthentication
+	}
+	return ErrTransactionPending
+}
+
+func (j *TransactionJournal) recoverLocked(vaultKey []byte, expectedVaultID string) error {
 	record, err := j.loadRecord(vaultKey)
 	if errors.Is(err, fs.ErrNotExist) {
 		return j.cleanupOrphanJournalStages()
@@ -429,11 +658,23 @@ func (j *TransactionJournal) Recover(vaultKey []byte) error {
 	if err != nil {
 		return err
 	}
+	if expectedVaultID != "" && record.VaultID != expectedVaultID {
+		return ErrCatalogAuthentication
+	}
 	if record.State == "prepared" {
+		if err := j.fail("transaction.recovery.prepared"); err != nil {
+			return err
+		}
 		if err := j.cleanupRecord(record); err != nil {
 			return errors.Join(ErrTransactionNeedsRecovery, err)
 		}
 		return nil
+	}
+	// A rename can be visible after a failed directory fsync or an abrupt
+	// process exit. Re-establish the forward-only decision before touching live
+	// content; merely reading a committed marker is not a durability barrier.
+	if err := j.saveRecord(record, vaultKey); err != nil {
+		return errors.Join(ErrTransactionNeedsRecovery, err)
 	}
 	root, err := os.OpenRoot(j.vaultRoot)
 	if err != nil {
@@ -586,6 +827,12 @@ func (j *TransactionJournal) applyCommitted(root *os.Root, record transactionRec
 	// digest, which makes recovery idempotent after a partial prior attempt.
 	for _, entry := range record.Changes {
 		if err := validateTransactionTarget(root, entry.Path); err != nil {
+			// Directory cleanup can already have removed a deleted source's
+			// parents before a later journal cleanup failure. Absence completes
+			// that delete; symlinks and other validation failures still block.
+			if entry.Delete && errors.Is(err, fs.ErrNotExist) {
+				continue
+			}
 			return err
 		}
 		if entry.Delete {
@@ -595,8 +842,16 @@ func (j *TransactionJournal) applyCommitted(root *os.Root, record transactionRec
 		if err != nil {
 			return err
 		}
-		if current == entry.SHA256 {
+		if transactionChangeInstalled(entry, current, vaultKey) {
+			// This target may be visible from an interrupted rename whose parent
+			// was never synced. Secure it before any source delete can follow.
+			if err := j.syncVaultDirectory(root, path.Dir(entry.Path), "transaction.content.directory_sync"); err != nil {
+				return err
+			}
 			continue
+		}
+		if entry.PriorFingerprint != "" && !transactionPriorMatches(entry, current, vaultKey) {
+			return ErrTransactionConflict
 		}
 		stagePath := path.Join(path.Dir(entry.Path), entry.Stage)
 		stageDigest, err := transactionFileDigest(root, stagePath)
@@ -637,40 +892,23 @@ func (j *TransactionJournal) applyCommitted(root *os.Root, record transactionRec
 		return errors.Join(ErrTransactionJournalCorrupt, err)
 	}
 
+	// Publish and sync every destination before removing any source. The
+	// authenticated record remains path-sorted; replay ordering is independent.
 	for _, entry := range record.Changes {
 		if entry.Delete {
-			if err := validateTransactionTarget(root, entry.Path); err != nil {
-				return err
-			}
-			if info, err := root.Lstat(filepath.FromSlash(entry.Path)); err == nil {
-				if entry.ExpectedFingerprint != "" {
-					actual, digestErr := transactionTargetDigest(root, entry.Path)
-					if digestErr != nil || transactionSourceFingerprint(vaultKey, actual) != entry.ExpectedFingerprint {
-						return errors.Join(ErrTransactionNeedsRecovery, ErrTransactionConflict, digestErr)
-					}
-				}
-				if entry.RejectHardlinks && !hasSingleLink(info) {
-					return errors.Join(ErrTransactionNeedsRecovery, ErrInvalidTransaction)
-				}
-				if err := j.fail("transaction.content.delete"); err != nil {
-					return err
-				}
-				if err := root.Remove(filepath.FromSlash(entry.Path)); err != nil {
-					return fmt.Errorf("remove transaction target %q: %w", entry.Path, err)
-				}
-			} else if !errors.Is(err, fs.ErrNotExist) {
-				return err
-			}
-			if err := j.syncVaultDirectory(root, path.Dir(entry.Path), "transaction.content.directory_sync"); err != nil {
-				return err
-			}
 			continue
 		}
 		current, err := transactionTargetDigest(root, entry.Path)
 		if err != nil {
 			return err
 		}
-		if current == entry.SHA256 {
+		if transactionChangeInstalled(entry, current, vaultKey) {
+			continue
+		}
+		if entry.PlaintextFingerprint != "" {
+			if err := j.publishTransactionPlaintext(root, entry, vaultKey); err != nil {
+				return err
+			}
 			continue
 		}
 		stagePath := path.Join(path.Dir(entry.Path), entry.Stage)
@@ -685,6 +923,44 @@ func (j *TransactionJournal) applyCommitted(root *os.Root, record transactionRec
 		}
 	}
 
+	for _, entry := range record.Changes {
+		if !entry.Delete {
+			continue
+		}
+		if err := validateTransactionTarget(root, entry.Path); err != nil {
+			if errors.Is(err, fs.ErrNotExist) {
+				if err := j.syncExistingVaultAncestor(root, path.Dir(entry.Path)); err != nil {
+					return err
+				}
+				continue
+			}
+			return err
+		}
+		if info, err := root.Lstat(filepath.FromSlash(entry.Path)); err == nil {
+			if entry.ExpectedFingerprint != "" {
+				actual, digestErr := transactionTargetDigest(root, entry.Path)
+				if digestErr != nil || transactionSourceFingerprint(vaultKey, actual) != entry.ExpectedFingerprint {
+					return errors.Join(ErrTransactionNeedsRecovery, ErrTransactionConflict, digestErr)
+				}
+			}
+			if entry.RejectHardlinks && !hasSingleLink(info) {
+				return errors.Join(ErrTransactionNeedsRecovery, ErrInvalidTransaction)
+			}
+			if err := j.fail("transaction.content.delete"); err != nil {
+				return err
+			}
+			if err := root.Remove(filepath.FromSlash(entry.Path)); err != nil {
+				return fmt.Errorf("remove transaction target %q: %w", entry.Path, err)
+			}
+		} else if !errors.Is(err, fs.ErrNotExist) {
+			return err
+		}
+		if err := j.syncVaultDirectory(root, path.Dir(entry.Path), "transaction.content.directory_sync"); err != nil {
+			return err
+		}
+		continue
+	}
+
 	catalogDigest, err = transactionFileDigest(metadataRoot, j.catalog.name)
 	if err != nil && !errors.Is(err, fs.ErrNotExist) {
 		return err
@@ -696,9 +972,13 @@ func (j *TransactionJournal) applyCommitted(root *os.Root, record transactionRec
 		if err := metadataRoot.Rename(record.CatalogStage, j.catalog.name); err != nil {
 			return fmt.Errorf("install transaction catalog: %w", err)
 		}
-		if err := syncTransactionDirectory(metadataRoot, ".", j.fail, "transaction.catalog.directory_sync"); err != nil {
-			return err
-		}
+	}
+	// Equality after restart does not prove the catalog rename was durable.
+	if err := syncTransactionDirectory(metadataRoot, ".", j.fail, "transaction.catalog.directory_sync"); err != nil {
+		return err
+	}
+	if err := j.removeTransactionDirectories(root, record.RemoveDirectories); err != nil {
+		return err
 	}
 	return j.cleanupRecord(record)
 }
@@ -809,9 +1089,17 @@ func (j *TransactionJournal) cleanupRecord(record transactionRecord) error {
 		stagePath := path.Join(path.Dir(entry.Path), entry.Stage)
 		if removeErr := removeTransactionFile(root, stagePath); removeErr != nil {
 			result = errors.Join(result, removeErr)
+		} else if _, statErr := root.Lstat(filepath.FromSlash(path.Dir(entry.Path))); errors.Is(statErr, fs.ErrNotExist) {
+			continue
 		} else if syncErr := j.syncVaultDirectory(root, path.Dir(entry.Path), "transaction.cleanup.content_sync"); syncErr != nil {
 			result = errors.Join(result, syncErr)
 		}
+		if entry.PlaintextFingerprint != "" {
+			result = errors.Join(result, removeTransactionFile(root, transactionPlainTemporary(entry)))
+		}
+	}
+	if record.State == "prepared" {
+		result = errors.Join(result, j.removeTransactionDirectories(root, record.CreateDirectories))
 	}
 	result = errors.Join(result, root.Close())
 	metadataRoot, err := os.OpenRoot(j.catalog.directory)
@@ -1115,15 +1403,19 @@ func transactionPayloadFromRecord(record transactionRecord) transactionPayload {
 	return transactionPayload{
 		Version: record.Version, ID: record.ID, VaultID: record.VaultID, State: record.State,
 		Changes: record.Changes, CatalogStage: record.CatalogStage, CatalogSHA256: record.CatalogSHA256,
+		CreateDirectories: record.CreateDirectories, RemoveDirectories: record.RemoveDirectories,
 	}
 }
 
 func validateTransactionRecord(record transactionRecord) error {
-	if record.Version != transactionFormatVersion || !isCatalogID(record.ID) || !isCatalogID(record.VaultID) ||
+	if (record.Version != transactionFormatVersion && record.Version != 2) || !isCatalogID(record.ID) || !isCatalogID(record.VaultID) ||
 		(record.State != "prepared" && record.State != "committed") ||
 		len(record.Changes) > maxTransactionChanges || record.CatalogStage != transactionCatalogStageName(record.ID) ||
 		!isSHA256Hex(record.CatalogSHA256) {
 		return ErrInvalidTransaction
+	}
+	if err := validateTransactionDirectoryRecord(record); err != nil {
+		return err
 	}
 	seen := make(map[string]struct{}, len(record.Changes))
 	for index, entry := range record.Changes {
@@ -1135,10 +1427,30 @@ func validateTransactionRecord(record transactionRecord) error {
 		}
 		seen[entry.Path] = struct{}{}
 		if entry.Delete {
+			if entry.PlaintextFingerprint != "" || entry.ContentKeyEnvelope != nil {
+				return ErrInvalidTransaction
+			}
+			if entry.PriorFingerprint != "" {
+				return ErrInvalidTransaction
+			}
 			if entry.ObjectID != "" || entry.Stage != "" || entry.SHA256 != "" || (entry.ExpectedFingerprint != "" && !isSHA256Hex(entry.ExpectedFingerprint)) {
 				return ErrInvalidTransaction
 			}
 		} else if !isCatalogID(entry.ObjectID) || entry.Stage != transactionContentStageName(record.ID, index) || !isSHA256Hex(entry.SHA256) || entry.ExpectedFingerprint != "" || entry.RejectHardlinks {
+			return ErrInvalidTransaction
+		}
+		if entry.PlaintextFingerprint != "" {
+			if record.Version != 2 || !isSHA256Hex(entry.PlaintextFingerprint) || !validCatalogContentKeyEnvelope(entry.ObjectID, entry.ContentKeyEnvelope) {
+				return ErrInvalidTransaction
+			}
+		} else if entry.ContentKeyEnvelope != nil {
+			return ErrInvalidTransaction
+		}
+		if record.Version == 2 && !entry.Delete {
+			if entry.PriorFingerprint != "missing" && !isSHA256Hex(entry.PriorFingerprint) {
+				return ErrInvalidTransaction
+			}
+		} else if entry.PriorFingerprint != "" {
 			return ErrInvalidTransaction
 		}
 		if index > 0 && record.Changes[index-1].Path >= entry.Path {
@@ -1158,6 +1470,12 @@ func validateTransactionBindings(changes []CiphertextChange, catalog Catalog) er
 		if change.Delete {
 			if exists {
 				return ErrInvalidTransaction
+			}
+			continue
+		}
+		if change.PublishPlaintext {
+			if err := validatePlaintextPublication(change.Path, catalog); err != nil {
+				return err
 			}
 			continue
 		}
@@ -1197,6 +1515,12 @@ func validateTransactionRecordBindings(record transactionRecord, catalog Catalog
 		if change.Delete {
 			if exists {
 				return ErrInvalidTransaction
+			}
+			continue
+		}
+		if change.PlaintextFingerprint != "" {
+			if err := validatePlaintextPublication(change.Path, catalog); err != nil {
+				return err
 			}
 			continue
 		}

@@ -10,6 +10,7 @@ import (
 	"errors"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/alexedwards/scs/v2"
@@ -19,10 +20,52 @@ const (
 	sessionPrincipalKey          = "principal"
 	sessionCSRFKey               = "csrf_token"
 	sessionMFAPendingKey         = "mfa_pending"
+	sessionPublicationBarrierKey = "publication_barrier"
 	sessionActivityWriteInterval = time.Minute
 )
 
 var errSessionInactive = errors.New("session is revoked or expired")
+
+type callbackStartState uint8
+
+const (
+	callbackStartPending callbackStartState = iota
+	callbackStartAdmitted
+	callbackStartAborted
+)
+
+// callbackStartGate makes callback admission a one-shot synchronized decision.
+// The successful non-blocking receive/default selection is its linearization
+// point: cancellation observed before it prevents work; cancellation after it
+// is after callback start, even if the first callback instruction has not run.
+type callbackStartGate struct {
+	mu    sync.Mutex
+	state callbackStartState
+}
+
+func (gate *callbackStartGate) admit(ctx context.Context) error {
+	gate.mu.Lock()
+	defer gate.mu.Unlock()
+	if gate.state != callbackStartPending {
+		return ErrSessionBarrier
+	}
+	select {
+	case <-ctx.Done():
+		gate.state = callbackStartAborted
+		err := ctx.Err()
+		if err == nil {
+			err = context.Canceled
+		}
+		return errors.Join(ErrSessionBarrier, err)
+	default:
+		gate.state = callbackStartAdmitted
+		return nil
+	}
+}
+
+// ErrSessionBarrier marks a failure to acquire or commit the cross-process
+// auth transaction that protects a sensitive publication.
+var ErrSessionBarrier = errors.New("authentication session barrier failed")
 
 type SessionOptions struct {
 	CookieSecure     bool
@@ -69,6 +112,96 @@ func (s *Sessions) LoadAndSave(next http.Handler) http.Handler { return s.manage
 
 func (s *Sessions) Authenticated(ctx context.Context) bool {
 	return s.manager.GetString(ctx, sessionPrincipalKey) == OwnerPrincipal
+}
+
+// Active revalidates durable revocation/expiry for slow sensitive requests;
+// Authenticated alone only inspects the principal loaded at request admission.
+// This check never refreshes activity or writes session state.
+func (s *Sessions) Active(ctx context.Context) (bool, error) {
+	if !s.Authenticated(ctx) {
+		return false, nil
+	}
+	hash := s.CurrentHash(ctx)
+	if len(hash) != sha256.Size {
+		return false, nil
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	var active bool
+	err := s.service.db.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM auth_sessions
+		WHERE session_id_hash=? AND revoked_at IS NULL
+		AND julianday(idle_expires_at)>julianday(?)
+		AND julianday(absolute_expires_at)>julianday(?))`, hash, now, now).Scan(&active)
+	return active, err
+}
+
+// WithActiveSession serializes a sensitive publication with durable session
+// revocation. The no-op write acquires SQLite's cross-process writer lock
+// before the session is checked, then holds it until work returns. Session
+// revokers therefore either win first and prevent work, or wait until work is
+// complete before reporting a successful revocation. The callback must not
+// call back into the auth database.
+func (s *Sessions) WithActiveSession(ctx context.Context, work func() error) error {
+	return s.withActiveSessionBeforeStart(ctx, nil, work)
+}
+
+// withActiveSessionBeforeStart is the internal admission seam used to exercise
+// cancellation at the callback boundary. Production callers use
+// WithActiveSession, which passes no hook.
+func (s *Sessions) withActiveSessionBeforeStart(ctx context.Context, beforeStart func(), work func() error) error {
+	if s == nil || s.service == nil || s.service.db == nil || work == nil || !s.Authenticated(ctx) {
+		return ErrAuthentication
+	}
+	if err := ctx.Err(); err != nil {
+		return errors.Join(ErrSessionBarrier, err)
+	}
+	hash := s.CurrentHash(ctx)
+	if len(hash) != sha256.Size {
+		return ErrAuthentication
+	}
+	// A request cancellation must not release SQLite's writer lock while a
+	// protected publication callback is still running. Check the request before
+	// starting work, then keep the transaction alive until the callback returns.
+	transactionContext := context.WithoutCancel(ctx)
+	tx, err := s.service.db.BeginTx(transactionContext, nil)
+	if err != nil {
+		return errors.Join(ErrSessionBarrier, err)
+	}
+	defer tx.Rollback()
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	var activeHash []byte
+	err = tx.QueryRowContext(transactionContext, `UPDATE auth_sessions SET revoked_at=revoked_at
+		WHERE session_id_hash=? AND revoked_at IS NULL
+		AND julianday(idle_expires_at)>julianday(?)
+		AND julianday(absolute_expires_at)>julianday(?)
+		RETURNING session_id_hash`, hash, now, now).Scan(&activeHash)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ErrAuthentication
+	}
+	if err != nil {
+		return errors.Join(ErrSessionBarrier, err)
+	}
+	if len(activeHash) != sha256.Size {
+		return ErrAuthentication
+	}
+	if err := ctx.Err(); err != nil {
+		return errors.Join(ErrSessionBarrier, err)
+	}
+	s.manager.Put(ctx, sessionPublicationBarrierKey, true)
+	defer s.manager.Remove(ctx, sessionPublicationBarrierKey)
+	if beforeStart != nil {
+		beforeStart()
+	}
+	var startGate callbackStartGate
+	if err := startGate.admit(ctx); err != nil {
+		return err
+	}
+	if err := work(); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return errors.Join(ErrSessionBarrier, err)
+	}
+	return nil
 }
 
 // MFAPending reports only whether this short-lived session has already passed
@@ -319,6 +452,12 @@ func (s *sqliteSessionStore) CommitCtx(ctx context.Context, token string, data [
 		deadline, values, err := s.codec.Decode(data)
 		if err != nil {
 			return err
+		}
+		if barrier, ok := values[sessionPublicationBarrierKey].(bool); ok && barrier {
+			// The session is protected by an active auth DB write transaction. A
+			// response may start inside that publication callback; skip the nested
+			// session upsert to avoid blocking on the transaction's sole connection.
+			return nil
 		}
 		absoluteExpiry = deadline.UTC().Format(time.RFC3339Nano)
 		if value, ok := values["client"].(string); ok {

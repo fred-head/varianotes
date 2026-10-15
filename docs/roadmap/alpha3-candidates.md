@@ -651,6 +651,54 @@ requires its listed tests; P17 adds end-to-end and adversarial coverage.
   remained at its 3.4-GiB baseline throughout these checks. Encryption
   activation stays gated; P18 is unchanged.
 
+  **Finding remediation (2026-10-14):** the full P01–P17 AI review identified
+  F1–F10. Follow-up work and regression evidence are tracked in
+  [`../security/m31-finding-remediation.md`](../security/m31-finding-remediation.md).
+  F1/F2/F7/F10 were reproduced and corrected in follow-up changes; F3's durable
+  move/restore correction has restart and fault-boundary regressions. Other findings
+  are tracked individually; F4 now covers concurrent saves during prepared and
+  committed envelope recovery without rewriting content. F5/F6 add guarded
+  commits, manual/idle lock and concurrency regressions. F8 fences late content
+  responses and discards plaintext dialogs while preserving hidden drafts.
+  F9 now shares bounded credential work and persistent failure throttling with
+  vault unlock, including restart and concurrency regressions. Follow-up PR
+  gates remain open. PR #24 must not merge while
+  confirmed release blockers remain. Activation stays disabled.
+
+  **Fresh AI review — blocked (2026-10-14):** a separate AI session reviewed the
+  complete pre-P01-to-P17 candidate `060e636..dc59d0c`, including all F1–F10
+  corrections, in an unchanged isolated checkout. Its 38 selected existing Go
+  tests passed. The source review found R1–R5: missing durable recovery barriers
+  for the commit marker, Trash structure and existing envelopes; late Unlock
+  after lock/revocation; and plaintext remaining visible after lock-channel
+  failure. The implementer confirmed the control-flow gaps; those negative
+  flows were not dynamically reproduced. See
+  [`../security/m31-fresh-ai-review.md`](../security/m31-fresh-ai-review.md).
+  All five findings remain open. PRs #30/#31 are held open; PR #24 is not merged.
+  This AI report provides no independent reviewer sign-off. P17 remains open;
+  productive activation is disabled and P18 is unchanged.
+
+  **R-finding correction candidates:** reproduction, corrections, regression
+  tests and limitations are tracked in
+  [`../security/m31-review-remediation.md`](../security/m31-review-remediation.md).
+  No R correction may merge before a fresh full-scope AI review evaluates the
+  blockers. This remains an AI review, not independent expert sign-off.
+
+  **R follow-up AI review — blocked (2026-10-14):** R1–R5 were reproduced and
+  corrected as candidates in PRs #32–#36, with process-death/restart, sync-error,
+  concurrency and failed lock-channel regressions. The full uncached Go suite,
+  external age recovery, vet, focused race checks and all frontend checks passed;
+  correction-commit CI passed all four workflow jobs. A new source-only AI
+  session reviewed the complete `060e636..f29ecf3` candidate and its test-only
+  supplement, without counting implementer tests as its own evidence. Its
+  [report](../security/m31-r-followup-ai-review.md) identifies B1/B2: competing
+  Export-recovery and stale Trash reconciliation; B3: online CLI revocation
+  missing the server's grant/publication barrier; B4: missing parent sync on
+  first protected upload. These flows still need dynamic regression coverage
+  and correction. R2 and R4 remain open; all correction PRs and #24 are held
+  open. Work stops at these blockers. P17's expert sign-off is still absent;
+  productive activation stays disabled and P18 is unchanged.
+
 - [ ] **P18 — Operations documentation and release gate**
   *(dependencies: P01–P17; size: S)*
   **Goal/scope:** document setup, recovery, external decryption, backups, visible

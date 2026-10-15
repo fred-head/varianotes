@@ -206,10 +206,7 @@ func (c *vaultRecoveryCoordinator) VerifyRecoveryPlan(ctx context.Context, encod
 			}
 			clear(passwordKey)
 		}
-		catalogID, err := catalogStore.ReadVaultID()
-		if err == nil {
-			_, err = catalogStore.Load(key, catalogID)
-		}
+		_, err = catalogStore.Load(key, registeredCatalogID(entry.ID))
 		clear(key)
 		if err != nil {
 			return fmt.Errorf("verify registered vault %q recovery catalog: %w", entry.ID, err)
@@ -260,10 +257,7 @@ func (c *vaultRecoveryCoordinator) inspectVault(ctx context.Context, entry noteb
 			return nil, nil, nil, false, "", auth.ErrInvalidRecoveryCode
 		}
 	}
-	catalogID, err := catalogStore.ReadVaultID()
-	if err == nil {
-		_, err = catalogStore.Load(key, catalogID)
-	}
+	_, err = catalogStore.Load(key, registeredCatalogID(entry.ID))
 	if err != nil {
 		clear(key)
 		return nil, nil, nil, false, "", fmt.Errorf("verify registered vault %q catalog: %w", entry.ID, err)
@@ -331,13 +325,11 @@ func (c *vaultRecoveryCoordinator) applyRecoveryPlan(ctx context.Context, encode
 		if err != nil || !state.hasCatalog || !state.hasEnvelope {
 			return errors.Join(fmt.Errorf("registered vault %q encryption metadata is unavailable", entry.ID), err)
 		}
-		catalogBytes, err := readRegularFile(state.catalogPath, 16<<20)
-		if err != nil {
-			return fmt.Errorf("read registered vault %q catalog: %w", entry.ID, err)
-		}
-		digest := sha256.Sum256(catalogBytes)
-		if hex.EncodeToString(digest[:]) != update.CatalogSHA256 {
-			return fmt.Errorf("registered vault %q catalog changed during encryption recovery", entry.ID)
+		// VerifyRecoveryPlan still rejects stale confirmation snapshots. After
+		// its last verification, legitimate saves remain compatible with this
+		// unchanged data key. Durable replay must use the old/new envelope pair.
+		if err := checkRegisteredCatalogIdentity(state.catalogPath, entry.ID); err != nil {
+			return err
 		}
 		if plan.Operation == "password" {
 			if err := applyRecoveryEnvelope(state.envelopePath, update.OldPasswordEnvelope, update.NewPasswordEnvelope, true, true, forward); err != nil {
@@ -373,9 +365,9 @@ func applyRecoveryEnvelope(filename string, oldBytes, newBytes []byte, oldPresen
 			// the durable recovery journal.
 			return store.Delete()
 		}
-		return nil
-	}
-	if currentPresent != sourcePresent || !bytes.Equal(currentBytes, sourceBytes) {
+		// Matching visible target bytes can follow an interrupted rename.
+		// Fall through to Save to re-establish file and directory durability.
+	} else if currentPresent != sourcePresent || !bytes.Equal(currentBytes, sourceBytes) {
 		return errors.New("key envelope changed during recovery")
 	}
 	if !targetPresent {

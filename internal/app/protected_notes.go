@@ -1,10 +1,11 @@
 package app
 
 import (
+	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
-	"sync"
 
 	"github.com/fred-head/varianotes/internal/auth"
 	"github.com/fred-head/varianotes/internal/encryption"
@@ -17,22 +18,19 @@ type protectedNoteAccess struct {
 	store   *encryption.CatalogStore
 	journal *encryption.TransactionJournal
 	err     error
-
-	mu        sync.Mutex
-	recovered bool
 }
 
 func newProtectedNoteAccess(repository *files.Repository, registryPath string, record notebookRecord) *protectedNoteAccess {
 	if repository == nil || !repository.Configured() {
 		return nil
 	}
-	hasAge, ageErr := repository.HasAgeFiles()
 	access := &protectedNoteAccess{}
-	if ageErr != nil {
-		access.enabled, access.err = true, ageErr
-		return access
-	}
 	if registryPath == "" || record.ID == "" {
+		hasAge, ageErr := repository.HasAgeFiles()
+		if ageErr != nil {
+			access.enabled, access.err = true, ageErr
+			return access
+		}
 		if hasAge {
 			access.enabled = true
 			access.err = errors.New("encrypted files exist without registered encryption metadata")
@@ -46,6 +44,11 @@ func newProtectedNoteAccess(repository *files.Repository, registryPath string, r
 		return access
 	}
 	if !state.protected {
+		hasAge, ageErr := repository.HasAgeFiles()
+		if ageErr != nil {
+			access.enabled, access.err = true, ageErr
+			return access
+		}
 		if hasAge {
 			access.enabled = true
 			access.err = errors.New("encrypted files exist without valid encryption metadata")
@@ -74,28 +77,16 @@ func (access *protectedNoteAccess) catalogForKey(vaultKey []byte) (encryption.Ca
 		}
 		return encryption.Catalog{}, errors.New("protected note storage is unavailable")
 	}
-	access.mu.Lock()
-	defer access.mu.Unlock()
-	if !access.recovered {
-		if err := access.journal.Recover(vaultKey); err != nil {
-			return encryption.Catalog{}, fmt.Errorf("recover encrypted note storage: %w", err)
-		}
-		access.recovered = true
-	}
-	vaultID, err := access.store.ReadVaultID()
+	expectedID := registeredCatalogID(access.vaultID)
+	var catalog encryption.Catalog
+	err := access.journal.WithRecoveredCatalog(vaultKey, expectedID, func(current encryption.Catalog) error {
+		catalog = current
+		return nil
+	})
 	if err != nil {
-		return encryption.Catalog{}, err
+		return encryption.Catalog{}, fmt.Errorf("recover encrypted note storage: %w", err)
 	}
-	return access.store.Load(vaultKey, vaultID)
-}
-
-func (access *protectedNoteAccess) needsRecovery() {
-	if access == nil {
-		return
-	}
-	access.mu.Lock()
-	access.recovered = false
-	access.mu.Unlock()
+	return catalog, nil
 }
 
 func beginProtectedNoteLease(w http.ResponseWriter, r *http.Request, access *protectedNoteAccess, sessions *auth.Sessions, manager *encryption.KeyManager) (*encryption.KeyLease, bool) {
@@ -124,8 +115,55 @@ func beginProtectedNoteLease(w http.ResponseWriter, r *http.Request, access *pro
 	return nil, true
 }
 
+func withProtectedSession(ctx context.Context, sessions *auth.Sessions, manager *encryption.KeyManager, work func() error) error {
+	err := sessions.WithActiveSession(ctx, work)
+	if errors.Is(err, auth.ErrAuthentication) || errors.Is(err, auth.ErrSessionBarrier) {
+		if manager != nil && sessions != nil {
+			err = errors.Join(err, manager.RevokeSessionEverywhere(sessions.CurrentHash(ctx)))
+		}
+	}
+	return err
+}
+
+func commitProtectedLease(ctx context.Context, sessions *auth.Sessions, manager *encryption.KeyManager, lease *encryption.KeyLease, publish func() error) error {
+	err := withProtectedSession(ctx, sessions, manager, func() error {
+		return lease.Commit(publish)
+	})
+	if err != nil && lease != nil {
+		lease.Close()
+	}
+	return err
+}
+
+type protectedSessionWriter struct {
+	ctx         context.Context
+	sessions    *auth.Sessions
+	manager     *encryption.KeyManager
+	lease       *encryption.KeyLease
+	destination io.Writer
+}
+
+func (writer *protectedSessionWriter) Write(content []byte) (int, error) {
+	written := 0
+	err := withProtectedSession(writer.ctx, writer.sessions, writer.manager, func() error {
+		return writer.lease.GuardCommit(func() error {
+			var err error
+			written, err = writer.destination.Write(content)
+			if err == nil && written != len(content) {
+				return io.ErrShortWrite
+			}
+			return err
+		})
+	})
+	return written, err
+}
+
 func writeProtectedNoteError(w http.ResponseWriter, err error) {
 	switch {
+	case errors.Is(err, auth.ErrAuthentication):
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "authentication required"})
+	case errors.Is(err, auth.ErrSessionBarrier):
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "authentication state is unavailable"})
 	case errors.Is(err, encryption.ErrVaultLocked):
 		writeJSON(w, http.StatusLocked, map[string]string{"error": "vault is locked", "code": "encryption_locked"})
 	case errors.Is(err, encryption.ErrSessionRequired):
