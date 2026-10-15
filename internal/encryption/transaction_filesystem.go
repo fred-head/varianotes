@@ -119,6 +119,9 @@ func (j *TransactionJournal) removeTransactionDirectories(root *os.Root, directo
 	for i := len(directories) - 1; i >= 0; i-- {
 		relative := directories[i]
 		if _, err := root.Lstat(filepath.FromSlash(relative)); errors.Is(err, fs.ErrNotExist) {
+			if err := j.syncExistingVaultAncestor(root, path.Dir(relative)); err != nil {
+				return err
+			}
 			continue
 		} else if err != nil {
 			return err
@@ -138,6 +141,19 @@ func (j *TransactionJournal) removeTransactionDirectories(root *os.Root, directo
 		}
 	}
 	return nil
+}
+
+// Retry an interrupted delete even when its former parent is already gone.
+// Sync the nearest surviving ancestor before clearing the recovery record.
+func (j *TransactionJournal) syncExistingVaultAncestor(root *os.Root, relative string) error {
+	for {
+		if err := validateTransactionDirectory(root, relative); err == nil {
+			return j.syncVaultDirectory(root, relative, "transaction.directory.sync")
+		} else if !errors.Is(err, fs.ErrNotExist) || relative == "." {
+			return err
+		}
+		relative = path.Dir(relative)
+	}
 }
 
 func validatePlaintextPublication(relative string, catalog Catalog) error {

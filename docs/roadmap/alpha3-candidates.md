@@ -630,6 +630,12 @@ requires its listed tests; P17 adds end-to-end and adversarial coverage.
   This AI report provides no independent reviewer sign-off. P17 remains open;
   productive activation is disabled and P18 is unchanged.
 
+  **R-finding correction candidates:** reproduction, corrections, regression
+  tests and limitations are tracked in
+  [`../security/m31-review-remediation.md`](../security/m31-review-remediation.md).
+  No R correction may merge before a fresh full-scope AI review evaluates the
+  blockers. This remains an AI review, not independent expert sign-off.
+
 - [ ] **P18 — Operations documentation and release gate**
   *(dependencies: P01–P17; size: S)*
   **Goal/scope:** document setup, recovery, external decryption, backups, visible
