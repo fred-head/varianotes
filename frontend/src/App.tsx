@@ -1,4 +1,4 @@
-import { lazy, Suspense, useCallback, useEffect, useRef, useState, type CSSProperties, type FormEvent, type KeyboardEvent, type MouseEvent, type ReactNode } from 'react'
+import { lazy, Suspense, useCallback, useEffect, useLayoutEffect, useRef, useState, type CSSProperties, type FormEvent, type KeyboardEvent, type MouseEvent, type ReactNode } from 'react'
 import { AutoLockController, autoLockOptions, loadAutoLockPreference, parseAutoLockMinutes, saveAutoLockPreference, type AutoLockMinutes } from './app/autoLock'
 import { emptyDocumentStats, type DocumentStats } from './app/documentStats'
 import { apiFetch, listenForAuthEvents, notifyAuthChanged, setCSRFToken } from './api'
@@ -11,6 +11,7 @@ type Theme = 'dark' | 'light'
 type TreeNode = { name: string; path: string; type: 'directory' | 'file'; protected?: boolean; protectionInherited?: boolean; children?: TreeNode[] }
 type FileResponse = { path: string; content: string; version: string }
 type Draft = FileResponse & { savedContent: string }
+type ContentViewToken = { vaultId: string; generation: number; epoch: number }
 type DocumentStatsSnapshot = { documentKey: string; stats: DocumentStats }
 type MenuState = { entry?: TreeNode; x: number; y: number }
 type CleanupAsset = { path: string; size: number }
@@ -154,6 +155,8 @@ export function App({ authMode = 'disabled', runningVersion = 'dev', onLoggedOut
   const encryptionStatusRef = useRef<EncryptionStatus | undefined>(undefined)
   const loadTreeRef = useRef<() => Promise<void>>(async () => undefined)
   const vaultGeneration = useRef(0)
+  const contentViewEpoch = useRef(0)
+  const contentViewVault = useRef('')
   const activeNotebookIDRef = useRef('')
   const lastServerActivity = useRef(0)
   const activeDraft = useRef<Draft | undefined>(undefined)
@@ -175,13 +178,50 @@ export function App({ authMode = 'disabled', runningVersion = 'dev', onLoggedOut
     setSearchLoading(false)
     setSearchError(undefined)
   }, [])
-  activeNotebookIDRef.current = activeNotebookID
+  const invalidateContentView = useCallback(() => {
+    contentViewEpoch.current++
+    setSaveConflict(undefined)
+    setConflictError(undefined)
+    setConflictLoading(false)
+    setMoveLinkPreview(undefined)
+    setMoveProtectionChoice(undefined)
+    setNoteLoading(false)
+    setNoteError(undefined)
+    setSaveError(undefined)
+    setOperationError(undefined)
+    setSaveStatus(activeDraft.current && activeDraft.current.content !== activeDraft.current.savedContent ? 'unsaved' : 'saved')
+    if (saveTimer.current) {
+      clearTimeout(saveTimer.current)
+      saveTimer.current = undefined
+    }
+    // Keep the unsaved draft only in memory; derived plaintext is discarded.
+    discardSearchState()
+  }, [discardSearchState])
+  const lockContentView = useCallback(() => {
+    invalidateContentView()
+    const current = encryptionStatusRef.current
+    if (current?.protected && current.vaultId === activeNotebookIDRef.current) {
+      const next = { ...current, locked: true }
+      encryptionStatusRef.current = next
+      setEncryptionStatus(next)
+    }
+    setVaultLocked(true)
+  }, [invalidateContentView])
+  function contentViewToken(): ContentViewToken {
+    return { vaultId: activeNotebookIDRef.current, generation: vaultGeneration.current, epoch: contentViewEpoch.current }
+  }
+  function acceptsContent(token: ContentViewToken): boolean {
+    return token.vaultId === activeNotebookIDRef.current
+      && token.generation === vaultGeneration.current && token.epoch === contentViewEpoch.current
+      && !(encryptionStatusRef.current?.protected && encryptionStatusRef.current.locked)
+  }
+  useLayoutEffect(() => { activeNotebookIDRef.current = activeNotebookID }, [activeNotebookID])
   const activeEncryptionStatus = encryptionStatus?.vaultId === activeNotebookID ? encryptionStatus : undefined
 
   useEffect(() => listenForAuthEvents(() => {
     setReadOnly(true)
-    discardSearchState()
-  }, discardSearchState), [discardSearchState])
+    lockContentView()
+  }, lockContentView), [lockContentView])
 
   useEffect(() => {
     const handleOnline = () => setBrowserOnline(true)
@@ -240,10 +280,13 @@ export function App({ authMode = 'disabled', runningVersion = 'dev', onLoggedOut
   }, [activeNotebookID, searchQuery, discardSearchState])
 
   useEffect(() => {
-    if (!activeNotebookID || typeof EventSource === 'undefined') return
+    if (contentViewVault.current) invalidateContentView()
+    else contentViewEpoch.current++
+    contentViewVault.current = activeNotebookID
     searchVaultUnlocked.current = false
     vaultGeneration.current = 0
     encryptionStatusRef.current = undefined
+    if (!activeNotebookID || typeof EventSource === 'undefined') return
     const source = new EventSource(`/api/encryption/lock-events?vaultId=${encodeURIComponent(activeNotebookID)}`)
     const handleLockEvent = (event: Event) => {
       try {
@@ -251,6 +294,7 @@ export function App({ authMode = 'disabled', runningVersion = 'dev', onLoggedOut
         if (update.vaultId !== activeNotebookID) return
         const generation = update.generation ?? 0
         if (generation < vaultGeneration.current) return
+        if (generation !== vaultGeneration.current || update.locked || encryptionStatusRef.current?.locked) invalidateContentView()
         vaultGeneration.current = generation
         const current = encryptionStatusRef.current
         if (current?.vaultId === activeNotebookID) {
@@ -280,7 +324,7 @@ export function App({ authMode = 'disabled', runningVersion = 'dev', onLoggedOut
       source.removeEventListener('encryption-lock', handleLockEvent)
       source.close()
     }
-  }, [activeNotebookID, discardSearchState])
+  }, [activeNotebookID, discardSearchState, invalidateContentView])
 
   useEffect(() => {
     if (!operationNotice) return
@@ -299,13 +343,13 @@ export function App({ authMode = 'disabled', runningVersion = 'dev', onLoggedOut
       setHealth('online')
     } catch (error) {
       setTreeError(messageFrom(error))
-      if (error instanceof APIError && error.status === 423) setVaultLocked(true)
+      if (error instanceof APIError && error.status === 423) lockContentView()
       if (messageFrom(error) === 'repository is not configured') setNotebookConfigured(false)
     } finally {
       setTreeLoading(false)
     }
-  }, [])
-  loadTreeRef.current = loadTree
+  }, [lockContentView])
+  useLayoutEffect(() => { loadTreeRef.current = loadTree }, [loadTree])
 
   const loadNotebookInfo = useCallback(async () => {
     try {
@@ -334,22 +378,22 @@ export function App({ authMode = 'disabled', runningVersion = 'dev', onLoggedOut
 
   const loadEncryptionStatus = useCallback(async () => {
     if (!activeNotebookID) return
+    const epoch = contentViewEpoch.current
     try {
       const response = await apiFetch('/api/encryption/status')
       const status = await responseJSON<EncryptionStatus>(response)
-      if (status.vaultId !== activeNotebookIDRef.current || status.generation < vaultGeneration.current) return
+      if (epoch !== contentViewEpoch.current || status.vaultId !== activeNotebookIDRef.current || status.generation < vaultGeneration.current) return
+      if (status.generation !== vaultGeneration.current || status.locked !== encryptionStatusRef.current?.locked) invalidateContentView()
       vaultGeneration.current = status.generation
       encryptionStatusRef.current = status
       setEncryptionStatus(status)
       setVaultLocked(status.locked)
       if (status.protected && !status.locked) void loadTree()
     } catch {
+      if (epoch !== contentViewEpoch.current) return
       const current = encryptionStatusRef.current
       if (current?.protected && current.vaultId === activeNotebookIDRef.current) {
-        const locked = { ...current, locked: true }
-        encryptionStatusRef.current = locked
-        setEncryptionStatus(locked)
-        setVaultLocked(true)
+        lockContentView()
         lastServerActivity.current = 0
         if (saveTimer.current) {
           clearTimeout(saveTimer.current)
@@ -358,7 +402,7 @@ export function App({ authMode = 'disabled', runningVersion = 'dev', onLoggedOut
         discardSearchState()
       }
     }
-  }, [activeNotebookID, discardSearchState, loadTree])
+  }, [activeNotebookID, discardSearchState, invalidateContentView, lockContentView, loadTree])
 
   useEffect(() => {
     if (!activeNotebookID) return
@@ -388,8 +432,7 @@ export function App({ authMode = 'disabled', runningVersion = 'dev', onLoggedOut
       lastServerActivity.current = now
       void apiFetch(`/api/encryption/activity?vaultId=${encodeURIComponent(activeNotebookID)}`, { method: 'POST' }).then((response) => {
         if (response.status === 423) {
-          setVaultLocked(true)
-          discardSearchState()
+          lockContentView()
           void loadEncryptionStatus()
         }
       }).catch(() => undefined)
@@ -402,15 +445,48 @@ export function App({ authMode = 'disabled', runningVersion = 'dev', onLoggedOut
       window.removeEventListener('keydown', reportActivity, true)
       window.removeEventListener('touchstart', reportActivity, true)
     }
-  }, [activeNotebookID, discardSearchState, loadEncryptionStatus])
+  }, [activeNotebookID, lockContentView, loadEncryptionStatus])
+
+  const unlockVault = useCallback(async (password: string, openDialogOnFailure = false) => {
+    if (!encryptionStatusRef.current?.protected || !password) return
+    setUnlockBusy(true)
+    setUnlockError(undefined)
+    try {
+      const result = await responseJSON<{ vaultId: string; unlocked: boolean; generation: number }>(await apiFetch('/api/encryption/unlock', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ password }),
+      }))
+      if (result.vaultId !== activeNotebookIDRef.current || result.generation < vaultGeneration.current) {
+        throw new Error('Vault lock state changed. Try unlocking again.')
+      }
+      invalidateContentView()
+      vaultGeneration.current = result.generation
+      const current = encryptionStatusRef.current
+      if (current?.vaultId === result.vaultId) {
+        const next = { ...current, locked: !result.unlocked, generation: result.generation }
+        encryptionStatusRef.current = next
+        setEncryptionStatus(next)
+      }
+      setVaultLocked(!result.unlocked)
+      lastServerActivity.current = 0
+      setUnlockDialogOpen(false)
+      setUnlockError(undefined)
+    } catch (error) {
+      setUnlockError(messageFrom(error))
+      if (openDialogOnFailure) setUnlockDialogOpen(true)
+    } finally {
+      setUnlockBusy(false)
+    }
+  }, [invalidateContentView])
 
   useEffect(() => {
     if (!initialVaultPassword || !encryptionStatus || initialUnlockAttempted.current) return
     initialUnlockAttempted.current = true
     onInitialVaultPasswordConsumed?.()
     if (!encryptionStatus.protected || encryptionStatus.unlockPasswordMode !== 'login' || !encryptionStatus.locked) return
-    void unlockVault(initialVaultPassword, true)
-  }, [initialVaultPassword, encryptionStatus, onInitialVaultPasswordConsumed])
+    void Promise.resolve().then(() => unlockVault(initialVaultPassword, true))
+  }, [initialVaultPassword, encryptionStatus, onInitialVaultPasswordConsumed, unlockVault])
 
   useEffect(() => {
     const checkHealth = () => apiFetch('/api/health').then((response) => {
@@ -419,13 +495,13 @@ export function App({ authMode = 'disabled', runningVersion = 'dev', onLoggedOut
     }).catch(() => setHealth('offline'))
     void checkHealth()
     const healthTimer = globalThis.setInterval(() => void checkHealth(), 15_000)
-    apiFetch('/api/repository/tree').then(responseJSON<{ entries: TreeNode[] }>).then((data) => {
+    const initialNotebookInfo = apiFetch('/api/notebook').then(responseJSON<{ name: string; configured: boolean }>).then((data) => { setNotebookConfigured(data.configured); setNotebookName(data.configured ? data.name || 'Notebook' : 'Notebooks'); return data }).catch(() => { setNotebookName('Notebook'); return undefined })
+    const initialNotebooks = apiFetch('/api/notebooks').then(responseJSON<{ activeId: string; notebooks: NotebookInfo[] }>).then((data) => { setNotebooks(data.notebooks); setActiveNotebookID(data.activeId); const active = data.notebooks.find((notebook) => notebook.id === data.activeId); if (active) setNotebookName(active.name) }).catch(() => undefined)
+    Promise.all([apiFetch('/api/repository/tree').then(responseJSON<{ entries: TreeNode[] }>), initialNotebooks, initialNotebookInfo]).then(([data, , info]) => {
       setEntries(data.entries)
-      setNotebookConfigured(true)
+      setNotebookConfigured(info?.configured ?? true)
       setHealth('online')
     }).catch((error: unknown) => { const message = messageFrom(error); setTreeError(message); if (message === 'repository is not configured') setNotebookConfigured(false) }).finally(() => setTreeLoading(false))
-    apiFetch('/api/notebook').then(responseJSON<{ name: string; configured: boolean }>).then((data) => { setNotebookConfigured(data.configured); setNotebookName(data.configured ? data.name || 'Notebook' : 'Notebooks') }).catch(() => setNotebookName('Notebook'))
-    apiFetch('/api/notebooks').then(responseJSON<{ activeId: string; notebooks: NotebookInfo[] }>).then((data) => { setNotebooks(data.notebooks); setActiveNotebookID(data.activeId); const active = data.notebooks.find((notebook) => notebook.id === data.activeId); if (active) setNotebookName(active.name) }).catch(() => undefined)
 
     const warnBeforeUnload = (event: BeforeUnloadEvent) => {
       const draft = activeDraft.current
@@ -476,6 +552,7 @@ export function App({ authMode = 'disabled', runningVersion = 'dev', onLoggedOut
   }, [autoLockMinutes])
 
   async function saveDraft(): Promise<boolean> {
+    const token = contentViewToken()
     if (saveTimer.current) clearTimeout(saveTimer.current)
     if (encryptionStatusRef.current?.protected && encryptionStatusRef.current.locked) return false
     if (savePromise.current) {
@@ -486,6 +563,7 @@ export function App({ authMode = 'disabled', runningVersion = 'dev', onLoggedOut
       }
     }
 
+    if (!acceptsContent(token)) return false
     const draft = activeDraft.current
     if (!draft || draft.content === draft.savedContent) {
       setSaveStatus('saved')
@@ -504,12 +582,15 @@ export function App({ authMode = 'disabled', runningVersion = 'dev', onLoggedOut
 
     try {
       const saved = await operation
+      if (!acceptsContent(token)) return false
       const current = activeDraft.current
-      if (current?.path === snapshot.path) {
+      if (current === draft) {
         current.version = saved.version
         current.savedContent = snapshot.content
       }
     } catch (error) {
+      if (!acceptsContent(token)) return false
+      if (error instanceof APIError && error.status === 423) { lockContentView(); return false }
 		const isConflict = error instanceof APIError && error.status === 409
 		if (error instanceof TypeError) setHealth('offline')
 		setSaveStatus(isConflict ? 'conflict' : 'error')
@@ -517,50 +598,18 @@ export function App({ authMode = 'disabled', runningVersion = 'dev', onLoggedOut
 		if (isConflict) {
 			try {
 				const server = await responseJSON<FileResponse>(await apiFetch(`/api/repository/file?path=${encodeURIComponent(snapshot.path)}`))
-				setSaveConflict({ server, yourContent: snapshot.content })
+				if (acceptsContent(token) && activeDraft.current === draft) setSaveConflict({ server, yourContent: snapshot.content })
 			} catch { /* retry remains available without discarding the draft */ }
 		}
       return false
     } finally {
-      savePromise.current = undefined
+      if (savePromise.current === operation) savePromise.current = undefined
     }
 
     const current = activeDraft.current
     if (current?.path === snapshot.path && current.content !== current.savedContent) return saveDraft()
     setSaveStatus('saved')
     return true
-  }
-
-  async function unlockVault(password: string, openDialogOnFailure = false) {
-    if (!encryptionStatusRef.current?.protected || !password) return
-    setUnlockBusy(true)
-    setUnlockError(undefined)
-    try {
-      const result = await responseJSON<{ vaultId: string; unlocked: boolean; generation: number }>(await apiFetch('/api/encryption/unlock', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ password }),
-      }))
-      if (result.vaultId !== activeNotebookIDRef.current || result.generation < vaultGeneration.current) {
-        throw new Error('Vault lock state changed. Try unlocking again.')
-      }
-      vaultGeneration.current = result.generation
-      const current = encryptionStatusRef.current
-      if (current?.vaultId === result.vaultId) {
-        const next = { ...current, locked: !result.unlocked, generation: result.generation }
-        encryptionStatusRef.current = next
-        setEncryptionStatus(next)
-      }
-      setVaultLocked(!result.unlocked)
-      lastServerActivity.current = 0
-      setUnlockDialogOpen(false)
-      setUnlockError(undefined)
-    } catch (error) {
-      setUnlockError(messageFrom(error))
-      if (openDialogOnFailure) setUnlockDialogOpen(true)
-    } finally {
-      setUnlockBusy(false)
-    }
   }
 
   async function lockVault() {
@@ -573,6 +622,7 @@ export function App({ authMode = 'disabled', runningVersion = 'dev', onLoggedOut
     try {
       const result = await responseJSON<{ vaultId: string; locked: boolean; generation: number }>(await apiFetch('/api/encryption/lock', { method: 'POST' }))
       if (result.vaultId !== activeNotebookIDRef.current || result.generation < vaultGeneration.current) return
+      invalidateContentView()
       vaultGeneration.current = result.generation
       const current = encryptionStatusRef.current
       if (current?.vaultId === result.vaultId) {
@@ -588,8 +638,9 @@ export function App({ authMode = 'disabled', runningVersion = 'dev', onLoggedOut
     }
   }
   async function applySaveConflict(action: 'keep_mine' | 'use_server' | 'edit_combined', content?: string) {
+    const token = contentViewToken()
     const pending = saveConflict
-    if (!pending) return
+    if (!pending || !acceptsContent(token)) return
     setConflictError(undefined)
     setConflictLoading(true)
     try {
@@ -601,6 +652,7 @@ export function App({ authMode = 'disabled', runningVersion = 'dev', onLoggedOut
           body: JSON.stringify({ path: pending.server.path, expectedVersion: pending.server.version, content: action === 'edit_combined' ? content ?? '' : pending.yourContent }),
         }))
       }
+      if (!acceptsContent(token)) return
       activeDraft.current = { ...resolved, savedContent: resolved.content }
       setNote(resolved)
       setSelectedPath(resolved.path)
@@ -611,13 +663,15 @@ export function App({ authMode = 'disabled', runningVersion = 'dev', onLoggedOut
       setSaveStatus('saved')
       setSaveError(undefined)
     } catch (error) {
+      if (!acceptsContent(token)) return
+      if (error instanceof APIError && error.status === 423) { lockContentView(); return }
       setConflictError(messageFrom(error))
       try {
         const server = await responseJSON<FileResponse>(await apiFetch(`/api/repository/file?path=${encodeURIComponent(pending.server.path)}`))
-        setSaveConflict({ server, yourContent: pending.yourContent })
+        if (acceptsContent(token)) setSaveConflict({ server, yourContent: pending.yourContent })
       } catch { /* Both versions remain available in memory. */ }
     } finally {
-      setConflictLoading(false)
+      if (acceptsContent(token)) setConflictLoading(false)
     }
   }
 
@@ -663,6 +717,7 @@ export function App({ authMode = 'disabled', runningVersion = 'dev', onLoggedOut
     try {
       const response = await apiFetch(`/api/notebooks/${encodeURIComponent(notebook.id)}/activate`, { method: 'POST' })
       await responseJSON<NotebookInfo>(response)
+      invalidateContentView()
       discardSearchState()
       activeDraft.current = undefined
       setTabs([])
@@ -688,18 +743,21 @@ export function App({ authMode = 'disabled', runningVersion = 'dev', onLoggedOut
   }
 
   async function openNote(path: string, disposition: 'current' | 'new' = 'current') {
+    const token = contentViewToken()
     if (path === selectedPath) return
     if (encryptionStatusRef.current?.protected && encryptionStatusRef.current.locked) {
       setUnlockDialogOpen(true)
       return
     }
     if (!(await saveDraft())) return
+    if (!acceptsContent(token)) return
     setNoteLoading(true)
     setNoteError(undefined)
     setSaveError(undefined)
     try {
       const response = await apiFetch(`/api/repository/file?path=${encodeURIComponent(path)}`)
       const loaded = await responseJSON<FileResponse>(response)
+      if (!acceptsContent(token)) return
       const existingTab = tabs.find((tab) => tab.path === path)
       setTabs((current) => {
         if (current.some((tab) => tab.path === path)) return current
@@ -724,17 +782,18 @@ export function App({ authMode = 'disabled', runningVersion = 'dev', onLoggedOut
       updateReadOnly(existingTab?.readOnly ?? false, path)
       setSaveStatus('saved')
     } catch (error) {
+      if (!acceptsContent(token)) return
       setNoteError(messageFrom(error))
       if (error instanceof APIError && error.status === 423) {
-        setVaultLocked(true)
-        discardSearchState()
+        lockContentView()
       }
     } finally {
-      setNoteLoading(false)
+      if (acceptsContent(token)) setNoteLoading(false)
     }
   }
 
   async function closeTab(path: string) {
+    const token = contentViewToken()
     const index = tabs.findIndex((tab) => tab.path === path)
     if (index < 0) return
     if (path !== selectedPath) {
@@ -742,6 +801,7 @@ export function App({ authMode = 'disabled', runningVersion = 'dev', onLoggedOut
       return
     }
     if (!(await saveDraft())) return
+    if (!acceptsContent(token)) return
     const remaining = tabs.filter((tab) => tab.path !== path)
     const next = remaining[Math.min(index, remaining.length - 1)]
     setTabs(remaining)
@@ -758,6 +818,7 @@ export function App({ authMode = 'disabled', runningVersion = 'dev', onLoggedOut
   }
 
   function updateDraft(markdown: string) {
+    if (encryptionStatusRef.current?.protected && encryptionStatusRef.current.locked) return
     const draft = activeDraft.current
     if (!draft || draft.content === markdown) return
     draft.content = markdown
@@ -778,6 +839,8 @@ export function App({ authMode = 'disabled', runningVersion = 'dev', onLoggedOut
   }
 
   async function submitCreateEntry(value:string) {
+    const token = contentViewToken()
+    if (!acceptsContent(token)) return
     const request = createRequest
     if (!request) return
     let name = value.trim()
@@ -794,8 +857,10 @@ export function App({ authMode = 'disabled', runningVersion = 'dev', onLoggedOut
     try {
       const response = await apiFetch('/api/repository/entries', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ path, type:request.type }) })
       await responseJSON<{ path: string; type: string }>(response)
+      if (!acceptsContent(token)) return
       if (request.parent) setExpandedFolders((current) => new Set(current).add(request.parent))
       await loadTree()
+      if (!acceptsContent(token)) return
       setSelectedItem({ name: baseName(path), path, type:request.type })
       if (request.type === 'file') await openNote(path)
     } catch (error) {
@@ -806,14 +871,17 @@ export function App({ authMode = 'disabled', runningVersion = 'dev', onLoggedOut
   }
 
   async function performMove(entry: TreeNode, target: string, rewriteToken?:string, protectionChoice?:'keep'|'decrypt') {
+    const token = contentViewToken()
     if (target === entry.path) return
     if (!(await saveDraft())) return
+    if (!acceptsContent(token)) return
     setOperationBusy(true)
     setOperationError(undefined)
     try {
       if (!rewriteToken) {
         const previewResponse = await apiFetch('/api/repository/move/preview', { method:'POST', headers:{ 'Content-Type':'application/json' }, body:JSON.stringify({ source:entry.path, target }) })
         const preview = await responseJSON<MoveLinkPreview>(previewResponse)
+        if (!acceptsContent(token)) return
         if (preview.rewrites.length > 0) {
           setMoveLinkPreview({ entry, preview })
           return
@@ -821,6 +889,7 @@ export function App({ authMode = 'disabled', runningVersion = 'dev', onLoggedOut
       }
       const response = await apiFetch('/api/repository/move', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ source: entry.path, target, ...(rewriteToken ? { rewriteToken } : {}), ...(protectionChoice ? { protectionChoice } : {}) }) })
       await responseJSON<{ path: string }>(response)
+      if (!acceptsContent(token)) return
       const affectedPath = selectedPath === entry.path || selectedPath?.startsWith(`${entry.path}/`)
         ? target + selectedPath.slice(entry.path.length)
         : undefined
@@ -845,11 +914,14 @@ export function App({ authMode = 'disabled', runningVersion = 'dev', onLoggedOut
         setSelectedPath(undefined)
       }
       await loadTree()
+      if (!acceptsContent(token)) return
       if (affectedPath) {
         await openNote(affectedPath)
         updateReadOnly(affectedReadOnly ?? false, affectedPath)
       }
     } catch (error) {
+      if (!acceptsContent(token)) return
+      if (error instanceof APIError && error.status === 423) { lockContentView(); return }
       if (error instanceof APIError && error.code === 'move_protection_choice_required') {
         setMoveProtectionChoice({ entry, target, rewriteToken })
       } else {
@@ -911,12 +983,15 @@ export function App({ authMode = 'disabled', runningVersion = 'dev', onLoggedOut
   }
 
   async function deleteEntry(entry: TreeNode) {
+    const token = contentViewToken()
     if (!(await saveDraft())) return
+    if (!acceptsContent(token)) return
     setOperationBusy(true)
     setOperationError(undefined)
     try {
       const response = await apiFetch(`/api/repository/entry?path=${encodeURIComponent(entry.path)}`, { method: 'DELETE' })
       if (!response.ok) await responseJSON<never>(response)
+      if (!acceptsContent(token)) return
       const activeDeleted = selectedPath === entry.path || selectedPath?.startsWith(`${entry.path}/`)
       const activeIndex = tabs.findIndex((tab) => tab.path === selectedPath)
       const remainingTabs = tabs.filter((tab) => tab.path !== entry.path && !tab.path.startsWith(`${entry.path}/`))
@@ -931,6 +1006,7 @@ export function App({ authMode = 'disabled', runningVersion = 'dev', onLoggedOut
       if (selectedItem?.path === entry.path || selectedItem?.path.startsWith(`${entry.path}/`)) setSelectedItem(undefined)
       setExpandedFolders((current) => new Set([...current].filter((folder) => folder !== entry.path && !folder.startsWith(`${entry.path}/`))))
       await loadTree()
+      if (!acceptsContent(token)) return
       if (activeDeleted && remainingTabs.length > 0) {
         const next = remainingTabs[Math.min(Math.max(activeIndex, 0), remainingTabs.length - 1)]
         await openNote(next.path)
@@ -1023,6 +1099,7 @@ export function App({ authMode = 'disabled', runningVersion = 'dev', onLoggedOut
     setOperationError(undefined)
     try {
       await responseJSON(await apiFetch('/api/auth/logout', { method: 'POST' }))
+      lockContentView()
       onLoggedOut()
     } catch (caught) {
       setOperationError(messageFrom(caught))
@@ -1086,11 +1163,13 @@ export function App({ authMode = 'disabled', runningVersion = 'dev', onLoggedOut
   })
 
   async function toggleReadOnly() {
+    const token = contentViewToken()
+    if (!acceptsContent(token)) return
     if (readOnly) {
       updateReadOnly(false)
       return
     }
-    if (await saveDraft()) updateReadOnly(true)
+    if (await saveDraft() && acceptsContent(token)) updateReadOnly(true)
   }
 
   const selectedFolderPath = selectedItem?.type === 'directory' ? selectedItem.path : selectedItem ? parentPath(selectedItem.path) : ''
@@ -1195,7 +1274,7 @@ export function App({ authMode = 'disabled', runningVersion = 'dev', onLoggedOut
       {createRequest && <TextInputDialog title={createRequest.type === 'file' ? 'New Note' : 'New Folder'} label={createRequest.type === 'file' ? `Note name${createRequest.parent ? ` in ${createRequest.parent}` : ''}` : `Folder name${createRequest.parent ? ` in ${createRequest.parent}` : ''}`} initialValue={createRequest.suggested} confirmLabel="Create" onCancel={() => setCreateRequest(undefined)} onConfirm={(value) => void submitCreateEntry(value)} />}
       {deleteRequest && <ConfirmationDialog title="Move to Trash?" message={`Move “${deleteRequest.path}” to Trash?${deleteRequest.type === 'file' ? ' Its owned image assets will move with it.' : ' Everything inside this folder will move with it.'} You can restore it later.`} confirmLabel="Move to Trash" danger onCancel={() => setDeleteRequest(undefined)} onConfirm={() => { const entry = deleteRequest; setDeleteRequest(undefined); void deleteEntry(entry) }} />}
       {moveEntry && <FolderPicker entries={entries} notebookName={notebookName} moving={moveEntry} destination={moveDestination} onDestination={setMoveDestination} onCancel={() => setMoveEntry(undefined)} onConfirm={() => void confirmMove()} />}
-      {moveLinkPreview && <MoveLinkPreviewDialog preview={moveLinkPreview.preview} onCancel={() => setMoveLinkPreview(undefined)} onConfirm={() => void confirmMoveLinkRewrites()} />}
+      {(!activeEncryptionStatus?.protected || !vaultLocked) && moveLinkPreview && <MoveLinkPreviewDialog preview={moveLinkPreview.preview} onCancel={() => setMoveLinkPreview(undefined)} onConfirm={() => void confirmMoveLinkRewrites()} />}
       {moveProtectionChoice && <MoveProtectionDialog entry={moveProtectionChoice.entry} target={moveProtectionChoice.target} busy={operationBusy} onCancel={() => setMoveProtectionChoice(undefined)} onChoose={(choice) => void confirmProtectionMove(choice)} />}
       {unlockDialogOpen && activeEncryptionStatus?.protected && <VaultUnlockDialog passwordMode={activeEncryptionStatus.unlockPasswordMode} busy={unlockBusy} error={unlockError} onCancel={() => { setUnlockDialogOpen(false); setUnlockError(undefined) }} onUnlock={(password) => void unlockVault(password)} />}
       {settingsOpen && <SettingsDialog mode="settings" authMode={authMode} runningVersion={runningVersion} onLoggedOut={onLoggedOut} autoLockMinutes={autoLockMinutes} onAutoLockMinutes={setAutoLockMinutes} onClose={() => setSettingsOpen(false)} />}
@@ -1203,7 +1282,7 @@ export function App({ authMode = 'disabled', runningVersion = 'dev', onLoggedOut
       {manageNotebooksOpen && <ManageNotebooksDialog notebooks={notebooks} activeNotebookID={activeNotebookID} operationsBlocked={operationBusy || saveStatus === 'saving' || saveStatus === 'unsaved'} onChanged={refreshNotebookRegistrations} onClose={() => setManageNotebooksOpen(false)} />}
 
 
-	  {saveConflict && <SaveConflictDialog pending={saveConflict} busy={conflictLoading} error={conflictError} onClose={() => setSaveConflict(undefined)} onResolve={(action, content) => void applySaveConflict(action, content)} />}
+	  {(!activeEncryptionStatus?.protected || !vaultLocked) && saveConflict && <SaveConflictDialog pending={saveConflict} busy={conflictLoading} error={conflictError} onClose={() => setSaveConflict(undefined)} onResolve={(action, content) => void applySaveConflict(action, content)} />}
 
       {trashOpen && <TrashDialog onChanged={loadTree} onClose={() => setTrashOpen(false)} />}
     </div>

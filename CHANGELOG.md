@@ -8,6 +8,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- M31 locks discard conflict and backlink comparisons and reject late content
+  responses across lock generations and vault switches. Unsaved drafts stay
+  hidden in tab memory and remain available after unlocking.
+
 - M31 Move/Trash commits recheck the session and lock generation before changing
   live content. Manual and idle locks reject prepared late mutations; content
   preparation and publication now use a consistent lock order without holding

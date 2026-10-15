@@ -610,8 +610,9 @@ requires its listed tests; P17 adds end-to-end and adversarial coverage.
   move/restore correction has restart and fault-boundary regressions. Other findings
   are tracked individually; F4 now covers concurrent saves during prepared and
   committed envelope recovery without rewriting content. F5/F6 add guarded
-  commits, manual/idle lock and concurrency regressions. Remaining findings
-  and a fresh independent review remain open. PR #24 must not merge while
+  commits, manual/idle lock and concurrency regressions. F8 fences late content
+  responses and discards plaintext dialogs while preserving hidden drafts.
+  F9 remediation and a fresh independent review remain open. PR #24 must not merge while
   confirmed release blockers remain. Activation stays disabled.
 
 - [ ] **P18 — Operations documentation and release gate**
