@@ -49,6 +49,11 @@ type recoveryJournalPayload struct {
 func (s *Service) BeginEncryptionRecoveryCode(ctx context.Context, currentPassword, separateEncryptionPassword string, sessionHash []byte) (string, string, error) {
 	s.credentialMu.Lock()
 	defer s.credentialMu.Unlock()
+	releaseJournal, err := lockAuthJournal(ctx, s.config.MetadataPath)
+	if err != nil {
+		return "", "", err
+	}
+	defer releaseJournal()
 	if len(sessionHash) != sha256.Size {
 		return "", "", ErrAuthentication
 	}
@@ -102,6 +107,11 @@ func (s *Service) ConfirmEncryptionRecoveryCode(ctx context.Context, challenge, 
 	}
 	s.credentialMu.Lock()
 	defer s.credentialMu.Unlock()
+	releaseJournal, err := lockAuthJournal(ctx, s.config.MetadataPath)
+	if err != nil {
+		return err
+	}
+	defer releaseJournal()
 	state, err := s.State(ctx)
 	if err != nil {
 		return err
@@ -129,6 +139,16 @@ func (s *Service) ConfirmEncryptionRecoveryCode(ctx context.Context, challenge, 
 func (s *Service) BeginPasswordRecovery(ctx context.Context, recoveryCode, newPassword string) (string, string, error) {
 	s.credentialMu.Lock()
 	defer s.credentialMu.Unlock()
+	releaseJournal, err := lockAuthJournal(ctx, s.config.MetadataPath)
+	if err != nil {
+		return "", "", err
+	}
+	defer releaseJournal()
+	if phase, _, err := s.pendingPasswordChange(ctx); err != nil {
+		return "", "", err
+	} else if phase != "" {
+		return "", "", ErrPasswordChangePending
+	}
 	state, err := s.State(ctx)
 	if err != nil {
 		return "", "", err
@@ -179,6 +199,11 @@ func (s *Service) ConfirmPasswordRecovery(ctx context.Context, challenge, newPas
 	}
 	s.credentialMu.Lock()
 	defer s.credentialMu.Unlock()
+	releaseJournal, err := lockAuthJournal(ctx, s.config.MetadataPath)
+	if err != nil {
+		return err
+	}
+	defer releaseJournal()
 	state, err := s.State(ctx)
 	if err != nil {
 		return err
@@ -300,6 +325,11 @@ func (s *Service) executeEncryptionRecovery(ctx context.Context, operation strin
 	}
 	if err := s.ensureNoPendingEncryptionRecovery(ctx); err != nil {
 		return err
+	}
+	if phase, _, err := s.pendingPasswordChange(ctx); err != nil {
+		return err
+	} else if phase != "" {
+		return ErrPasswordChangePending
 	}
 	payload := recoveryJournalPayload{Operation: operation, Plan: append([]byte(nil), plan...), Credential: credential}
 	encoded, err := json.Marshal(payload)

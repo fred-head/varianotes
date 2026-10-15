@@ -118,6 +118,23 @@ login credential. The auth database records the envelope plan and a `prepared`
 phase; the credential update and `committed` phase share one SQLite transaction.
 Startup rolls back a prepared plan or completes a committed plan before serving
 requests. If recovery cannot reach a registered vault, startup fails closed.
+Initialization (including `auth reset-mfa`) and credential/envelope transitions
+share a cross-process ownership lock in `auth.db.journal-lock` beside the auth
+database (using its resolved path). This empty SQLite database holds a
+`BEGIN IMMEDIATE` transaction across preflight, journal writes, envelope work,
+and completion or rollback. It is separate from the auth database so the
+owner can continue writing its durable journal. Other initializations wait;
+canceled waiters and lock errors abort before recovery changes any journal.
+Canceling the owner request retains ownership until its cleanup returns.
+Closing the connection or process death releases ownership automatically;
+startup can then recover a prepared or committed transaction. Failed recovery
+keeps the journal for retry, and operator/code-based resets reject an unfinished
+password-change journal. Never delete or replace the coordination file while
+any process may use it. SQLite database hard-link aliases and filesystems that
+do not provide SQLite locking are unsupported; this coordination does not
+extend the one-active-backend-writer-per-vault contract. See the focused
+[C1 regression evidence](m31-c1-remediation.md).
+
 Password recovery without the previous password changes the login credential
 only and leaves vault envelopes untouched. The envelope rewrap primitive takes
 an explicit encryption password, so a later separate encryption password does

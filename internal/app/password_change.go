@@ -23,6 +23,8 @@ const passwordChangePlanVersion = 1
 
 type vaultPasswordChangeCoordinator struct {
 	registryPath string
+	// Test-only boundary after a durable envelope write.
+	afterEnvelopeWrite func()
 }
 
 type passwordChangePlan struct {
@@ -244,6 +246,9 @@ func (c *vaultPasswordChangeCoordinator) apply(ctx context.Context, encoded []by
 		}
 		if err != nil {
 			return fmt.Errorf("replace registered vault %q key envelope: %w", entry.ID, err)
+		}
+		if c.afterEnvelopeWrite != nil {
+			c.afterEnvelopeWrite()
 		}
 	}
 	return nil

@@ -8,6 +8,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- M31 auth initialization, including `auth reset-mfa`, waits for live
+  password/envelope transactions across service instances and processes.
+  Cancellation and failed recovery retain unfinished journals; process restart
+  releases ownership and safely retries recovery. Encryption activation and
+  the separate P17 review remain pending.
+
 - M31 exports and repository instances share vault synchronization and preserve
   active Save/Move/Restore transactions through commit or abort. Protected
   Trash reconciliation recovers and reloads the current catalog under those
