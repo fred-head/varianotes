@@ -231,18 +231,19 @@ func (c *vaultPasswordChangeCoordinator) apply(ctx context.Context, encoded []by
 		}
 		switch {
 		case bytes.Equal(currentBytes, targetBytes):
-			continue
+			// A visible prior rename may still lack its directory barrier.
+			// Replay identical authenticated bytes through the durable writer.
 		case bytes.Equal(currentBytes, sourceBytes):
-			if forward {
-				err = store.Save(newEnvelope)
-			} else {
-				err = store.Save(oldEnvelope)
-			}
-			if err != nil {
-				return fmt.Errorf("replace registered vault %q key envelope: %w", entry.ID, err)
-			}
 		default:
 			return fmt.Errorf("registered vault %q key envelope changed during password change", entry.ID)
+		}
+		if forward {
+			err = store.Save(newEnvelope)
+		} else {
+			err = store.Save(oldEnvelope)
+		}
+		if err != nil {
+			return fmt.Errorf("replace registered vault %q key envelope: %w", entry.ID, err)
 		}
 	}
 	return nil

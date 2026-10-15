@@ -60,3 +60,28 @@ durable metadata and the full directory plan. Full files tests and focused
 Trash/lock/concurrency race tests passed. These exercise process interruption
 and failed barriers, not actual storage power loss. CI/full-scope AI review
 remain outstanding.
+
+## R3 — matching envelope replay
+
+**Confirmed.** New rollback/forward regressions failed because matching
+visible envelopes were skipped. A prepared SQLite password-change journal
+survived two child processes that each synced a temporary old envelope,
+renamed it and abruptly exited before the parent-directory barrier. Auth
+restart removed the journal while leaving that visible inode untouched.
+
+**Correction.** Both password-change replay and existing recovery-envelope
+replay persist the exact target bytes via the existing atomic, file/parent-
+synced envelope writer even on equality. Errors propagate before auth clears
+its journal. Independent registered Vault-ID and exact old/new-envelope
+checks remain; replay still permits legitimate concurrent content saves.
+
+**Regression evidence.** `TestEnvelopeReplayRewritesMatchingTarget` covers
+matching targets in both directions for both replay paths.
+`TestEnvelopeRollbackProcessRestart` constructs the precise filesystem
+interruption boundary in two real child processes, then runs real auth
+startup recovery, checks a durable rewrite before journal completion, verifies
+the original login/vault passwords, and verifies unchanged content bytes.
+The child performs the writer's rename sequence explicitly; it is not a full
+backend process or a physical power-cut test. Focused password/recovery app
+tests and race checks (including concurrent catalog-save replay) passed.
+The broader uncached auth/route gate and CI/full-scope AI review remain gates.

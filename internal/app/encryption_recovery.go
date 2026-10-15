@@ -365,9 +365,9 @@ func applyRecoveryEnvelope(filename string, oldBytes, newBytes []byte, oldPresen
 			// the durable recovery journal.
 			return store.Delete()
 		}
-		return nil
-	}
-	if currentPresent != sourcePresent || !bytes.Equal(currentBytes, sourceBytes) {
+		// Matching visible target bytes can follow an interrupted rename.
+		// Fall through to Save to re-establish file and directory durability.
+	} else if currentPresent != sourcePresent || !bytes.Equal(currentBytes, sourceBytes) {
 		return errors.New("key envelope changed during recovery")
 	}
 	if !targetPresent {
