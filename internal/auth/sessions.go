@@ -106,18 +106,25 @@ func (s *Sessions) WithActiveSession(ctx context.Context, work func() error) err
 	if s == nil || s.service == nil || s.service.db == nil || work == nil || !s.Authenticated(ctx) {
 		return ErrAuthentication
 	}
+	if err := ctx.Err(); err != nil {
+		return errors.Join(ErrSessionBarrier, err)
+	}
 	hash := s.CurrentHash(ctx)
 	if len(hash) != sha256.Size {
 		return ErrAuthentication
 	}
-	tx, err := s.service.db.BeginTx(ctx, nil)
+	// A request cancellation must not release SQLite's writer lock while a
+	// protected publication callback is still running. Check the request before
+	// starting work, then keep the transaction alive until the callback returns.
+	transactionContext := context.WithoutCancel(ctx)
+	tx, err := s.service.db.BeginTx(transactionContext, nil)
 	if err != nil {
 		return errors.Join(ErrSessionBarrier, err)
 	}
 	defer tx.Rollback()
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	var activeHash []byte
-	err = tx.QueryRowContext(ctx, `UPDATE auth_sessions SET revoked_at=revoked_at
+	err = tx.QueryRowContext(transactionContext, `UPDATE auth_sessions SET revoked_at=revoked_at
 		WHERE session_id_hash=? AND revoked_at IS NULL
 		AND julianday(idle_expires_at)>julianday(?)
 		AND julianday(absolute_expires_at)>julianday(?)
@@ -130,6 +137,9 @@ func (s *Sessions) WithActiveSession(ctx context.Context, work func() error) err
 	}
 	if len(activeHash) != sha256.Size {
 		return ErrAuthentication
+	}
+	if err := ctx.Err(); err != nil {
+		return errors.Join(ErrSessionBarrier, err)
 	}
 	s.manager.Put(ctx, sessionPublicationBarrierKey, true)
 	defer s.manager.Remove(ctx, sessionPublicationBarrierKey)

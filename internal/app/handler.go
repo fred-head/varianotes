@@ -64,10 +64,10 @@ func newHandlerWithMutationHook(logger *slog.Logger, repositoryRoot string, auth
 }
 
 func newHandlerWithHooks(logger *slog.Logger, repositoryRoot string, authService *auth.Service, sessions *auth.Sessions, keyManager *encryption.KeyManager, beforeMutationCommit, beforeUnlockGrant func(), versions ...string) (http.Handler, error) {
-	return newHandlerWithPublicationHook(logger, repositoryRoot, authService, sessions, keyManager, beforeMutationCommit, beforeUnlockGrant, nil, versions...)
+	return newHandlerWithPublicationHook(logger, repositoryRoot, authService, sessions, keyManager, beforeMutationCommit, beforeUnlockGrant, nil, nil, versions...)
 }
 
-func newHandlerWithPublicationHook(logger *slog.Logger, repositoryRoot string, authService *auth.Service, sessions *auth.Sessions, keyManager *encryption.KeyManager, beforeMutationCommit, beforeUnlockGrant, beforeProtectedCommit func(), versions ...string) (http.Handler, error) {
+func newHandlerWithPublicationHook(logger *slog.Logger, repositoryRoot string, authService *auth.Service, sessions *auth.Sessions, keyManager *encryption.KeyManager, beforeMutationCommit, beforeUnlockGrant, beforeProtectedCommit, afterProtectedSession func(), versions ...string) (http.Handler, error) {
 	if keyManager == nil {
 		return nil, errors.New("encryption key manager is required")
 	}
@@ -118,7 +118,12 @@ func newHandlerWithPublicationHook(logger *slog.Logger, repositoryRoot string, a
 		if beforeProtectedCommit != nil {
 			beforeProtectedCommit()
 		}
-		return commitProtectedLease(r.Context(), sessions, keyManager, lease, publish)
+		return commitProtectedLease(r.Context(), sessions, keyManager, lease, func() error {
+			if afterProtectedSession != nil {
+				afterProtectedSession()
+			}
+			return publish()
+		})
 	}
 	guardJournal := func(ctx context.Context, access *protectedNoteAccess, lease *encryption.KeyLease) *encryption.TransactionJournal {
 		return access.journal.WithCommitGuard(func(commit func() error) error {
@@ -926,6 +931,9 @@ func newHandlerWithPublicationHook(logger *slog.Logger, repositoryRoot string, a
 				beforeUnlockGrant()
 			}
 			err = withProtectedSession(r.Context(), sessions, keyManager, func() error {
+				if afterProtectedSession != nil {
+					afterProtectedSession()
+				}
 				if err := keyManager.CompleteUnlock(attempt, vaultKey); err != nil {
 					return err
 				}
