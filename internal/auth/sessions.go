@@ -10,6 +10,7 @@ import (
 	"errors"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/alexedwards/scs/v2"
@@ -24,6 +25,43 @@ const (
 )
 
 var errSessionInactive = errors.New("session is revoked or expired")
+
+type callbackStartState uint8
+
+const (
+	callbackStartPending callbackStartState = iota
+	callbackStartAdmitted
+	callbackStartAborted
+)
+
+// callbackStartGate makes callback admission a one-shot synchronized decision.
+// The successful non-blocking receive/default selection is its linearization
+// point: cancellation observed before it prevents work; cancellation after it
+// is after callback start, even if the first callback instruction has not run.
+type callbackStartGate struct {
+	mu    sync.Mutex
+	state callbackStartState
+}
+
+func (gate *callbackStartGate) admit(ctx context.Context) error {
+	gate.mu.Lock()
+	defer gate.mu.Unlock()
+	if gate.state != callbackStartPending {
+		return ErrSessionBarrier
+	}
+	select {
+	case <-ctx.Done():
+		gate.state = callbackStartAborted
+		err := ctx.Err()
+		if err == nil {
+			err = context.Canceled
+		}
+		return errors.Join(ErrSessionBarrier, err)
+	default:
+		gate.state = callbackStartAdmitted
+		return nil
+	}
+}
 
 // ErrSessionBarrier marks a failure to acquire or commit the cross-process
 // auth transaction that protects a sensitive publication.
@@ -103,6 +141,13 @@ func (s *Sessions) Active(ctx context.Context) (bool, error) {
 // complete before reporting a successful revocation. The callback must not
 // call back into the auth database.
 func (s *Sessions) WithActiveSession(ctx context.Context, work func() error) error {
+	return s.withActiveSessionBeforeStart(ctx, nil, work)
+}
+
+// withActiveSessionBeforeStart is the internal admission seam used to exercise
+// cancellation at the callback boundary. Production callers use
+// WithActiveSession, which passes no hook.
+func (s *Sessions) withActiveSessionBeforeStart(ctx context.Context, beforeStart func(), work func() error) error {
 	if s == nil || s.service == nil || s.service.db == nil || work == nil || !s.Authenticated(ctx) {
 		return ErrAuthentication
 	}
@@ -143,6 +188,13 @@ func (s *Sessions) WithActiveSession(ctx context.Context, work func() error) err
 	}
 	s.manager.Put(ctx, sessionPublicationBarrierKey, true)
 	defer s.manager.Remove(ctx, sessionPublicationBarrierKey)
+	if beforeStart != nil {
+		beforeStart()
+	}
+	var startGate callbackStartGate
+	if err := startGate.admit(ctx); err != nil {
+		return err
+	}
 	if err := work(); err != nil {
 		return err
 	}

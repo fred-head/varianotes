@@ -6,10 +6,15 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/fred-head/varianotes/internal/encryption"
 )
 
 func TestSQLiteSessionStoreHashesOpaqueTokenAndHonorsRevocation(t *testing.T) {
@@ -241,6 +246,90 @@ func TestSessionPublicationBarrierSerializesMFAReset(t *testing.T) {
 	called := false
 	if err := sessions.WithActiveSession(ctx, func() error { called = true; return nil }); !errors.Is(err, ErrAuthentication) || called {
 		t.Fatalf("revoked session passed publication barrier: called=%v err=%v", called, err)
+	}
+}
+
+func TestSessionPublicationBarrierRejectsCancellationAtCallbackStart(t *testing.T) {
+	service, err := Open(t.Context(), Config{Mode: ModeLocal, MetadataPath: filepath.Join(t.TempDir(), "auth.db")}, testLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer service.Close()
+	sessions, err := NewSessions(service, DefaultSessionOptions(false))
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := &sqliteSessionStore{db: service.db, codec: sessions.manager.Codec, defaultIdle: time.Hour}
+	token := "session-callback-start-cancellation-test-token"
+	data, err := sessions.manager.Codec.Encode(time.Now().Add(time.Hour), map[string]any{sessionPrincipalKey: OwnerPrincipal})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CommitCtx(t.Context(), token, data, time.Now().Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	sessionCtx, err := sessions.manager.Load(t.Context(), token)
+	if err != nil || !sessions.Authenticated(sessionCtx) {
+		t.Fatalf("load authenticated test session: authenticated=%v error=%v", sessions.Authenticated(sessionCtx), err)
+	}
+
+	requestCtx, cancelRequest := context.WithCancel(sessionCtx)
+	request := httptest.NewRequestWithContext(requestCtx, http.MethodPost, "/api/protected-publication", nil)
+	paused, resume := make(chan struct{}), make(chan struct{})
+	var release sync.Once
+	releaseWork := func() { release.Do(func() { close(resume) }) }
+	defer releaseWork()
+	markerPath := filepath.Join(t.TempDir(), "published")
+	manager := encryption.NewKeyManager()
+	t.Cleanup(func() { _ = manager.Close() })
+	hash := sessionHash(token)
+	var callbackStarted bool
+	publicationDone := make(chan error, 1)
+	finished := false
+	defer func() {
+		cancelRequest()
+		releaseWork()
+		if !finished {
+			select {
+			case <-publicationDone:
+			case <-time.After(5 * time.Second):
+			}
+		}
+	}()
+	go func() {
+		publicationDone <- sessions.withActiveSessionBeforeStart(request.Context(), func() {
+			close(paused)
+			<-resume
+		}, func() error {
+			callbackStarted = true
+			if err := os.WriteFile(markerPath, []byte("published"), 0o600); err != nil {
+				return err
+			}
+			return manager.Unlock("33333333333333333333333333333333", hash[:], bytes.Repeat([]byte{0x31}, encryption.VaultKeySize))
+		})
+	}()
+	select {
+	case <-paused:
+	case <-time.After(5 * time.Second):
+		t.Fatal("publication barrier did not pause immediately before callback admission")
+	}
+	cancelRequest()
+	releaseWork()
+	var barrierErr error
+	select {
+	case barrierErr = <-publicationDone:
+		finished = true
+	case <-time.After(5 * time.Second):
+		t.Fatal("publication barrier did not return after cancellation")
+	}
+	_, fileErr := os.Stat(markerPath)
+	filePublished := fileErr == nil
+	grantPublished := manager.IsUnlocked("33333333333333333333333333333333", hash[:])
+	if callbackStarted || filePublished || grantPublished || !errors.Is(barrierErr, context.Canceled) || !errors.Is(barrierErr, ErrSessionBarrier) {
+		t.Fatalf("canceled callback admission: started=%v filePublished=%v grantPublished=%v error=%v (file stat error=%v)", callbackStarted, filePublished, grantPublished, barrierErr, fileErr)
+	}
+	if err := service.ResetMFA(t.Context()); err != nil {
+		t.Fatalf("MFA reset remained blocked after canceled callback admission: %v", err)
 	}
 }
 
