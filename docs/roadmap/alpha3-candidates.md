@@ -636,6 +636,21 @@ requires its listed tests; P17 adds end-to-end and adversarial coverage.
   No R correction may merge before a fresh full-scope AI review evaluates the
   blockers. This remains an AI review, not independent expert sign-off.
 
+  **R follow-up AI review — blocked (2026-10-14):** R1–R5 were reproduced and
+  corrected as candidates in PRs #32–#36, with process-death/restart, sync-error,
+  concurrency and failed lock-channel regressions. The full uncached Go suite,
+  external age recovery, vet, focused race checks and all frontend checks passed;
+  correction-commit CI passed all four workflow jobs. A new source-only AI
+  session reviewed the complete `060e636..f29ecf3` candidate and its test-only
+  supplement, without counting implementer tests as its own evidence. Its
+  [report](../security/m31-r-followup-ai-review.md) identifies B1/B2: competing
+  Export-recovery and stale Trash reconciliation; B3: online CLI revocation
+  missing the server's grant/publication barrier; B4: missing parent sync on
+  first protected upload. These flows still need dynamic regression coverage
+  and correction. R2 and R4 remain open; all correction PRs and #24 are held
+  open. Work stops at these blockers. P17's expert sign-off is still absent;
+  productive activation stays disabled and P18 is unchanged.
+
 - [ ] **P18 — Operations documentation and release gate**
   *(dependencies: P01–P17; size: S)*
   **Goal/scope:** document setup, recovery, external decryption, backups, visible
