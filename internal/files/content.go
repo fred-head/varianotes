@@ -22,6 +22,8 @@ const internalTransactionStagePrefix = ".vnotes-txn-"
 type contentStore struct {
 	root string
 	mu   sync.RWMutex
+	// Private fault seam for filesystem interruption regressions.
+	fault func(phase, relative string) error
 }
 
 type contentFile struct {
@@ -306,7 +308,10 @@ func (s *contentStore) mkdir(relative string, mode fs.FileMode) error {
 	if err := s.validateParents(root, relative); err != nil {
 		return err
 	}
-	return root.Mkdir(filepath.FromSlash(relative), mode)
+	if err := root.Mkdir(filepath.FromSlash(relative), mode); err != nil {
+		return err
+	}
+	return s.fail("directory.created", relative)
 }
 
 func (s *contentStore) WriteNew(relative string, content []byte, mode fs.FileMode) error {
@@ -340,7 +345,7 @@ func (s *contentStore) writeNew(relative string, content []byte, mode fs.FileMod
 		_ = root.Remove(filepath.FromSlash(relative))
 		return err
 	}
-	return nil
+	return s.fail("file.created", relative)
 }
 
 func (s *contentStore) Remove(relative string) error {
@@ -356,6 +361,18 @@ func (s *contentStore) remove(relative string) error {
 	}
 	defer root.Close()
 	if err := s.validateExisting(root, relative, false); err != nil {
+		return err
+	}
+	return root.Remove(filepath.FromSlash(relative))
+}
+
+func (s *contentStore) removeEmptyDirectory(relative string) error {
+	root, err := s.openRoot()
+	if err != nil {
+		return err
+	}
+	defer root.Close()
+	if err := s.validateExisting(root, relative, true); err != nil {
 		return err
 	}
 	return root.Remove(filepath.FromSlash(relative))
@@ -402,7 +419,10 @@ func (s *contentStore) rename(source, target string) error {
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
-	return root.Rename(filepath.FromSlash(source), filepath.FromSlash(target))
+	if err := root.Rename(filepath.FromSlash(source), filepath.FromSlash(target)); err != nil {
+		return err
+	}
+	return s.fail("file.renamed", target)
 }
 
 func (s *contentStore) SyncDir(relative string) error {
@@ -412,6 +432,9 @@ func (s *contentStore) SyncDir(relative string) error {
 }
 
 func (s *contentStore) syncDir(relative string) error {
+	if err := s.fail("directory.sync", relative); err != nil {
+		return err
+	}
 	root, err := s.openRoot()
 	if err != nil {
 		return err
@@ -432,6 +455,13 @@ func (s *contentStore) syncDir(relative string) error {
 	}
 	defer directory.Close()
 	return directory.Sync()
+}
+
+func (s *contentStore) fail(phase, relative string) error {
+	if s.fault != nil {
+		return s.fault(phase, relative)
+	}
+	return nil
 }
 
 func (s *contentStore) openRoot() (*os.Root, error) {

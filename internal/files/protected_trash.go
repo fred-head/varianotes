@@ -91,15 +91,16 @@ func (r *Repository) MoveToTrashWithCatalog(relative string, catalog encryption.
 	if err != nil {
 		return TrashItem{}, err
 	}
+	// Retry the root barrier even when a prior attempt made .trash visible.
+	if err := r.content.syncDir("."); err != nil {
+		return TrashItem{}, err
+	}
 	id, err := newTrashID()
 	if err != nil {
 		return TrashItem{}, err
 	}
 	finalRoot := path.Join(trashRoot, id)
 	pendingRoot := path.Join(trashRoot, ".pending-"+id)
-	if err := r.content.mkdir(finalRoot, 0o755); err != nil {
-		return TrashItem{}, err
-	}
 	cleanup := func() {
 		_ = r.content.removeAll(finalRoot)
 		_ = r.content.removeAll(pendingRoot)
@@ -108,25 +109,29 @@ func (r *Repository) MoveToTrashWithCatalog(relative string, catalog encryption.
 		cleanup()
 		return TrashItem{}, err
 	}
+	if err := r.content.syncDir(trashRoot); err != nil {
+		cleanup()
+		return TrashItem{}, err
+	}
 	if err := r.writeTrashMetadata(pendingRoot, trashMetadata{OriginalPath: relative, Type: map[bool]string{true: "directory", false: "file"}[folder], DeletedAt: time.Now().UTC().Format(time.RFC3339)}); err != nil {
 		cleanup()
 		return TrashItem{}, err
 	}
-	contentRoot := path.Join(finalRoot, trashContentName)
-	if err := r.content.mkdir(contentRoot, 0o755); err != nil {
+	// The restore mapping must survive before the forward-only content commit.
+	if err := r.content.syncDir(pendingRoot); err != nil {
 		cleanup()
 		return TrashItem{}, err
 	}
+	contentRoot := path.Join(finalRoot, trashContentName)
+	createDirectories := []string{finalRoot, contentRoot}
 	targetRoot := path.Join(contentRoot, "item")
 	if folder {
-		if err := r.content.mkdir(targetRoot, 0o755); err != nil {
+		directories, err := r.planTrashDirectoryTree(relative, targetRoot)
+		if err != nil {
 			cleanup()
 			return TrashItem{}, err
 		}
-		if err := r.mirrorEmptyDirectoryTree(relative, targetRoot); err != nil {
-			cleanup()
-			return TrashItem{}, err
-		}
+		createDirectories = append(createDirectories, directories...)
 	} else {
 		assets := noteAssetsPath(relative)
 		moveAssets := false
@@ -137,14 +142,12 @@ func (r *Repository) MoveToTrashWithCatalog(relative string, catalog encryption.
 			cleanup()
 			return TrashItem{}, assetsErr
 		} else if exists && moveAssets {
-			if err := r.content.mkdir(noteAssetsPath(targetRoot), 0o755); err != nil {
+			directories, err := r.planTrashDirectoryTree(assets, noteAssetsPath(targetRoot))
+			if err != nil {
 				cleanup()
 				return TrashItem{}, err
 			}
-			if err := r.mirrorEmptyDirectoryTree(assets, noteAssetsPath(targetRoot)); err != nil {
-				cleanup()
-				return TrashItem{}, err
-			}
+			createDirectories = append(createDirectories, directories...)
 		}
 	}
 
@@ -198,9 +201,16 @@ func (r *Repository) MoveToTrashWithCatalog(relative string, catalog encryption.
 		}
 	}
 	next.FolderRules = uniqueFolderRules(next.FolderRules)
-	tx, err := journal.Prepare(changes, next, vaultKey)
+	tx, err := journal.PrepareFilesystem(changes, next, vaultKey, createDirectories, nil)
 	if err == nil {
-		err = tx.Commit()
+		if r.transactionPrepared != nil {
+			err = r.transactionPrepared()
+		}
+		if err == nil {
+			err = tx.Commit()
+		} else {
+			err = errors.Join(err, tx.Abort())
+		}
 	}
 	for _, change := range changes {
 		clear(change.Ciphertext)
@@ -800,30 +810,21 @@ func (r *Repository) assetReferencesLocked(catalog encryption.Catalog, vaultKey 
 	return refs, nil
 }
 
-func (r *Repository) mirrorEmptyDirectoryTree(source, target string) error {
+func (r *Repository) planTrashDirectoryTree(source, target string) ([]string, error) {
 	entries, err := r.content.entriesUnder(source)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	directories := make([]string, 0)
+	directories := []string{target}
 	for _, entry := range entries {
 		if entry.Info.Mode()&os.ModeSymlink != 0 {
-			return ErrInvalidPath
+			return nil, ErrInvalidPath
 		}
 		if entry.Info.IsDir() {
-			directories = append(directories, entry.Path)
+			directories = append(directories, target+strings.TrimPrefix(entry.Path, source))
 		}
 	}
-	sort.Slice(directories, func(i, j int) bool {
-		return strings.Count(directories[i], "/") < strings.Count(directories[j], "/")
-	})
-	for _, directory := range directories {
-		destination := target + strings.TrimPrefix(directory, source)
-		if err := r.content.mkdir(destination, 0o755); err != nil {
-			return err
-		}
-	}
-	return nil
+	return directories, nil
 }
 
 func (r *Repository) ensureMirroredDirectoryTree(source, target string) error {
@@ -961,7 +962,7 @@ func (r *Repository) reconcilePendingTrash(catalog encryption.Catalog) error {
 		if readErr != nil {
 			if errors.Is(readErr, os.ErrNotExist) {
 				if _, finalErr := r.content.lstat(path.Join(trashRoot, id, trashMetadataName)); finalErr == nil {
-					if err := r.content.removeAll(pending); err != nil {
+					if err := r.finalizePendingTrash(id); err != nil {
 						return err
 					}
 					continue
@@ -1011,10 +1012,7 @@ func (r *Repository) reconcilePendingTrash(catalog encryption.Catalog) error {
 					return err
 				}
 			}
-			if err := r.content.rename(path.Join(pending, trashMetadataName), path.Join(root, trashMetadataName)); err != nil {
-				return err
-			}
-			if err := r.content.removeAll(pending); err != nil {
+			if err := r.finalizePendingTrash(id); err != nil {
 				return err
 			}
 			if value.Type == "directory" {
@@ -1102,8 +1100,28 @@ func (r *Repository) finalizePendingTrash(id string) error {
 	}
 	pending := path.Join(trashRoot, ".pending-"+id)
 	root := path.Join(trashRoot, id)
-	if err := r.content.rename(path.Join(pending, trashMetadataName), path.Join(root, trashMetadataName)); err != nil {
+	if _, err := r.content.lstat(path.Join(root, trashMetadataName)); errors.Is(err, fs.ErrNotExist) {
+		if err := r.content.rename(path.Join(pending, trashMetadataName), path.Join(root, trashMetadataName)); err != nil {
+			return err
+		}
+	} else if err != nil {
 		return err
 	}
-	return r.content.removeAll(pending)
+	// A retry may see the destination already installed. Sync it again before
+	// making the source removal durable or discarding the recovery directory.
+	if err := r.content.syncDir(root); err != nil {
+		return err
+	}
+	if _, err := r.content.lstat(pending); err == nil {
+		if err := r.content.syncDir(pending); err != nil {
+			return err
+		}
+		// Remove only an empty pending directory; preserve unexpected payload.
+		if err := r.content.removeEmptyDirectory(pending); err != nil {
+			return err
+		}
+	} else if !errors.Is(err, fs.ErrNotExist) {
+		return err
+	}
+	return r.content.syncDir(trashRoot)
 }
