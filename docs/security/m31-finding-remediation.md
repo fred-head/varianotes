@@ -73,9 +73,13 @@ cross-vault binding; it requires independently trusted anti-rollback state.
 
 ## Still open
 
-F9 awaits code verification and remediation. A fresh full M31
-review is required after all confirmed findings are fixed. No merge or security
-approval for P17 is claimed here.
+The original F1–F10 flows have corrections and regression evidence. The fresh
+full P01–P17 AI review of `dc59d0c` found five further blocking variants, R1–R5,
+including recovery durability, late unlock and UI lock-channel failure. They
+remain open; see [the reviewer report](m31-fresh-ai-review.md). The implementer
+confirmed the cited control-flow gaps; the negative power-loss/race flows were
+not dynamically reproduced. Follow-up PRs #30/#31 remain open, and PR #24 must
+not merge. No independent reviewer sign-off or security approval is claimed.
 
 ## F3 — Durable move, backlinks and decrypt restore
 
@@ -108,8 +112,8 @@ Regressions:
 
 Validation: serial uncached `go test -p 1 -count=1 ./...` and focused filesystem
 and journal cases passed; `go vet -p 1 ./internal/encryption ./internal/files`
-passed. F5/F6 still require lease guarding and lock-order corrections at the
-application boundary. Fresh independent review of the complete format and
+passed. The F5/F6 follow-up below adds lease guarding and lock-order corrections
+at the application boundary. Fresh independent review of the complete format and
 integration remains required.
 
 ## F4 — Content save during envelope transition
@@ -195,3 +199,31 @@ Validation: serial full frontend suite and focused additional regressions;
 frontend lint/build. Browser memory erasure or revocation of previously viewed
 plaintext is not claimed; the requirement is to hide protected content and
 reject stale responses while preserving the unsaved draft.
+
+## F9 — Export password derivation bypassed shared throttle
+
+Confirmed by two failed regressions: export reauthentication accepted another
+derivation while the shared credential slot should have been occupied, and
+repeated wrong export passwords left no failure budget across authentication
+database reopen. The route now takes the existing bounded credential slot and
+checks the persistent sensitive-operation throttle before decoding/derivation.
+Actual password rejection records a failure; a valid grant clears previous
+failures using the same scope as vault unlock. Locked, malformed and integrity
+failures do not count as wrong passwords. All exits release the slot and
+throttled export responses keep `no-store, private` and `Retry-After`.
+
+Regressions in `internal/app/export_throttle_test.go`:
+- `TestProtectedExportCredentialFailuresThrottleAcrossRestart`: four wrong
+  attempts, reopen auth database/handler, require 429 for export and unlock.
+- `TestProtectedExportSharesBoundedCredentialWork`: hold one request before
+  derivation, reject export/unlock competitors, then verify slot release. No
+  resource exhaustion load test or parallel expensive derivation is used.
+- `TestProtectedExportSuccessfulReauthenticationClearsCredentialFailures`
+- `TestProtectedExportDoesNotCountLockedOrMalformedRequestsAsPasswordFailures`
+
+Validation: uncached serial auth/app/command suites, focused export cases,
+focused concurrent case with `-race`, and app vet passed. The common throttle
+also limits other password operations; no separate export bypass was introduced.
+Activation remains disabled and P18 unchanged. The fresh review of the entire
+P01–P17 integration is recorded above; its blockers and the required reviewer
+sign-off remain open.

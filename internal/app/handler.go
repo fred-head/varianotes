@@ -1092,7 +1092,23 @@ func newHandlerWithMutationHook(logger *slog.Logger, repositoryRoot string, auth
 		handleNotebookExport(w, r, logger, metadataPath, sessions, keyManager, exportGrants, false)
 	})
 	mux.HandleFunc("POST /api/notebooks/{notebookID}/export/reauth", func(w http.ResponseWriter, r *http.Request) {
-		handleNotebookExportReauthentication(w, r, metadataPath, sessions, keyManager, exportGrants)
+		setExportNoStore(w)
+		if sessions == nil || loginThrottle == nil {
+			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "authenticated session is required"})
+			return
+		}
+		clientIP, release, allowed := beginCredentialAttempt(w, r, auth.ThrottleOperationSensitive)
+		if !allowed {
+			return
+		}
+		defer release()
+		handleNotebookExportReauthentication(w, r, metadataPath, sessions, keyManager, exportGrants,
+			func() bool { return recordCredentialFailure(w, r, auth.ThrottleOperationSensitive, clientIP) },
+			func() {
+				if err := loginThrottle.SuccessOperation(r.Context(), auth.ThrottleOperationSensitive, clientIP); err != nil {
+					logger.Warn("clear export credential throttle failed", "operation", auth.ThrottleOperationSensitive)
+				}
+			})
 	})
 	mux.HandleFunc("POST /api/notebooks/{notebookID}/export", func(w http.ResponseWriter, r *http.Request) {
 		handleNotebookExport(w, r, logger, metadataPath, sessions, keyManager, exportGrants, true)

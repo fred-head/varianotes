@@ -198,6 +198,7 @@ func TestNotebookExportDoesNotPromptWhenCatalogHasNoProtectedContent(t *testing.
 
 type protectedExportHarness struct {
 	handler      http.Handler
+	service      *auth.Service
 	manager      *encryption.KeyManager
 	root         string
 	metadataRoot string
@@ -342,7 +343,7 @@ func newExportHarnessWithMutationHook(t *testing.T, includeProtected bool, befor
 		t.Fatal(err)
 	}
 	return protectedExportHarness{
-		handler: handler, manager: manager, root: root, metadataRoot: metadataRoot, vaultID: vaultID,
+		handler: handler, service: authService, manager: manager, root: root, metadataRoot: metadataRoot, vaultID: vaultID,
 		cookie: cookie, csrf: csrf, key: key, asset: asset, sessionHash: sessionHash, logs: logs,
 	}
 }
