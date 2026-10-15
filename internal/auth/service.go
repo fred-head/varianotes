@@ -191,6 +191,11 @@ func Open(ctx context.Context, config Config, logger *slog.Logger) (*Service, er
 	if err := os.Chmod(filepath.Dir(config.MetadataPath), 0o700); err != nil {
 		return nil, fmt.Errorf("secure authentication metadata directory: %w", err)
 	}
+	releaseJournal, err := lockAuthJournal(ctx, config.MetadataPath)
+	if err != nil {
+		return nil, fmt.Errorf("coordinate authentication initialization: %w", err)
+	}
+	defer releaseJournal()
 
 	db, err := sql.Open("sqlite", config.MetadataPath)
 	if err != nil {
