@@ -535,6 +535,16 @@ func (r *Repository) PrepareAssetUploadWithCatalog(noteRelative string, content 
 		return nil, protectedNote, err
 	}
 	protected := protectedNote || protectedByRule
+	if protected {
+		// The transaction journal stages and publishes ciphertext inside this
+		// directory, but it does not own the directory's creation. Persist its
+		// entry in the parent before a durable catalog commit can reference it.
+		// Sync on retries too: a previous attempt may have left the directory
+		// visible after its parent sync failed.
+		if err := r.content.syncDir(path.Dir(assetsDirectory)); err != nil {
+			return nil, true, err
+		}
+	}
 	asset := Asset{RelativePath: relativePath, ContentType: contentType}
 	if !protected {
 		unlock = false
