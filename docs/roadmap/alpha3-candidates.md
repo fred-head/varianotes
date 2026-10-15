@@ -662,8 +662,9 @@ requires its listed tests; P17 adds end-to-end and adversarial coverage.
   responses and discards plaintext dialogs while preserving hidden drafts.
   F9 now shares bounded credential work and persistent failure throttling with
   vault unlock, including restart and concurrency regressions. Follow-up PR
-  gates remain open. PR #24 must not merge while
-  confirmed release blockers remain. Activation stays disabled.
+  fixes have since been integrated into `main`; they do not replace P17's fresh
+  full-scope review of the updated candidate. PR #24 must not merge while that
+  review reports release blockers. Activation stays disabled.
 
   **Fresh AI review — blocked (2026-10-14):** a separate AI session reviewed the
   complete pre-P01-to-P17 candidate `060e636..dc59d0c`, including all F1–F10
@@ -674,15 +675,19 @@ requires its listed tests; P17 adds end-to-end and adversarial coverage.
   failure. The implementer confirmed the control-flow gaps; those negative
   flows were not dynamically reproduced. See
   [`../security/m31-fresh-ai-review.md`](../security/m31-fresh-ai-review.md).
-  All five findings remain open. PRs #30/#31 are held open; PR #24 is not merged.
-  This AI report provides no independent reviewer sign-off. P17 remains open;
-  productive activation is disabled and P18 is unchanged.
+  All five findings were open on the reviewed candidate. The report identifies
+  blockers on that commit and therefore does not satisfy the Alpha 3 P17
+  sign-off rule. A fresh review of the updated candidate may serve as the
+  selected sign-off under that rule. P17 remains open; productive activation is
+  disabled and P18 is unchanged.
 
   **R-finding correction candidates:** reproduction, corrections, regression
   tests and limitations are tracked in
   [`../security/m31-review-remediation.md`](../security/m31-review-remediation.md).
-  No R correction may merge before a fresh full-scope AI review evaluates the
-  blockers. This remains an AI review, not independent expert sign-off.
+  The merge gate recorded for those candidates predates their later integration
+  into `main`. Their full-scope AI review remains required for P17 under the
+  [Alpha 3 sign-off rule](../security/m31-p17-ai-review-signoff.md); an eligible
+  AI review is not an expert audit or general security certification.
 
   **R follow-up AI review — blocked (2026-10-14):** R1–R5 were reproduced and
   corrected as candidates in PRs #32–#36, with process-death/restart, sync-error,
@@ -694,10 +699,12 @@ requires its listed tests; P17 adds end-to-end and adversarial coverage.
   [report](../security/m31-r-followup-ai-review.md) identifies B1/B2: competing
   Export-recovery and stale Trash reconciliation; B3: online CLI revocation
   missing the server's grant/publication barrier; B4: missing parent sync on
-  first protected upload. These flows still need dynamic regression coverage
-  and correction. R2 and R4 remain open; all correction PRs and #24 are held
-  open. Work stops at these blockers. P17's expert sign-off is still absent;
-  productive activation stays disabled and P18 is unchanged.
+  first protected upload. These findings were open on the reviewed candidate;
+  corrections were subsequently merged into `main` in PR #38 (B1/B2), #39 (B3),
+  and #40 (B4). That report does not sign off the later candidate. P17 remains
+  open pending a fresh review of the current full M31 state under the Alpha 3
+  rule, with its required technical checks passing on the reviewed commit.
+  Productive activation stays disabled and P18 is unchanged.
 
 - [ ] **P18 — Operations documentation and release gate**
   *(dependencies: P01–P17; size: S)*

@@ -12,7 +12,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   active Save/Move/Restore transactions through commit or abort. Protected
   Trash reconciliation recovers and reloads the current catalog under those
   locks, retaining restore mappings across interrupted commits/finalization.
-  B3/B4 and further security review remain open; activation stays disabled.
+  Follow-up corrections for B1/B2, B3 and B4 are in PRs #38, #39 and #40. A
+  fresh full-scope P17 review remains required; activation stays disabled.
 
 - M31 recovery repeats commit, content, catalog and key-envelope durability
   barriers before completing interrupted work. Serial protected Trash paths journal their
@@ -20,7 +21,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   interrupted finalization. Further security review remains required.
 
 - M31 pending unlock requests are fenced against HTTP manual lock, logout
-  and session revocation. Online CLI revocation coordination remains open.
+  and session revocation. Online CLI revocation is coordinated with protected
+  work by the follow-up in PR #39.
 
 - M31 protected views hide plaintext on lock-channel or connection failures
   and enforce a local display deadline when lock events stop arriving.

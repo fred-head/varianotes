@@ -3,9 +3,11 @@
 Scope: findings B1 and B2 from the immutable
 [follow-up AI source review](m31-r-followup-ai-review.md). The correction starts
 from `dc588fe`; the report's original provenance remains unchanged.
-B3 (online CLI revocation) and B4 (first-upload parent fsync) remain
-open. Encryption activation stays disabled, P18 is unchanged and no PR is
-merged. This is implementation evidence, not independent security sign-off.
+At the time of this candidate, B3 (online CLI revocation) and B4 (first-upload
+parent fsync) remained open. The B1/B2 correction later merged in PR #38; the
+B3 and B4 corrections later merged in PRs #39 and #40. Encryption activation
+stays disabled and P18 is unchanged. This implementation evidence does not by
+itself satisfy the Alpha 3 P17 sign-off rule.
 
 ## Reproduction before the correction
 
@@ -72,8 +74,11 @@ run matching `TestHTTPExportRecoveryDuringPrepared` and
 test/race attempts with `GOMAXPROCS=2` and `GOMEMLIMIT=1536MiB` timed out in
 password KDF work; their dumps did not show blocked vault locks. The normal
 full suite was then rerun successfully in serial with default runtime limits.
-The complete race gate remains CI work.
+At the time of this candidate, the complete race gate remained CI work.
 
 These tests exercise process death and injected I/O failures;
-they do not simulate physical power loss. CI, the required fresh full-scope AI
-review before any R-fix merge, and independent P17 review remain outstanding.
+they do not simulate physical power loss. The full-scope review of the updated
+M31 candidate remains required under the
+[Alpha 3 P17 rule](m31-p17-ai-review-signoff.md); that review may serve as the
+selected sign-off if it reports no release blockers and all required technical
+checks pass on the reviewed commit.
