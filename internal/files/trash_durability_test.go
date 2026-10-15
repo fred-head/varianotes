@@ -93,11 +93,22 @@ func TestProtectedTrashProcessRestart(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		journal, err := encryption.NewTransactionJournal(repository.root, store)
+		armed := false
+		journal, err := encryption.NewTransactionJournal(repository.root, store, encryption.TransactionJournalOptions{
+			Fault: func(phase string) error {
+				if armed && boundary == "catalog-rename" && phase == "transaction.catalog.rename" {
+					os.Exit(86)
+				}
+				return nil
+			},
+		})
 		if err != nil {
 			t.Fatal(err)
 		}
 		repository.content.fault = func(phase, relative string) error {
+			if boundary == "before-metadata-rename" && phase == "file.rename" && strings.HasSuffix(relative, "/metadata.json") {
+				os.Exit(86)
+			}
 			if boundary == "pending-created" && phase == "directory.created" && strings.Contains(relative, ".pending-") {
 				os.Exit(86)
 			}
@@ -110,6 +121,7 @@ func TestProtectedTrashProcessRestart(t *testing.T) {
 			return nil
 		}
 		repository.transactionPrepared = func() error {
+			armed = true
 			if boundary == "directories-prepared" {
 				os.Exit(86)
 			}
@@ -137,7 +149,7 @@ func TestProtectedTrashProcessRestart(t *testing.T) {
 		}
 		return
 	}
-	for _, boundary := range []string{"pending-created", "metadata-written", "directories-prepared", "content-committed", "metadata-renamed"} {
+	for _, boundary := range []string{"pending-created", "metadata-written", "directories-prepared", "catalog-rename", "content-committed", "before-metadata-rename", "metadata-renamed"} {
 		t.Run(boundary, func(t *testing.T) {
 			repository, store, _, catalog, key, catalogPath := trashDurabilityFixture(t)
 			command := exec.Command(os.Args[0], "-test.run=^TestProtectedTrashProcessRestart$")
@@ -152,14 +164,13 @@ func TestProtectedTrashProcessRestart(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if err := journal.RecoverForVault(key, catalog.VaultID); err != nil {
-				t.Fatal(err)
-			}
-			catalog, err = store.Load(key, catalog.VaultID)
+			// The listing still holds the pre-operation snapshot. It must recover
+			// the journal and use its current catalog before touching metadata.
+			items, err := restarted.TrashItemsWithCatalog(catalog, key, journal)
 			if err != nil {
 				t.Fatal(err)
 			}
-			items, err := restarted.TrashItemsWithCatalog(catalog, key)
+			catalog, err = store.Load(key, catalog.VaultID)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -214,12 +225,12 @@ func TestProtectedTrashBarrierFailuresPreserveRestoreMapping(t *testing.T) {
 			}
 			if at != "pending" {
 				// Repeated failure must retain the pending recovery directory.
-				if _, err := repository.TrashItemsWithCatalog(catalog, key); !errors.Is(err, injected) {
+				if _, err := repository.TrashItemsWithCatalog(catalog, key, journal); !errors.Is(err, injected) {
 					t.Fatalf("retry skipped failed barrier: %v", err)
 				}
 			}
 			repository.content.fault = nil
-			items, err := repository.TrashItemsWithCatalog(catalog, key)
+			items, err := repository.TrashItemsWithCatalog(catalog, key, journal)
 			if err != nil {
 				t.Fatal(err)
 			}

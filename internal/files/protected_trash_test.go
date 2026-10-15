@@ -46,7 +46,7 @@ func TestProtectedTrashKeepsCiphertextAndRestoresWithProtection(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	items, err := repository.TrashItemsWithCatalog(catalog, key)
+	items, err := repository.TrashItemsWithCatalog(catalog, key, journal)
 	if err != nil || len(items) != 1 || !items[0].Protected || items[0].ProtectionChoiceRequired {
 		t.Fatalf("protected Trash listing = %#v, err=%v", items, err)
 	}
@@ -187,7 +187,7 @@ func TestProtectedFolderTrashAndRestorePreservesRecursivePolicy(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	listed, err := repository.TrashItemsWithCatalog(catalog, key)
+	listed, err := repository.TrashItemsWithCatalog(catalog, key, journal)
 	if err != nil || len(listed) != 1 || !listed[0].ProtectionChoiceRequired {
 		t.Fatalf("folder Trash listing = %#v, err=%v", listed, err)
 	}
@@ -374,7 +374,7 @@ func TestProtectedTrashPermanentDeleteBlocksReferencedTrashAttachment(t *testing
 	if _, err := repository.DeleteTrashItemWithCatalog(item.ID, catalog, key, store, journal); !errors.Is(err, ErrTrashReferencedAsset) {
 		t.Fatalf("permanent delete with a shared attachment = %v", err)
 	}
-	items, err := repository.TrashItemsWithCatalog(catalog, key)
+	items, err := repository.TrashItemsWithCatalog(catalog, key, journal)
 	if err != nil || len(items) != 1 {
 		t.Fatalf("referenced protected Trash was lost: %#v err=%v", items, err)
 	}
@@ -435,7 +435,7 @@ func TestProtectedTrashCommitRecoversForwardAndFinalizesStagedMetadata(t *testin
 	if err := os.Remove(oldCiphertext); err != nil {
 		t.Fatal(err)
 	}
-	items, err := repository.TrashItemsWithCatalog(catalog, key)
+	items, err := repository.TrashItemsWithCatalog(catalog, key, journal)
 	if err != nil || len(items) != 1 || !items[0].Protected {
 		t.Fatalf("reconciled Trash item = %#v err=%v", items, err)
 	}
@@ -462,7 +462,7 @@ func TestProtectedTrashCommitRecoversForwardAndFinalizesStagedMetadata(t *testin
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := repository.TrashItemsWithCatalog(catalog, key); err != nil {
+	if _, err := repository.TrashItemsWithCatalog(catalog, key, journal); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Lstat(stalePending); !errors.Is(err, os.ErrNotExist) {
@@ -480,7 +480,7 @@ func TestProtectedTrashCommitRecoversForwardAndFinalizesStagedMetadata(t *testin
 	if err := os.MkdirAll(filepath.Join(missingMetadataFinal, trashContentName, "item", "empty"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := repository.TrashItemsWithCatalog(catalog, key); err != nil {
+	if _, err := repository.TrashItemsWithCatalog(catalog, key, journal); err != nil {
 		t.Fatalf("reconcile metadata-less pending Trash: %v", err)
 	}
 	for _, stalePath := range []string{missingMetadataPending, missingMetadataFinal} {
@@ -498,7 +498,7 @@ func TestProtectedTrashReconcilesCompletedAndAmbiguousRoots(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	store, _ := protectedFixture(t, root, metadata, catalog, key)
+	store, journal := protectedFixture(t, root, metadata, catalog, key)
 	catalog, err = store.Load(key, catalog.VaultID)
 	if err != nil {
 		t.Fatal(err)
@@ -509,7 +509,7 @@ func TestProtectedTrashReconcilesCompletedAndAmbiguousRoots(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(completedRoot, "content", "item", "empty"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if items, err := repository.TrashItemsWithCatalog(catalog, key); err != nil || len(items) != 0 {
+	if items, err := repository.TrashItemsWithCatalog(catalog, key, journal); err != nil || len(items) != 0 {
 		t.Fatalf("listing after a completed Trash operation = %#v err=%v", items, err)
 	}
 	if _, err := os.Stat(completedRoot); !errors.Is(err, os.ErrNotExist) {
@@ -526,7 +526,7 @@ func TestProtectedTrashReconcilesCompletedAndAmbiguousRoots(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, err := repository.TrashItemsWithCatalog(catalog, key); !errors.Is(err, ErrInvalidPath) {
+	if _, err := repository.TrashItemsWithCatalog(catalog, key, journal); !errors.Is(err, ErrInvalidPath) {
 		t.Fatalf("listing with ambiguous metadata-less Trash returned %v", err)
 	}
 	if contents, err := os.ReadFile(ambiguousFile); err != nil || string(contents) != "preserve me" {

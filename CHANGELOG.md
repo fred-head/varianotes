@@ -8,11 +8,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- M31 exports and repository instances share vault synchronization and preserve
+  active Save/Move/Restore transactions through commit or abort. Protected
+  Trash reconciliation recovers and reloads the current catalog under those
+  locks, retaining restore mappings across interrupted commits/finalization.
+  B3/B4 and further security review remain open; activation stays disabled.
+
 - M31 recovery repeats commit, content, catalog and key-envelope durability
   barriers before completing interrupted work. Serial protected Trash paths journal their
   destination directories and preserves durable restore metadata across
-  interrupted finalization. Concurrent recovery/reconciliation findings remain
-  open; further security review remains required.
+  interrupted finalization. Further security review remains required.
 
 - M31 pending unlock requests are fenced against HTTP manual lock, logout
   and session revocation. Online CLI revocation coordination remains open.

@@ -21,7 +21,7 @@ const internalTransactionStagePrefix = ".vnotes-txn-"
 // coordination with other repository mutations.
 type contentStore struct {
 	root string
-	mu   sync.RWMutex
+	mu   *sync.RWMutex
 	// Private fault seam for filesystem interruption regressions.
 	fault func(phase, relative string) error
 }
@@ -403,6 +403,9 @@ func (s *contentStore) Rename(source, target string) error {
 }
 
 func (s *contentStore) rename(source, target string) error {
+	if err := s.fail("file.rename", target); err != nil {
+		return err
+	}
 	root, err := s.openRoot()
 	if err != nil {
 		return err

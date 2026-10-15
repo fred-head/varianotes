@@ -4,7 +4,6 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"sync"
 
 	"github.com/fred-head/varianotes/internal/auth"
 	"github.com/fred-head/varianotes/internal/encryption"
@@ -17,22 +16,19 @@ type protectedNoteAccess struct {
 	store   *encryption.CatalogStore
 	journal *encryption.TransactionJournal
 	err     error
-
-	mu        sync.Mutex
-	recovered bool
 }
 
 func newProtectedNoteAccess(repository *files.Repository, registryPath string, record notebookRecord) *protectedNoteAccess {
 	if repository == nil || !repository.Configured() {
 		return nil
 	}
-	hasAge, ageErr := repository.HasAgeFiles()
 	access := &protectedNoteAccess{}
-	if ageErr != nil {
-		access.enabled, access.err = true, ageErr
-		return access
-	}
 	if registryPath == "" || record.ID == "" {
+		hasAge, ageErr := repository.HasAgeFiles()
+		if ageErr != nil {
+			access.enabled, access.err = true, ageErr
+			return access
+		}
 		if hasAge {
 			access.enabled = true
 			access.err = errors.New("encrypted files exist without registered encryption metadata")
@@ -46,6 +42,11 @@ func newProtectedNoteAccess(repository *files.Repository, registryPath string, r
 		return access
 	}
 	if !state.protected {
+		hasAge, ageErr := repository.HasAgeFiles()
+		if ageErr != nil {
+			access.enabled, access.err = true, ageErr
+			return access
+		}
 		if hasAge {
 			access.enabled = true
 			access.err = errors.New("encrypted files exist without valid encryption metadata")
@@ -74,29 +75,16 @@ func (access *protectedNoteAccess) catalogForKey(vaultKey []byte) (encryption.Ca
 		}
 		return encryption.Catalog{}, errors.New("protected note storage is unavailable")
 	}
-	access.mu.Lock()
-	defer access.mu.Unlock()
 	expectedID := registeredCatalogID(access.vaultID)
-	// Check the registration before allowing recovery to mutate any live files.
-	if _, err := access.store.Load(vaultKey, expectedID); err != nil {
-		return encryption.Catalog{}, err
+	var catalog encryption.Catalog
+	err := access.journal.WithRecoveredCatalog(vaultKey, expectedID, func(current encryption.Catalog) error {
+		catalog = current
+		return nil
+	})
+	if err != nil {
+		return encryption.Catalog{}, fmt.Errorf("recover encrypted note storage: %w", err)
 	}
-	if !access.recovered {
-		if err := access.journal.RecoverForVault(vaultKey, expectedID); err != nil {
-			return encryption.Catalog{}, fmt.Errorf("recover encrypted note storage: %w", err)
-		}
-		access.recovered = true
-	}
-	return access.store.Load(vaultKey, expectedID)
-}
-
-func (access *protectedNoteAccess) needsRecovery() {
-	if access == nil {
-		return
-	}
-	access.mu.Lock()
-	access.recovered = false
-	access.mu.Unlock()
+	return catalog, nil
 }
 
 func beginProtectedNoteLease(w http.ResponseWriter, r *http.Request, access *protectedNoteAccess, sessions *auth.Sessions, manager *encryption.KeyManager) (*encryption.KeyLease, bool) {

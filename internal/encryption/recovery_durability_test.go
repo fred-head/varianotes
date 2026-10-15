@@ -44,9 +44,7 @@ func TestRecoveryProcessBoundary(t *testing.T) {
 		return
 	}
 	fixture := newPlaintextConversionFixture(t, []byte("process-boundary secret"))
-	if _, err := fixture.journal.Prepare(fixture.changes, fixture.nextCatalog, fixture.key); err != nil {
-		t.Fatal(err)
-	}
+	runTransactionProcessExit(t, fixture, "prepared")
 	run := func(decide bool, phase string) {
 		t.Helper()
 		command := exec.Command(os.Args[0], "-test.run=^TestRecoveryProcessBoundary$")

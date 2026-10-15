@@ -1380,8 +1380,7 @@ func newHandlerWithHooks(logger *slog.Logger, repositoryRoot string, authService
 				})
 			})
 			if err != nil {
-				operation.Abort()
-				noteAccess.needsRecovery()
+				err = errors.Join(err, operation.Abort())
 				writeProtectedNoteError(w, err)
 			}
 			return
@@ -1430,8 +1429,7 @@ func newHandlerWithHooks(logger *slog.Logger, repositoryRoot string, authService
 				})
 			})
 			if err != nil {
-				operation.Abort()
-				noteAccess.needsRecovery()
+				err = errors.Join(err, operation.Abort())
 				writeProtectedNoteError(w, err)
 			}
 			return
@@ -1480,8 +1478,7 @@ func newHandlerWithHooks(logger *slog.Logger, repositoryRoot string, authService
 					})
 				})
 				if err != nil {
-					operation.Abort()
-					noteAccess.needsRecovery()
+					err = errors.Join(err, operation.Abort())
 					writeProtectedNoteError(w, err)
 				}
 				return
@@ -1520,9 +1517,6 @@ func newHandlerWithHooks(logger *slog.Logger, repositoryRoot string, authService
 			})
 			if err != nil {
 				lease.Close()
-				if errors.Is(err, encryption.ErrTransactionNeedsRecovery) {
-					noteAccess.needsRecovery()
-				}
 				writeProtectedNoteError(w, err)
 				return
 			}
@@ -1671,9 +1665,6 @@ func newHandlerWithHooks(logger *slog.Logger, repositoryRoot string, authService
 			})
 			if err != nil {
 				lease.Close()
-				if errors.Is(err, encryption.ErrTransactionNeedsRecovery) {
-					noteAccess.needsRecovery()
-				}
 				writeProtectedNoteError(w, err)
 				return
 			}
@@ -1713,7 +1704,7 @@ func newHandlerWithHooks(logger *slog.Logger, repositoryRoot string, authService
 					return loadErr
 				}
 				var listErr error
-				items, listErr = repository.TrashItemsWithCatalog(catalog, key)
+				items, listErr = repository.TrashItemsWithCatalog(catalog, key, noteAccess.journal)
 				return listErr
 			})
 			if err != nil {
@@ -1762,9 +1753,6 @@ func newHandlerWithHooks(logger *slog.Logger, repositoryRoot string, authService
 			})
 			if err != nil {
 				lease.Close()
-				if errors.Is(err, encryption.ErrTransactionNeedsRecovery) {
-					noteAccess.needsRecovery()
-				}
 				writeProtectedNoteError(w, err)
 				return
 			}
@@ -1803,9 +1791,6 @@ func newHandlerWithHooks(logger *slog.Logger, repositoryRoot string, authService
 			})
 			if err != nil {
 				lease.Close()
-				if errors.Is(err, encryption.ErrTransactionNeedsRecovery) {
-					noteAccess.needsRecovery()
-				}
 				writeProtectedNoteError(w, err)
 				return
 			}
@@ -1866,7 +1851,6 @@ func newHandlerWithHooks(logger *slog.Logger, repositoryRoot string, authService
 			})
 			if err != nil {
 				operation.Abort()
-				noteAccess.needsRecovery()
 				writeProtectedNoteError(w, err)
 			}
 			return
