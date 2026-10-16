@@ -1,4 +1,13 @@
-# M31 fresh AI review after R1–R5 corrections
+# M31 historical AI review after R1–R5 corrections
+
+> **Historical, commit-bound review.** The findings below apply to the reviewed
+> candidate identified in the provenance section (`f29ecf3`), where B1–B4 were
+> open. Later corrections are recorded in
+> [M31 review remediation](m31-review-remediation.md),
+> [B1/B2 remediation](m31-b1-b2-remediation.md), and
+> [C1 remediation](m31-c1-remediation.md). P17 has since completed after the
+> documented fresh AI review, and PR #24 is merged. This report does not assess
+> later commits. P18 remains open; encryption activation remains disabled.
 
 **Drei hohe Freigabeblocker und ein weiterer Dauerhaftigkeitsbefund wurden gefunden.** Die folgenden Abläufe sind aus dem Quelltext hergeleitet; ich habe keine Tests ausgeführt und keine Laufzeitreproduktion vorgenommen.
 
@@ -114,7 +123,8 @@ Zum Abschluss verifiziert: HEAD weiterhin **`f29ecf3d4d5a3788565a5216aa8ff8e2eda
 - Fresh source-review session: `01a13a59-9c7c-7073-9792-1f97f8818894`.
 - Immutable isolated candidate: `f29ecf3d4d5a3788565a5216aa8ff8e2eda44f3b`;
   independently verified baseline: `060e6367a7905f6306bac7273f19e1681df41f39`.
-- Complete P01–P17 plus F1–F10/R1–R5; PR #24 was assembled locally and not merged.
+- Complete P01–P17 plus F1–F10/R1–R5; PR #24 was assembled locally and had not
+  merged at the time of this report.
   The three-line test-only addition at `7d0e68f7a8caed682ee2dd8861a0050a9798d5d7`
   was separately read by the reviewer. Production sources are identical.
 - The report is reproduced above with portable source links. The reviewer
@@ -130,7 +140,8 @@ Zum Abschluss verifiziert: HEAD weiterhin **`f29ecf3d4d5a3788565a5216aa8ff8e2eda
   not been dynamically reproduced or fixed on the reviewed candidate. The
   report is not a general safety certification or merge approval.
 - Work stopped at the reported blockers on that candidate. At the time, the
-  correction PRs were open; PR #24 remains open, productive activation is
-  disabled and P18 is unchanged. Corrections for B1/B2, B3 and B4 were later
+  correction PRs were open; PR #24 had not merged at the time of this report,
+  productive activation was disabled and P18 was unchanged. Corrections for
+  B1/B2, B3 and B4 were later
   merged into `main` in PRs #38, #39 and #40. A fresh full-scope review of the
   updated candidate remains necessary under the Alpha 3 P17 rule.

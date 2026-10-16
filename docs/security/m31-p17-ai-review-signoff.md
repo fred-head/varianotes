@@ -1,5 +1,11 @@
 # M31 P17 AI review sign-off for Alpha 3
 
+**Current status:** P17 is complete following the documented fresh AI review,
+and PR #24 is merged. P18 remains open, so production encryption activation
+stays disabled. This document defines the sign-off rule; it does not add
+reviewer, commit, or report details beyond the records maintained for that
+review.
+
 ## Decision and limits
 
 No independent security expert is available for the Alpha 3 M31 review. For
@@ -41,8 +47,7 @@ candidate commit:
 2. All P01–P17 required technical checks, including the acceptance tests and
    applicable repository CI/release gates, have passed on that commit.
 
-If the candidate changes after review, repeat the full-scope review and the
-required technical checks on the changed commit before P17 can be completed.
-P18 and production activation remain blocked until P17 passes this gate.
-Passing P17 does not bypass P18: production activation remains disabled until
-the separate P18 release gate passes.
+If a candidate changes after review, repeat the full-scope review and the
+required technical checks on the changed commit before treating that commit as
+P17-complete. P17 has passed this gate. P18 remains open, and production
+activation stays disabled until the separate P18 release gate passes.

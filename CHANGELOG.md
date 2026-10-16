@@ -8,23 +8,31 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- M31 P17 is complete following the documented fresh AI review, and PR #24 is
+  merged. P18 remains open, so encryption activation stays disabled. Earlier
+  M31 entries below preserve the status at their respective candidate points.
+
 - M31 auth initialization, including `auth reset-mfa`, waits for live
   password/envelope transactions across service instances and processes.
   Cancellation and failed recovery retain unfinished journals; process restart
-  releases ownership and safely retries recovery. Encryption activation and
-  the separate P17 review remain pending.
+  releases ownership and safely retries recovery. At the time of this change,
+  P17 review remained pending; P17 has since completed. Activation remains
+  disabled until P18 passes.
 
 - M31 exports and repository instances share vault synchronization and preserve
   active Save/Move/Restore transactions through commit or abort. Protected
   Trash reconciliation recovers and reloads the current catalog under those
   locks, retaining restore mappings across interrupted commits/finalization.
-  Follow-up corrections for B1/B2, B3 and B4 are in PRs #38, #39 and #40. A
-  fresh full-scope P17 review remains required; activation stays disabled.
+  Follow-up corrections for B1/B2, B3 and B4 merged in PRs #38, #39 and #40.
+  P17's fresh full-scope review has since completed; activation stays disabled
+  until P18 passes.
 
 - M31 recovery repeats commit, content, catalog and key-envelope durability
   barriers before completing interrupted work. Serial protected Trash paths journal their
   destination directories and preserves durable restore metadata across
-  interrupted finalization. Further security review remains required.
+  interrupted finalization. Further security review was still required for the
+  candidate at that time; P17 has since completed and P18 remains the activation
+  gate.
 
 - M31 pending unlock requests are fenced against HTTP manual lock, logout
   and session revocation. Online CLI revocation is coordinated with protected
@@ -67,6 +75,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- Added the M31 encrypted-vault operations guide for complete backups,
+  password and recovery-code handling, standalone recovery, metadata visibility,
+  plaintext copies, memory limits, and release conditions. The source recovery
+  utility now prompts for the vault password without exposing it in command
+  arguments and restores into a new directory. P17 is complete; new/adopted-vault
+  release-flow checks remain pending for P18, and activation stays disabled.
 - Added M31P16 protection status, per-session unlock and manual lock, recovery
   code setup and replacement, and password recovery that preserves encrypted
   content. Locked views hide protected notes while unsaved drafts stay only in
