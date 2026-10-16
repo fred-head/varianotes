@@ -126,11 +126,11 @@ Zum Abschluss verifiziert: HEAD weiterhin **`f29ecf3d4d5a3788565a5216aa8ff8e2eda
   snapshot boundaries. B3 leaves R4's online CLI boundary open; B4 concerns a
   directory-publication barrier outside the patched Trash paths.
 - The implementer re-read the cited Export/Journal/Trash/CLI control flows.
-  These additional negative interleavings and the upload power-loss state have
-  not been dynamically reproduced or fixed. No general safety, independent
-  expert sign-off or merge approval is claimed.
-- Work stops at the reported security blockers. All correction PRs remain open,
-  PR #24 remains open, productive activation is disabled and P18 is unchanged.
-  A further repair must cover shared vault transaction ownership, authoritative
-  Trash reconciliation, and coordinated online CLI revocation without silently
-  restricting the documented operator workflow. B4 also remains open.
+  These additional negative interleavings and the upload power-loss state had
+  not been dynamically reproduced or fixed on the reviewed candidate. The
+  report is not a general safety certification or merge approval.
+- Work stopped at the reported blockers on that candidate. At the time, the
+  correction PRs were open; PR #24 remains open, productive activation is
+  disabled and P18 is unchanged. Corrections for B1/B2, B3 and B4 were later
+  merged into `main` in PRs #38, #39 and #40. A fresh full-scope review of the
+  updated candidate remains necessary under the Alpha 3 P17 rule.

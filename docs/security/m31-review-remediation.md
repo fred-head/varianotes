@@ -1,19 +1,28 @@
 # M31 R1–R5 remediation candidates
 
-Source findings: [fresh AI report](m31-fresh-ai-review.md). These follow-up
-changes are candidates, not a release or merge approval. Before any R-fix PR
-merges, a fresh AI session must review the complete pre-P01-to-P17 candidate
-and assess release blockers. The AI review does not replace P17's independent
-reviewer sign-off. PR #24 remains open, activation disabled, P18 unchanged.
+This document records findings and remediation evidence for the candidates
+reviewed at the time; those reports do not assess today's complete M31 state.
+The Alpha 3 P17 sign-off is governed by the
+[P17 AI review rule](m31-p17-ai-review-signoff.md): a qualifying fresh,
+separate, read-only AI review may serve as the selected sign-off when it finds
+no release blockers and the required technical checks pass on the reviewed
+commit. It is not an expert audit or a general security certification.
 
-**Fresh follow-up outcome: blocked.** The completed
+The source review below found blockers on its candidate. Follow-up corrections
+for B1/B2, B3, and B4 were later merged into `main` in PRs #38, #39, and #40,
+respectively. A fresh full-scope review of the updated candidate is still
+required before P17 can close. PR #24 remains open, activation disabled, P18
+unchanged.
+
+**Fresh follow-up outcome for the reviewed candidate: blocked.** The completed
 [full-scope AI source review](m31-r-followup-ai-review.md) reports three high
 blockers (B1–B3) and a medium durability finding (B4). A separate
 [B1/B2 correction candidate](m31-b1-b2-remediation.md) dynamically reproduces
-and addresses concurrent recovery and stale catalog reconciliation. B3/B4
-remain open, including R4's documented online CLI revocation. The serial
-R1/R2 barriers, R3 replay and R5 display fences are correction candidates,
-not overall recovery/safety guarantees. No correction PR has merged.
+and addresses concurrent recovery and stale catalog reconciliation. On that
+reviewed candidate, B3/B4 also remained open, including R4's documented online
+CLI revocation. The serial R1/R2 barriers, R3 replay and R5 display fences are
+correction candidates, not overall recovery/safety guarantees. The later B1–B4
+corrections are implementation changes, not a P17 sign-off.
 
 Tests run serially with disk-backed caches/temporary data, `GOMAXPROCS=2` and
 `GOMEMLIMIT=1536MiB`; focused race checks use the same limits. Abrupt subprocess
@@ -188,7 +197,10 @@ outage or suspended-browser process test. CI/full-scope AI review remain gates.
   inspected the complete baseline-to-candidate difference in the unchanged
   isolated `f29ecf3` checkout and the three-line test addition. It executed no
   tests; implementer validation is not counted as the reviewer's own evidence.
-  It is an AI review, not P17's independent expert sign-off.
+  That report found B1–B4 blockers on its reviewed candidate and therefore did
+  not satisfy the Alpha 3 P17 sign-off rule. A fresh review of the updated
+  candidate may serve as the selected sign-off under that rule; this bounded AI
+  review is not an expert audit or general security certification.
 
 ## CI at the correction commits (2026-10-14)
 

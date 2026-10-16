@@ -3,6 +3,8 @@ package encryption
 import (
 	"bytes"
 	"errors"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -328,6 +330,103 @@ func TestKeyManagerRevocationAndRestartClearSessionGrants(t *testing.T) {
 	defer restarted.Close()
 	if restarted.IsUnlocked("vault-d", secondSession) {
 		t.Fatal("new manager loaded a prior process key")
+	}
+}
+
+func TestKeyManagerLockRacesInvalidateEverySessionLease(t *testing.T) {
+	for iteration := range 16 {
+		manager := newKeyManager(time.Minute)
+		firstSession := bytes.Repeat([]byte{byte(iteration + 1)}, 32)
+		secondSession := bytes.Repeat([]byte{byte(iteration + 33)}, 32)
+		key := bytes.Repeat([]byte{0x7b}, VaultKeySize)
+		firstEvents, cancelFirst, err := manager.Subscribe("vault-lock-race", firstSession)
+		if err != nil {
+			t.Fatal(err)
+		}
+		secondEvents, cancelSecond, err := manager.Subscribe("vault-lock-race", secondSession)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := manager.Unlock("vault-lock-race", firstSession, key); err != nil {
+			t.Fatal(err)
+		}
+		assertLockEvent(t, firstEvents, false, LockReasonUnlocked)
+		if err := manager.Unlock("vault-lock-race", secondSession, key); err != nil {
+			t.Fatal(err)
+		}
+		assertLockEvent(t, secondEvents, false, LockReasonUnlocked)
+
+		firstLease, err := manager.BeginUse("vault-lock-race", firstSession)
+		if err != nil {
+			t.Fatal(err)
+		}
+		secondLease, err := manager.BeginUse("vault-lock-race", secondSession)
+		if err != nil {
+			t.Fatal(err)
+		}
+		firstPending, err := manager.BeginUse("vault-lock-race", firstSession)
+		if err != nil {
+			t.Fatal(err)
+		}
+		secondPending, err := manager.BeginUse("vault-lock-race", secondSession)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		start := make(chan struct{})
+		var workers sync.WaitGroup
+		var lockReturned atomic.Bool
+		var latePublication atomic.Bool
+		for _, lease := range []*KeyLease{firstLease, secondLease} {
+			workers.Add(1)
+			go func(lease *KeyLease) {
+				defer workers.Done()
+				<-start
+				_ = lease.Commit(func() error {
+					if lockReturned.Load() {
+						latePublication.Store(true)
+					}
+					return nil
+				})
+			}(lease)
+		}
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			<-start
+			if err := manager.LockAll(LockReasonManual); err != nil {
+				latePublication.Store(true)
+				return
+			}
+			lockReturned.Store(true)
+		}()
+		close(start)
+		workers.Wait()
+
+		if latePublication.Load() {
+			t.Fatal("a lease published after the concurrent lock returned")
+		}
+		for name, session := range map[string][]byte{"first": firstSession, "second": secondSession} {
+			if manager.IsUnlocked("vault-lock-race", session) {
+				t.Fatalf("%s session remained unlocked after LockAll", name)
+			}
+		}
+		for name, lease := range map[string]*KeyLease{"first": firstPending, "second": secondPending} {
+			published := false
+			if err := lease.Commit(func() error { published = true; return nil }); !errors.Is(err, ErrVaultLocked) {
+				t.Fatalf("%s pending lease after LockAll = %v, want locked", name, err)
+			}
+			if published {
+				t.Fatalf("%s pending lease published after LockAll", name)
+			}
+		}
+		assertLockEvent(t, firstEvents, true, LockReasonManual)
+		assertLockEvent(t, secondEvents, true, LockReasonManual)
+		cancelFirst()
+		cancelSecond()
+		if err := manager.Close(); err != nil {
+			t.Fatal(err)
+		}
 	}
 }
 
