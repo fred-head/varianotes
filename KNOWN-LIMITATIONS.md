@@ -34,6 +34,26 @@ using it with important notes.
   for external changes; a stale save is rejected when its version check detects
   the change.
 
+## M31 encrypted vaults
+
+- P17's fresh security review is complete, but the separate P18 release gate
+  remains open and encryption activation is disabled in the current build. Do
+  not rely on encrypted-vault protection until a release explicitly reports
+  that gate as complete.
+- Encryption metadata stays outside vault folders under the application data
+  directory. A VariaNotes restore therefore needs a matching complete `/data`
+  backup, not only a copy of the vault directory.
+- Protected file contents do not hide paths, file sizes, timestamps, protection
+  rules, or other catalog metadata. Unlocking places keys and plaintext in
+  server and browser memory; locking does not promise physical memory erasure.
+- Earlier plaintext backups and copies are not rewritten by conversion.
+  Protected ZIP exports contain plaintext and may remain in device downloads
+  or synced folders.
+- Standalone recovery requires the vault encryption password and matching
+  encryption metadata. The recovery code is for recovery through VariaNotes;
+  it is not a standalone decryption password. See the
+  [M31 operations and recovery guide](docs/security/m31-operations.md).
+
 ## Portability and compatibility
 
 - Notes are ordinary CommonMark/GFM Markdown, but rendered details may differ

@@ -1,4 +1,13 @@
-# M31 fresh AI security review — open blockers
+# M31 historical AI security review — blockers on the reviewed candidate
+
+> **Historical, commit-bound review.** This report applies to the immutable
+> candidate named below (`dc59d0c`), where R1–R5 were open and PR #24 had not
+> merged. Later corrections are recorded in
+> [M31 review remediation](m31-review-remediation.md) and the subsequent
+> [B1/B2](m31-b1-b2-remediation.md) and
+> [C1](m31-c1-remediation.md) records. P17 has since completed after the
+> documented fresh AI review, and PR #24 is merged. This report does not assess
+> later commits. P18 remains open; encryption activation remains disabled.
 
 ## Provenance and disposition
 
@@ -8,7 +17,7 @@
 - Scope: full P01–P17 difference, including all F1–F10 corrections, plus relevant existing boundaries. The P17 changes were assembled locally; PR #24 was not merged.
 - Reviewer executed 38 selected existing Go tests serially with persistent disk caches and a bounded memory target; no files or Git state were changed in the review checkout.
 - The implementer re-read the cited control flows and confirmed the missing barriers/fences. The negative power-loss and paused-unlock flows were not dynamically reproduced; no real power-cut test was performed.
-- R1–R5 were open on the named candidate. This report found release blockers on that commit and therefore does not satisfy the Alpha 3 P17 sign-off rule. PR #24 has no merge approval, productive activation remains disabled, and P18 is unchanged.
+- R1–R5 were open on the named candidate. This report found release blockers on that commit and therefore did not satisfy the Alpha 3 P17 sign-off rule at that time. PR #24 had no merge approval on the reviewed candidate, productive activation was disabled, and P18 was unchanged. P17 has since completed following the documented fresh AI review, and PR #24 is merged; this report does not assess later commits.
 - This is a bounded AI source review, not an expert audit or general security certification. No merge approval is claimed.
 
 ## Reviewer report

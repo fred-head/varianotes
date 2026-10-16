@@ -37,7 +37,7 @@ Read only what the task needs; do not load every document up front.
 - Shipped changes and changelog expectations: [`CHANGELOG.md`](CHANGELOG.md), [`CONTRIBUTING.md`](CONTRIBUTING.md)
 - Git-free reboot contract and phases: [`docs/roadmap/git-free-reboot.md`](docs/roadmap/git-free-reboot.md)
 - Full Alpha 3 milestone roadmap: [`docs/roadmap/alpha3-candidates.md`](docs/roadmap/alpha3-candidates.md)
-- Historical milestone specifications: [`docs/history/agent-plan-archive.md`](docs/history/agent-plan-archive.md)
+- Curated historical context: [`docs/history/README.md`](docs/history/README.md)
 
 Use the nearest relevant source and tests for implementation details. Avoid
 routine reads of `frontend/node_modules/`, `frontend/dist/`,
@@ -46,14 +46,13 @@ for dependency work.
 
 ## Local Go caches
 
-For Go development, tests, vet, and security scans, use the persistent caches
-`GOCACHE=/home/fredmin/.cache/go-build`,
-`GOMODCACHE=/home/fredmin/go/pkg/mod`, and
-`GOTMPDIR=/home/fredmin/.cache/varianotes/go-tmp`. Also set
-`TMPDIR=/home/fredmin/.cache/varianotes/go-tmp`: Go's `testing.T.TempDir()` uses
-`TMPDIR`, not `GOTMPDIR`. The Makefile exports both temporary-directory
-variables for its Go targets. Do not put large Go caches or test data in
-RAM-backed `/tmp`.
+For Go development, tests, vet, and security scans, use persistent,
+disk-backed locations for the Go build cache (`GOCACHE`), module cache
+(`GOMODCACHE`), and temporary data (`GOTMPDIR` and `TMPDIR`). Set `GOTMPDIR`
+and `TMPDIR` to the same dedicated writable directory when running Go tools
+directly. Go's `testing.T.TempDir()` uses `TMPDIR`, not `GOTMPDIR`. The Makefile
+exports both temporary-directory variables for its Go targets. Do not put
+large Go caches or test data in RAM-backed `/tmp`.
 
 ## Validation
 

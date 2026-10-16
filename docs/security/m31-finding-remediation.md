@@ -1,8 +1,16 @@
 # M31 security finding remediation
 
-This records the follow-up to the full P01–P17 AI review. Passing regression
-tests are implementation evidence, not independent security approval. P17 and
-PR #24 remain open; encryption activation remains disabled; P18 is unchanged.
+> **Historical, candidate-bound remediation record.** The findings, validation,
+> and open-gate statements below describe the candidates and points in time
+> identified in each section; this record does not review later commits. P17
+> has since completed following the documented fresh AI review, and PR #24 is
+> merged. P18 remains open, so encryption activation remains disabled. The
+> review outcome and current release gate are recorded in the
+> [P17 sign-off policy](m31-p17-ai-review-signoff.md) and the
+> [operations guide](m31-operations.md).
+
+Passing regression tests are implementation evidence, not independent security
+approval.
 
 ## F1 — New plaintext attachment reference on protected save
 
@@ -80,9 +88,10 @@ were open on that candidate; see [the reviewer report](m31-fresh-ai-review.md).
 The implementer confirmed the cited control-flow gaps; the negative
 power-loss/race flows were not dynamically reproduced. At the time, follow-up
 PRs #30/#31 were open. They and correction PRs #32–#36 have since merged into
-`main`; PR #24 must not merge until its current P17 gate is met. This historical
-report found blockers on its reviewed candidate and does not satisfy the Alpha
-3 P17 sign-off rule. The current gate is defined in
+`main`; PR #24 had not merged at that point. This historical report found
+blockers on `dc59d0c` and did not satisfy the Alpha 3 P17 sign-off rule then.
+PR #24 has since merged after P17 completed following the documented fresh AI
+review. This report does not assess later commits. The current gate is defined in
 [the sign-off policy](m31-p17-ai-review-signoff.md).
 
 ## F3 — Durable move, backlinks and decrypt restore
@@ -117,8 +126,11 @@ Regressions:
 Validation: serial uncached `go test -p 1 -count=1 ./...` and focused filesystem
 and journal cases passed; `go vet -p 1 ./internal/encryption ./internal/files`
 passed. The F5/F6 follow-up below adds lease guarding and lock-order corrections
-at the application boundary. A fresh full-scope review of the current candidate
-under [the Alpha 3 P17 rule](m31-p17-ai-review-signoff.md) remains required.
+at the application boundary. At the time of this validation record, a fresh
+full-scope review of the candidate under
+[the Alpha 3 P17 rule](m31-p17-ai-review-signoff.md) remained required. P17 has
+since completed following the documented fresh AI review; this report does not
+assess the reviewed commit or later commits.
 
 ## F4 — Content save during envelope transition
 
@@ -228,7 +240,9 @@ Regressions in `internal/app/export_throttle_test.go`:
 Validation: uncached serial auth/app/command suites, focused export cases,
 focused concurrent case with `-race`, and app vet passed. The common throttle
 also limits other password operations; no separate export bypass was introduced.
-Activation remains disabled and P18 unchanged. The fresh review of the entire
-P01–P17 integration is recorded above; its blockers applied to the reviewed
-candidate. A new review of the updated candidate is still required under the
-Alpha 3 P17 rule.
+At this report's candidate point, activation remained disabled and P18 was
+unchanged. The fresh review of the entire P01–P17 integration is recorded above;
+its blockers applied to the reviewed candidate. P17 has since completed after
+the documented fresh AI review, and PR #24 is merged. P18 remains open, so
+activation remains disabled. This remediation record does not assess later
+commits.

@@ -1,5 +1,12 @@
 # M31 R1–R5 remediation candidates
 
+> **Historical, commit-bound remediation record.** The findings and validation
+> below apply to the candidates named in this document, including the reviewed
+> `f29ecf3` candidate; this record does not assess later commits. When it was
+> written, P17 was still awaiting the fresh full-scope review and PR #24 had not
+> merged. P17 has since completed following the documented fresh AI review, and
+> PR #24 is merged. P18 remains open, so encryption activation stays disabled.
+
 This document records findings and remediation evidence for the candidates
 reviewed at the time; those reports do not assess today's complete M31 state.
 The Alpha 3 P17 sign-off is governed by the
@@ -10,9 +17,10 @@ commit. It is not an expert audit or a general security certification.
 
 The source review below found blockers on its candidate. Follow-up corrections
 for B1/B2, B3, and B4 were later merged into `main` in PRs #38, #39, and #40,
-respectively. A fresh full-scope review of the updated candidate is still
-required before P17 can close. PR #24 remains open, activation disabled, P18
-unchanged.
+respectively. At the time this report was written, a fresh full-scope review of
+the updated candidate was still required before P17 could close, and PR #24
+remained open. P17 has since completed after the documented fresh AI review, and
+PR #24 has merged. P18 remains open and activation remains disabled.
 
 **Fresh follow-up outcome for the reviewed candidate: blocked.** The completed
 [full-scope AI source review](m31-r-followup-ai-review.md) reports three high
@@ -51,7 +59,9 @@ destination barrier and checking exact ciphertext/catalog afterwards.
 `TestRecoveryRequiresDurableInstalledCatalog`, and
 `TestRecoveryResyncsAlreadyRemovedDirectory` cover repeated fsync failures
 and journal retention. Full encryption/files package tests and focused
-encryption race tests passed. CI and fresh full-scope AI review remain gates.
+encryption race tests passed. At the time of the reviewed candidate, CI and a
+fresh full-scope AI review remained gates; P17 has since completed following
+the documented fresh AI review. This report does not assess later commits.
 
 ## R2 — protected Trash durability
 
@@ -107,7 +117,9 @@ the original login/vault passwords, and verifies unchanged content bytes.
 The child performs the writer's rename sequence explicitly; it is not a full
 backend process or a physical power-cut test. Focused password/recovery app
 tests and race checks (including concurrent catalog-save replay) passed.
-The broader uncached auth/route gate and CI/full-scope AI review remain gates.
+At the time of this candidate, the broader uncached auth/route gate and
+CI/full-scope AI review remained gates. P17 has since completed following the
+documented fresh AI review; this report does not assess later commits.
 
 ## R4 — pending Unlock against lock/revocation
 
@@ -175,7 +187,9 @@ lint and production build passed (existing large-chunk warning remains).
 HTTP test cover deadline/grant binding, activity and no-store responses.
 Focused encryption/app race checks including pending unlock passed. These
 are component tests with a simulated event channel/timer, not a real proxy
-outage or suspended-browser process test. CI/full-scope AI review remain gates.
+outage or suspended-browser process test. At the time of this candidate,
+CI/full-scope AI review remained gates. P17 has since completed following the
+documented fresh AI review; this report does not assess later commits.
 
 ## Combined validation and candidate provenance
 
@@ -219,7 +233,8 @@ or stand in for protected-main CodeQL/up-to-date/review requirements.
 | #35 R4 | `be85c80` | `38561321991` |
 | #36 R5 | `919fee5` | `38562055107` |
 
-The later documentation-only follow-up has its own pending CI; no inherited
-green result is asserted for its new commit. All PRs are held open. Locally,
+At the time of this CI record, the later documentation-only follow-up had its
+own pending CI; no inherited green result was asserted for its new commit. The
+correction PRs in the table were held open then and have since merged. Locally,
 temporary data and caches stayed on disk; sampled swap during the resumed
 validation stayed around 4.0 GiB, with approximately 10–11 GiB RAM available.

@@ -245,11 +245,16 @@ Completion criteria:
 
 ## Milestone 31 - Selective encryption for notes and folders
 
-M31 remains in Alpha 3. This checklist is the implementation plan. **P01–P16
-are complete; P17–P18 remain open.** M31 is not complete until P01–P18 are
+M31 remains in Alpha 3. This checklist is the implementation plan. **P01–P17
+are complete; P18 remains open.** M31 is not complete until P01–P18 are
 complete and P17's Alpha 3 sign-off rule has passed. Encryption activation
 must stay disabled in the UI, API, and any operator command until the P18
 release gate passes.
+
+**Current status:** P17 completed after the documented fresh AI review, and PR
+#24 is merged. The dated reports below retain the findings and dispositions
+that applied to their named candidates; they do not assess later commits. P18
+remains open, and activation remains disabled until its release gate passes.
 
 The size labels are relative estimates, not measured durations: S is small, M
 is medium, and L is large or has substantial failure-recovery work. Each step
@@ -436,7 +441,8 @@ requires its listed tests; P17 adds end-to-end and adversarial coverage.
   sessions, and locks in-memory vault keys. See the recovery details in the
   [authentication architecture](../security/authentication-architecture.md).
   The externally stored code restores access through VariaNotes from a matching
-  complete backup; standalone content decryption remains in the P17/P18 gate.
+  complete backup; operator recovery instructions and the release drill remain
+  in the P18 gate.
 
 - [x] **P09 — Encrypted note reads, saves, and conflicts**
   *(dependencies: P01–P06; size: M)*
@@ -468,7 +474,8 @@ requires its listed tests; P17 adds end-to-end and adversarial coverage.
   uploads stream through a bounded reader without temporary files. Locked image
   requests return no content and the editor shows “Geschützter Anhang”; shared
   cleanup tests retain an object until every reference is removed. M31
-  activation remains gated by P12–P18, including P17's Alpha 3 sign-off rule.
+  activation remains gated by the remaining P12–P18 criteria; P17's Alpha 3
+  sign-off rule has passed, and activation stays disabled until P18 passes.
 
 - [x] **P11 — Convert existing notes, folders, and attachments**
   *(dependencies: P04, P06, P09, P10; size: L)*
@@ -592,7 +599,7 @@ requires its listed tests; P17 adds end-to-end and adversarial coverage.
   erasure is not claimed. P17's integration fault matrix and Alpha 3 sign-off
   rule remain required.
 
-- [ ] **P17 — End-to-end fault matrix and Alpha 3 security review sign-off**
+- [x] **P17 — End-to-end fault matrix and Alpha 3 security review sign-off**
   *(dependencies: P01–P16; size: L)*
   **Goal/scope:** exercise complete flows and review crypto integration,
   transaction recovery, auth coordination, and data leaks.
@@ -609,13 +616,14 @@ requires its listed tests; P17 adds end-to-end and adversarial coverage.
   sign-off for this Alpha 3 milestone, subject to the complete conditions in
   [P17 review rule](../security/m31-p17-ai-review-signoff.md). This is a
   bounded AI review, not an expert audit or general security certification.
-  P17 stays open until that review reports no open release blockers and every
-  required technical check passes on the exact commit reviewed. Any change to
-  the reviewed candidate requires a fresh review and the required checks on the
-  changed commit. P18 and production activation stay blocked until P17 is
-  complete; activation remains separately blocked until P18 passes.
+  P17 was completed after the documented fresh review and its required checks;
+  PR #24 is merged. Historical reports below remain bound to their named
+  candidates. A later change does not inherit review evidence for a different
+  commit. P18 and production activation remain separately gated until P18
+  passes.
 
-  **P17 status — validation passed; sign-off pending (2026-10-13):** conversion and journal
+  **Historical P17 status — validation passed; sign-off pending at that time
+  (2026-10-13):** conversion and journal
   fault/restart boundaries are covered by the P06/P11 tests; protected move
   rollback and Trash restart reconciliation by the P12/P13 tests. Added focused
   P17 tests for an uncommitted protected save recovered after restart, export
@@ -646,13 +654,15 @@ requires its listed tests; P17 adds end-to-end and adversarial coverage.
   packages, targeted `gosec -quiet ./internal/files/externalrestore`, and
   `git diff --check`. At the time of this validation record, PR #24 had no review
   submissions or requests. These checks and the implementation review are not
-  the fresh full-scope AI sign-off required by the Alpha 3 rule above. P17
-  remains open pending that review and its release-blocker assessment. Swap use
-  remained at its 3.4-GiB baseline throughout these checks. Encryption
-  activation stays gated; P18 is unchanged.
+  the fresh full-scope AI sign-off required by the Alpha 3 rule above. At that
+  point P17 remained open pending that review and its release-blocker
+  assessment. P17 has since completed after the documented fresh AI review and
+  PR #24 has merged. Swap use remained at its 3.4-GiB baseline throughout
+  these checks. Encryption activation stays gated until P18 passes.
 
-  **Finding remediation (2026-10-14):** the full P01–P17 AI review identified
-  F1–F10. Follow-up work and regression evidence are tracked in
+  **Historical finding-remediation status (2026-10-14):** the full P01–P17 AI
+  review identified F1–F10 on its reviewed candidate. Follow-up work and
+  regression evidence are tracked in
   [`../security/m31-finding-remediation.md`](../security/m31-finding-remediation.md).
   F1/F2/F7/F10 were reproduced and corrected in follow-up changes; F3's durable
   move/restore correction has restart and fault-boundary regressions. Other findings
@@ -661,13 +671,15 @@ requires its listed tests; P17 adds end-to-end and adversarial coverage.
   commits, manual/idle lock and concurrency regressions. F8 fences late content
   responses and discards plaintext dialogs while preserving hidden drafts.
   F9 now shares bounded credential work and persistent failure throttling with
-  vault unlock, including restart and concurrency regressions. Follow-up PR
-  fixes have since been integrated into `main`; they do not replace P17's fresh
-  full-scope review of the updated candidate. PR #24 must not merge while that
-  review reports release blockers. Activation stays disabled.
+  vault unlock, including restart and concurrency regressions. At that point,
+  follow-up PR fixes had integrated into `main`, but the fresh full-scope review
+  was still required and PR #24 had not merged. P17 has since completed after
+  the documented fresh AI review and PR #24 has merged. This dated record does
+  not assess later commits. Activation stays disabled until P18 passes.
 
-  **Fresh AI review — blocked (2026-10-14):** a separate AI session reviewed the
-  complete pre-P01-to-P17 candidate `060e636..dc59d0c`, including all F1–F10
+  **Historical fresh AI review — blocked on its candidate (2026-10-14):** a
+  separate AI session reviewed the complete pre-P01-to-P17 candidate
+  `060e636..dc59d0c`, including all F1–F10
   corrections, in an unchanged isolated checkout. Its 38 selected existing Go
   tests passed. The source review found R1–R5: missing durable recovery barriers
   for the commit marker, Trash structure and existing envelopes; late Unlock
@@ -676,20 +688,22 @@ requires its listed tests; P17 adds end-to-end and adversarial coverage.
   flows were not dynamically reproduced. See
   [`../security/m31-fresh-ai-review.md`](../security/m31-fresh-ai-review.md).
   All five findings were open on the reviewed candidate. The report identifies
-  blockers on that commit and therefore does not satisfy the Alpha 3 P17
-  sign-off rule. A fresh review of the updated candidate may serve as the
-  selected sign-off under that rule. P17 remains open; productive activation is
-  disabled and P18 is unchanged.
+  blockers on that commit and therefore did not satisfy the Alpha 3 P17
+  sign-off rule at that time. P17 has since completed following the documented
+  fresh AI review, and PR #24 has merged. This report does not assess later
+  commits. Production activation remains disabled until P18 passes.
 
   **R-finding correction candidates:** reproduction, corrections, regression
   tests and limitations are tracked in
   [`../security/m31-review-remediation.md`](../security/m31-review-remediation.md).
   The merge gate recorded for those candidates predates their later integration
-  into `main`. Their full-scope AI review remains required for P17 under the
-  [Alpha 3 sign-off rule](../security/m31-p17-ai-review-signoff.md); an eligible
-  AI review is not an expert audit or general security certification.
+  into `main`. At the time, a full-scope AI review remained required for P17
+  under the [Alpha 3 sign-off rule](../security/m31-p17-ai-review-signoff.md).
+  P17 has since completed. An eligible AI review is not an expert audit or
+  general security certification.
 
-  **R follow-up AI review — blocked (2026-10-14):** R1–R5 were reproduced and
+  **Historical R follow-up AI review — blocked on its candidate (2026-10-14):**
+  R1–R5 were reproduced and
   corrected as candidates in PRs #32–#36, with process-death/restart, sync-error,
   concurrency and failed lock-channel regressions. The full uncached Go suite,
   external age recovery, vet, focused race checks and all frontend checks passed;
@@ -701,10 +715,9 @@ requires its listed tests; P17 adds end-to-end and adversarial coverage.
   missing the server's grant/publication barrier; B4: missing parent sync on
   first protected upload. These findings were open on the reviewed candidate;
   corrections were subsequently merged into `main` in PR #38 (B1/B2), #39 (B3),
-  and #40 (B4). That report does not sign off the later candidate. P17 remains
-  open pending a fresh review of the current full M31 state under the Alpha 3
-  rule, with its required technical checks passing on the reviewed commit.
-  Productive activation stays disabled and P18 is unchanged.
+  and #40 (B4). That report does not sign off later commits. P17 has since
+  completed following a documented fresh AI review, and PR #24 has merged. P18
+  remains open, so production activation stays disabled.
 
 - [ ] **P18 — Operations documentation and release gate**
   *(dependencies: P01–P17; size: S)*
@@ -713,7 +726,17 @@ requires its listed tests; P17 adds end-to-end and adversarial coverage.
   the feature only after all mandatory steps and review pass.
   **Acceptance/tests:** follow external recovery from a complete test backup;
   verify no activation path works before the gate; pass new/adopted-vault flows;
-  record P01–P18 and security review complete before marking M31 complete.
+  record P01–P18 and the fresh security review complete for the exact candidate
+  before marking M31 complete. The operator guide must distinguish the
+  standalone encryption password from the VariaNotes-only recovery code, and
+  describe the matching full-volume backup, metadata visibility, memory limits,
+  earlier plaintext copies, and plaintext ZIP exports.
+
+  **Implementation candidate (2026-10-16):** added the operator guide and
+  extended the source-only external restore utility to read the password
+  interactively and create a new recovery directory. Activation remains
+  disabled. P17 is complete and PR #24 is merged. The new/adopted-vault release
+  flows and final gate evidence have not been recorded; P18 remains open.
 
 ### M31 completion and activation gate
 

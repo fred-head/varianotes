@@ -154,6 +154,10 @@ MFA, session expiry and revocation, and trusted-proxy controls. It does not
 provide multiple users or roles, and it does not terminate TLS. See the
 [reverse-proxy guide](docs/security/reverse-proxy.md) and
 [local-authentication guide](docs/security/local-authentication-setup.md).
+P17's fresh security review is complete. M31 encrypted-vault activation remains
+disabled until the separate P18 release gate passes. See the
+[encrypted-vault operations and recovery guide](docs/security/m31-operations.md)
+for backup handling, standalone recovery, and the release conditions.
 Report security issues through the private reporting instructions in
 [`SECURITY.md`](SECURITY.md).
 

@@ -1,10 +1,12 @@
-// Command externalrestore is a small interoperability fixture used by the
-// M31 P17 test. It deliberately imports no VariaNotes package: it reads the
-// documented age files, XChaCha20-Poly1305 content-key envelopes, and
-// authenticated catalog directly, then delegates content decryption to age.
+// Command varianotes-external-restore restores a complete VariaNotes vault
+// backup without importing VariaNotes packages or contacting a VariaNotes
+// service. It reads the versioned age files, content-key envelopes, and
+// authenticated catalog, then delegates content decryption to the official
+// age CLI.
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"crypto/hmac"
 	"crypto/sha256"
@@ -23,6 +25,7 @@ import (
 
 	"filippo.io/age"
 	"golang.org/x/crypto/chacha20poly1305"
+	"golang.org/x/term"
 )
 
 const (
@@ -31,6 +34,7 @@ const (
 	maxCatalogBytes  = 16 << 20
 	maxEnvelopeBytes = 64 << 10
 	maxVaultKeySize  = 32
+	maxPasswordBytes = 1024
 	scryptWorkFactor = 18
 )
 
@@ -85,18 +89,19 @@ func main() {
 func run() error {
 	vaultPath := flag.String("vault", "", "path to the restored vault directory")
 	metadataPath := flag.String("encryption-metadata", "", "path to this vault's encryption metadata directory")
-	password := flag.String("password", "", "password for the age-wrapped vault key")
 	outputPath := flag.String("output", "", "destination for the recovered vault tree")
 	flag.Parse()
-	if *vaultPath == "" || *metadataPath == "" || *password == "" || *outputPath == "" {
-		return errors.New("vault, encryption metadata, password, and output are required")
+	if *vaultPath == "" || *metadataPath == "" || *outputPath == "" {
+		return errors.New("vault, encryption metadata, and output are required")
 	}
 	if _, err := os.Stat(*vaultPath); err != nil {
 		return fmt.Errorf("inspect backup vault: %w", err)
 	}
-	if err := os.MkdirAll(*outputPath, 0o700); err != nil {
-		return fmt.Errorf("create recovered vault directory: %w", err)
+	password, err := readPassword()
+	if err != nil {
+		return err
 	}
+	defer clear(password)
 
 	keyEnvelope, err := readJSON[vaultKeyEnvelope](filepath.Join(*metadataPath, "key-envelope.json"), maxEnvelopeBytes*2)
 	if err != nil {
@@ -105,7 +110,7 @@ func run() error {
 	if keyEnvelope.Version != 1 || len(keyEnvelope.AgeCiphertext) == 0 || len(keyEnvelope.AgeCiphertext) > maxEnvelopeBytes {
 		return errors.New("unsupported or invalid password envelope")
 	}
-	identity, err := age.NewScryptIdentity(*password)
+	identity, err := age.NewScryptIdentity(string(password))
 	if err != nil {
 		return errors.New("create age password identity")
 	}
@@ -129,7 +134,103 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	return restoreTree(*vaultPath, *outputPath, cat, vaultKey)
+	if hasProtectedObjects(cat) {
+		if _, err := exec.LookPath("age"); err != nil {
+			return errors.New("the official age CLI must be installed and available on PATH")
+		}
+	}
+	output, err := newOutputDirectory(*vaultPath, *metadataPath, *outputPath)
+	if err != nil {
+		return err
+	}
+	restored := false
+	defer func() {
+		if !restored {
+			_ = os.RemoveAll(output)
+		}
+	}()
+	if err := restoreTree(*vaultPath, output, cat, vaultKey); err != nil {
+		return err
+	}
+	restored = true
+	return nil
+}
+
+func readPassword() ([]byte, error) {
+	var password []byte
+	if term.IsTerminal(int(os.Stdin.Fd())) {
+		_, _ = fmt.Fprint(os.Stderr, "Encryption password: ")
+		value, err := term.ReadPassword(int(os.Stdin.Fd()))
+		_, _ = fmt.Fprintln(os.Stderr)
+		if err != nil {
+			return nil, fmt.Errorf("read encryption password: %w", err)
+		}
+		password = value
+	} else {
+		_, _ = fmt.Fprintln(os.Stderr, "Reading encryption password from standard input.")
+		reader := bufio.NewReader(io.LimitReader(os.Stdin, maxPasswordBytes+2))
+		value, err := reader.ReadString('\n')
+		if err != nil && err != io.EOF {
+			return nil, fmt.Errorf("read encryption password: %w", err)
+		}
+		value = strings.TrimSuffix(value, "\n")
+		value = strings.TrimSuffix(value, "\r")
+		password = []byte(value)
+	}
+	if len(password) == 0 || len(password) > maxPasswordBytes {
+		clear(password)
+		return nil, errors.New("encryption password is empty or too long")
+	}
+	return password, nil
+}
+
+func hasProtectedObjects(cat catalog) bool {
+	for _, object := range cat.Objects {
+		if object.Protected {
+			return true
+		}
+	}
+	return false
+}
+
+func newOutputDirectory(vaultRoot, metadataRoot, requested string) (string, error) {
+	absolute, err := filepath.Abs(requested)
+	if err != nil {
+		return "", errors.New("recovery destination path is invalid")
+	}
+	parent, err := filepath.EvalSymlinks(filepath.Dir(absolute))
+	if err != nil {
+		return "", errors.New("recovery destination parent must already exist")
+	}
+	output := filepath.Join(parent, filepath.Base(absolute))
+	for _, source := range []string{vaultRoot, metadataRoot} {
+		sourceRoot, err := filepath.EvalSymlinks(source)
+		if err != nil {
+			return "", errors.New("backup source path is unavailable")
+		}
+		sourceRoot, err = filepath.Abs(sourceRoot)
+		if err != nil {
+			return "", errors.New("backup source path is invalid")
+		}
+		if isWithin(sourceRoot, output) {
+			return "", errors.New("recovery destination must be outside the backup source directories")
+		}
+	}
+	if _, err := os.Lstat(output); err == nil || !errors.Is(err, os.ErrNotExist) {
+		return "", errors.New("recovery destination must be a new directory")
+	}
+	if err := os.Mkdir(output, 0o700); err != nil {
+		return "", fmt.Errorf("create recovered vault directory: %w", err)
+	}
+	return output, nil
+}
+
+func isWithin(root, target string) bool {
+	relative, err := filepath.Rel(root, target)
+	if err != nil {
+		return true
+	}
+	return relative == "." || (relative != ".." && !filepath.IsAbs(relative) && !strings.HasPrefix(relative, ".."+string(filepath.Separator)))
 }
 
 func readJSON[T any](filename string, limit int64) (T, error) {

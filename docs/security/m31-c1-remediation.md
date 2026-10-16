@@ -1,8 +1,15 @@
 # M31 C1: ownership of live auth journals
 
-This follow-up addresses C1 only. It does not grant P17 sign-off, change its
-criteria, authorize encryption activation, or replace a fresh overall review.
-PR #24 remains open pending that review.
+> **Historical, commit-bound remediation record.** The reproduction below is
+> bound to test-only commit `03c91c0` and its stated base; this document does
+> not assess later commits. This C1 follow-up did not itself grant P17 sign-off
+> or authorize activation. At the time, PR #24 remained open pending the overall
+> review. P17 has since completed following the documented fresh AI review, and
+> PR #24 is merged. P18 remains open, so encryption activation stays disabled.
+
+This follow-up addresses C1 only; see the current
+[P17 sign-off policy](m31-p17-ai-review-signoff.md) and
+[M31 operations guide](m31-operations.md) for the present release status.
 
 ## Reproduction on main
 

@@ -56,6 +56,13 @@ expects different authentication metadata. A rollback is not a data migration.
 Markdown vaults remain ordinary files, but VariaNotes does not provide an
 in-app version history or remote backup.
 
+For M31 encrypted vault data, also follow the
+[encrypted-vault operations and recovery guide](docs/security/m31-operations.md).
+The current build keeps encryption activation disabled. Do not promote a
+candidate until P01–P18 are complete. P17's fresh security review is complete;
+P18's release gate remains open. Record the review and all required checks for
+the exact candidate commit.
+
 ## Release verification
 
 For each exact candidate image, verify:
@@ -74,6 +81,13 @@ For each exact candidate image, verify:
 - the image operates without Git, OpenSSH, remotes, or SSH credentials;
 - the image remains non-root, read-only at the container root, and persistent
   through the documented `/data` volume.
+
+For an M31 candidate, additionally record the complete P01–P18 checklist and
+P17 review result for the exact commit. Recover a complete disposable backup
+outside VariaNotes, compare protected notes, binary assets, and ordinary files
+byte-for-byte, verify activation remains unavailable until the full gate passes,
+and exercise both new-vault and adopted-vault flows. Keep production activation
+disabled until all of these checks and their required technical gates pass.
 
 Verify the OCI digest, SBOM, and release attestation. Update release notes,
 known limitations, and the changelog before publication. Never move an

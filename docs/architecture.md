@@ -55,9 +55,12 @@ history. For behavior and deployment, see [README](../README.md).
   through forward recovery. M31P12 adds catalog-aware note and folder moves,
   explicit keep/decrypt policy choices, automatic conversion on moves into a
   protected destination, and journaled encrypted backlink updates. The
-  application still exposes no user-facing
-  unlock or activation path; encryption remains gated until all M31 steps and
-  the release review pass.
+  protected-vault unlock and lock controls are available, but there is no
+  encryption activation action or supported operator command. Activation
+  remains gated until the P18 release gate passes. P17's fresh review is
+  complete. The
+  [M31 operations guide](security/m31-operations.md) documents backups and
+  standalone recovery.
 - Multiple named vaults on one server are registered in application metadata.
   The registry stores IDs, display names, and filesystem paths. It is not a
   copy of note or asset content.
@@ -75,6 +78,7 @@ history. For behavior and deployment, see [README](../README.md).
 | Area | Responsibility | Start here |
 | --- | --- | --- |
 | `cmd/varianotes/` | Process startup, configuration, and operator auth commands | `main.go` |
+| `cmd/varianotes-external-restore/` | Standalone recovery from a complete encrypted-vault backup | `main.go` |
 | `internal/app/` | HTTP routes, authentication middleware, vault registry and export | `handler.go`, `notebooks.go` |
 | `internal/files/` | Confined filesystem operations, Markdown, assets, links, search, Trash, export | `repository.go`, `root.go`, `export.go` |
 | `internal/auth/` | Local/disabled mode, credentials, sessions, MFA, proxy identity | `config.go`, `service.go` |

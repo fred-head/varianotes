@@ -169,11 +169,12 @@ Application metadata backups contain the encrypted recovery envelopes but not
 the code. A restored backup can be recovered with the code that was active
 when that backup was made. If both the current vault password and the matching
 recovery code are lost, VariaNotes cannot recover those vault keys. The code
-recovers access through VariaNotes from a complete matching backup. In this
-step, external recovery means keeping the code outside VariaNotes and using it
-with the restored application metadata and vault. This is not a standalone
-external decryption tool; validating full VariaNotes-free content recovery
-remains part of the M31 security review and release gate.
+recovers access through VariaNotes from a complete matching backup. The
+standalone recovery utility instead requires the vault encryption password;
+the recovery code is not a substitute for it. Follow the
+[M31 operations and recovery guide](m31-operations.md) for the full `/data`
+backup requirements and external restore procedure. Full VariaNotes-free
+content recovery and its release checks remain part of the M31 gate.
 Explicitly disabling authentication is rejected while any registered vault has
 encryption metadata or `.age` ciphertext, including content in Trash, and also
 fails when a registered vault cannot be inspected.

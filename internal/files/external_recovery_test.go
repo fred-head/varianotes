@@ -117,12 +117,12 @@ func TestCompleteBackupRecoversFilesWithStandaloneAgeTool(t *testing.T) {
 	copyP17BackupTree(t, vaultRoot, backupVault)
 	copyP17BackupTree(t, metadataRoot, backupMetadata)
 	output := filepath.Join(base, "externally-restored-vault")
-	command := exec.Command("go", "run", "./externalrestore",
+	command := exec.Command("go", "run", "../../cmd/varianotes-external-restore",
 		"--vault", backupVault,
 		"--encryption-metadata", filepath.Join(backupMetadata, "encryption", hex.EncodeToString(metadataID[:])),
-		"--password", password,
 		"--output", output,
 	)
+	command.Stdin = strings.NewReader(password + "\n")
 	result, err := command.CombinedOutput()
 	if err != nil {
 		t.Fatalf("standalone external recovery failed: %v\n%s", err, strings.TrimSpace(string(result)))
